@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- tecla da barra de teclas -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android" android:color="#554FC3F7">
+    <item android:top="3dp" android:bottom="3dp" android:left="2dp" android:right="2dp">
+        <shape android:shape="rectangle">
+            <solid android:color="#26364A" />
+            <corners android:radius="7dp" />
+        </shape>
+    </item>
+</ripple>

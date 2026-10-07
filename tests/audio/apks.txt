@@ -1,0 +1,11 @@
+alsa-lib-1.2.15.3-r0.apk
+alsa-ucm-conf-1.2.16.1-r0.apk
+alsa-utils-1.2.15.2-r1.apk
+dialog-1.3.20260107-r1.apk
+fftw-single-libs-3.3.11-r0.apk
+libformw-6.6_p20260516-r0.apk
+libmenuw-6.6_p20260516-r0.apk
+libncursesw-6.6_p20260516-r0.apk
+libpanelw-6.6_p20260516-r0.apk
+musl-1.2.6-r2.apk
+ncurses-terminfo-base-6.6_p20260516-r0.apk

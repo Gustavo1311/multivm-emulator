@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- pilula de uma VM na tela inicial -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android" android:color="#334FC3F7">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@color/surface" />
+            <stroke android:width="1dp" android:color="@color/outline" />
+            <corners android:radius="40dp" />
+        </shape>
+    </item>
+</ripple>

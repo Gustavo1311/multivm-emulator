@@ -1,0 +1,39 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.multivm.app'
+    compileSdk 34
+    buildToolsVersion '34.0.3'
+
+    defaultConfig {
+        applicationId 'com.multivm.app'
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName '0.1'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // app de teste: assinado com a chave de debug para instalar direto
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    // imagens de BIOS ja sao binarias; nao comprimir
+    androidResources {
+        noCompress 'bin'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation project(':multivm')
+}

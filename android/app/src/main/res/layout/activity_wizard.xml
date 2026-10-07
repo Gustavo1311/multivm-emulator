@@ -1,0 +1,533 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Assistente da primeira VM: boas-vindas, uma pagina por categoria e o resumo. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
+
+    <!-- progresso: "Etapa N de M" e uma barra segmentada -->
+    <LinearLayout
+        android:id="@+id/header"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="16dp"
+        android:paddingTop="12dp"
+        android:paddingEnd="16dp">
+
+        <TextView
+            android:id="@+id/stepLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="#4FC3F7"
+            android:textSize="13sp" />
+
+        <LinearLayout
+            android:id="@+id/stepBar"
+            android:layout_width="match_parent"
+            android:layout_height="4dp"
+            android:layout_marginTop="6dp"
+            android:orientation="horizontal" />
+    </LinearLayout>
+
+    <ScrollView
+        android:id="@+id/scroll"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true">
+
+        <ViewFlipper
+            android:id="@+id/pages"
+            android:measureAllChildren="false"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:padding="16dp">
+
+            <!-- 0: boas-vindas -->
+            <LinearLayout style="@style/WizPage">
+
+                <ImageView
+                    android:layout_width="72dp"
+                    android:layout_height="72dp"
+                    android:layout_marginTop="24dp"
+                    android:src="@drawable/ic_launcher" />
+
+                <TextView
+                    style="@style/WizTitle"
+                    android:layout_marginTop="16dp"
+                    android:text="Bem-vindo ao MultiVM"
+                    android:textSize="28sp" />
+
+                <TextView
+                    style="@style/WizHelp"
+                    android:layout_marginTop="12dp"
+                    android:text="O MultiVM é um emulador de sistema completo: ele roda outros sistemas operacionais (Linux, Windows, ReactOS…) dentro do seu aparelho, sem precisar de root."
+                    android:textSize="16sp" />
+
+                <LinearLayout style="@style/WizCard">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Vamos criar a sua primeira máquina virtual"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        style="@style/WizHelp"
+                        android:text="1. Sistema — nome, arquitetura e tipo de boot\n2. Hardware — memória e o sistema que será instalado\n3. Som e rede — placas, microfone, internet e acesso remoto (VNC)\n4. Armazenamento — até 4 discos rígidos virtuais\n5. Inicialização — até 4 ISOs e 2 disquetes, ou o kernel\n6. Resumo — confira tudo antes de criar" />
+                </LinearLayout>
+
+                <LinearLayout style="@style/WizCard">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Arquiteturas suportadas"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        style="@style/WizHelp"
+                        android:text="• x86-64 e i386 (PC com BIOS): instale sistemas a partir de uma ISO\n• ARM64 e ARMv7 (virt): boot direto de um kernel Linux" />
+                </LinearLayout>
+
+                <TextView
+                    style="@style/WizHelp"
+                    android:layout_marginTop="16dp"
+                    android:text="Tudo pode ser alterado depois na tela de configuração. Se preferir configurar sozinho, toque em “Pular”."
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <!-- 1: sistema -->
+            <LinearLayout style="@style/WizPage">
+
+                <TextView
+                    style="@style/WizTitle"
+                    android:text="Sistema" />
+
+                <TextView
+                    style="@style/WizHelp"
+                    android:text="Dê um nome à VM e escolha o tipo de computador que ela vai emular." />
+
+                <TextView
+                    style="@style/Label"
+                    android:text="Nome da VM" />
+
+                <EditText
+                    android:id="@+id/wName"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:inputType="textCapSentences"
+                    android:text="Minha VM" />
+
+                <TextView
+                    style="@style/Label"
+                    android:text="Arquitetura" />
+
+                <Spinner
+                    android:id="@+id/wArch"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content" />
+
+                <TextView
+                    style="@style/Label"
+                    android:text="Como a VM vai iniciar" />
+
+                <RadioGroup
+                    android:id="@+id/wMode"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content">
+
+                    <RadioButton
+                        android:id="@+id/wModeBios"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:checked="true"
+                        android:text="PC com BIOS — instalar um sistema a partir de uma ISO ou disco" />
+
+                    <RadioButton
+                        android:id="@+id/wModeKernel"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Kernel Linux direto — sem BIOS, para testes e ARM" />
+                </RadioGroup>
+
+                <TextView
+                    android:id="@+id/wModeHelp"
+                    style="@style/WizHelp" />
+            </LinearLayout>
+
+            <!-- 2: hardware -->
+            <LinearLayout style="@style/WizPage">
+
+                <TextView
+                    style="@style/WizTitle"
+                    android:text="Hardware" />
+
+                <TextView
+                    style="@style/WizHelp"
+                    android:text="Quanta memória RAM do aparelho a VM poderá usar." />
+
+                <TextView
+                    style="@style/Label"
+                    android:text="Memória (MiB)" />
+
+                <SeekBar
+                    android:id="@+id/wRamBar"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp" />
+
+                <EditText
+                    android:id="@+id/wRam"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:inputType="number"
+                    android:text="512" />
+
+                <TextView
+                    android:id="@+id/wRamHelp"
+                    style="@style/WizHelp" />
+
+                <TextView
+                    style="@style/Label"
+                    android:layout_marginTop="16dp"
+                    android:text="Sistema que será instalado" />
+
+                <Spinner
+                    android:id="@+id/wOs"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content" />
+
+                <TextView
+                    android:id="@+id/wOsHelp"
+                    style="@style/WizHelp"
+                    android:textSize="13sp" />
+
+                <LinearLayout style="@style/WizCard">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Sugestões"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        style="@style/WizHelp"
+                        android:text="• Linux leve (Alpine, Debian sem interface): 256–512 MiB\n• Windows XP / ReactOS: 512–1024 MiB\n• Windows 10 / Server: 2048–3072 MiB" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- 3: som e rede -->
+            <LinearLayout style="@style/WizPage">
+
+                <TextView
+                    style="@style/WizTitle"
+                    android:text="Som e rede" />
+
+                <TextView
+                    android:id="@+id/wNetIntro"
+                    style="@style/WizHelp" />
+
+                <LinearLayout style="@style/WizCard">
+
+                    <TextView
+                        style="@style/Label"
+                        android:layout_marginTop="0dp"
+                        android:text="Placa de som" />
+
+                    <Spinner
+                        android:id="@+id/wSound"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content" />
+
+                    <CheckBox
+                        android:id="@+id/wMic"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Microfone (entrada de áudio do aparelho)" />
+                </LinearLayout>
+
+                <LinearLayout style="@style/WizCard">
+
+                    <TextView
+                        style="@style/Label"
+                        android:layout_marginTop="0dp"
+                        android:text="Placa de rede" />
+
+                    <Spinner
+                        android:id="@+id/wNic"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content" />
+
+                    <TextView
+                        style="@style/WizHelp"
+                        android:text="Rede NAT: a VM recebe 10.0.2.15 automaticamente e usa a internet do aparelho. O próprio aparelho aparece para ela como 10.0.2.2."
+                        android:textSize="13sp" />
+
+                    <TextView
+                        style="@style/Label"
+                        android:text="Redirecionamento de portas (aparelho → VM)" />
+
+                    <LinearLayout
+                        android:id="@+id/wFwdList"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical" />
+
+                    <Button
+                        android:id="@+id/wFwdAdd"
+                        style="@style/OutlineButton"
+                        android:layout_marginTop="8dp"
+                        android:drawableStart="@drawable/ic_add"
+                        android:drawableTint="@color/accent"
+                        android:text="Adicionar redirecionamento" />
+                </LinearLayout>
+
+                <LinearLayout style="@style/WizCard">
+
+                    <CheckBox
+                        android:id="@+id/wVnc"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Acesso remoto: servidor VNC" />
+
+                    <LinearLayout
+                        android:id="@+id/wVncGroup"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical">
+
+                        <TextView
+                            style="@style/Label"
+                            android:text="Tela ou porta (1 = tela :1 = porta 5901)" />
+
+                        <EditText
+                            android:id="@+id/wVncPort"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:inputType="number"
+                            android:text="1" />
+
+                        <TextView
+                            style="@style/Label"
+                            android:text="Senha (opcional, até 8 caracteres)" />
+
+                        <EditText
+                            android:id="@+id/wVncPassword"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:inputType="textPassword"
+                            android:maxLength="8" />
+
+                        <CheckBox
+                            android:id="@+id/wVncLan"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Permitir acesso pela rede local (Wi-Fi)" />
+                    </LinearLayout>
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- 3: armazenamento -->
+            <LinearLayout style="@style/WizPage">
+
+                <TextView
+                    style="@style/WizTitle"
+                    android:text="Armazenamento" />
+
+                <TextView
+                    style="@style/WizHelp"
+                    android:text="Os discos rígidos virtuais são onde o sistema será instalado." />
+
+                <com.multivm.app.MediaListView
+                    android:id="@+id/wDisks"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content" />
+
+                <TextView
+                    style="@style/WizHelp"
+                    android:layout_marginTop="8dp"
+                    android:text="Um disco novo (MVD) começa pequeno e cresce conforme o uso, até o tamanho máximo. Ele é criado ao final do assistente. Você pode ter até 4 discos."
+                    android:textSize="13sp" />
+
+                <!-- controlador (so PC com BIOS) -->
+                <LinearLayout
+                    android:id="@+id/wCtrlBox"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical">
+
+                    <TextView
+                        style="@style/Label"
+                        android:text="Controlador de disco" />
+
+                    <RadioGroup
+                        android:id="@+id/wCtrl"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content">
+
+                        <RadioButton
+                            android:id="@+id/wCtrlIde"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:checked="true"
+                            android:text="IDE — compatível com tudo (Windows XP, ReactOS, Linux)" />
+
+                        <RadioButton
+                            android:id="@+id/wCtrlSata"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="SATA/AHCI — Windows Vista ou mais novo, Linux" />
+                    </RadioGroup>
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- 4: inicializacao -->
+            <LinearLayout style="@style/WizPage">
+
+                <TextView
+                    style="@style/WizTitle"
+                    android:text="Inicialização" />
+
+                <TextView
+                    android:id="@+id/wBootHelp"
+                    style="@style/WizHelp" />
+
+                <!-- PC com BIOS -->
+                <LinearLayout
+                    android:id="@+id/wBiosBox"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical">
+
+                    <com.multivm.app.MediaListView
+                        android:id="@+id/wCds"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content" />
+
+                    <com.multivm.app.MediaListView
+                        android:id="@+id/wFloppies"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content" />
+
+                    <TextView
+                        style="@style/Label"
+                        android:layout_marginTop="16dp"
+                        android:text="Ordem de boot" />
+
+                    <Spinner
+                        android:id="@+id/wBootOrder"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
+                <!-- kernel direto -->
+                <LinearLayout
+                    android:id="@+id/wKernelBox"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical">
+
+                    <TextView
+                        style="@style/Label"
+                        android:text="Kernel" />
+
+                    <LinearLayout style="@style/FileRow">
+                        <TextView android:id="@+id/wKernelName" style="@style/FileName" />
+                        <Button android:id="@+id/wKernelPick" style="@style/SmallButton" android:text="Escolher" />
+                        <Button android:id="@+id/wKernelClear" style="@style/SmallButton" android:text="✕" />
+                    </LinearLayout>
+
+                    <TextView
+                        style="@style/Label"
+                        android:text="Initrd (opcional)" />
+
+                    <LinearLayout style="@style/FileRow">
+                        <TextView android:id="@+id/wInitrdName" style="@style/FileName" />
+                        <Button android:id="@+id/wInitrdPick" style="@style/SmallButton" android:text="Escolher" />
+                        <Button android:id="@+id/wInitrdClear" style="@style/SmallButton" android:text="✕" />
+                    </LinearLayout>
+
+                    <TextView
+                        style="@style/Label"
+                        android:text="Linha de comando (vazio = console padrão)" />
+
+                    <EditText
+                        android:id="@+id/wCmdline"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:fontFamily="monospace"
+                        android:inputType="text" />
+
+                    <CheckBox
+                        android:id="@+id/wFb"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:text="Tela gráfica (framebuffer)" />
+
+                    <EditText
+                        android:id="@+id/wFbSize"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:hint="LARGURAxALTURA"
+                        android:inputType="text"
+                        android:text="800x600" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- 5: resumo (preenchido no codigo) -->
+            <LinearLayout style="@style/WizPage">
+
+                <TextView
+                    style="@style/WizTitle"
+                    android:text="Resumo" />
+
+                <TextView
+                    style="@style/WizHelp"
+                    android:text="Confira a configuração. Toque em “Editar” para voltar a uma categoria." />
+
+                <LinearLayout
+                    android:id="@+id/wSummary"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical" />
+
+                <CheckBox
+                    android:id="@+id/wStartNow"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:checked="true"
+                    android:text="Iniciar a VM logo depois de criar" />
+            </LinearLayout>
+        </ViewFlipper>
+    </ScrollView>
+
+    <!-- navegacao -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/bg_dark"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:padding="12dp">
+
+        <Button
+            android:id="@+id/wBack"
+            style="@style/TextButton"
+            android:layout_height="52dp"
+            android:minWidth="96dp"
+            android:textSize="15sp" />
+
+        <View
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <Button
+            android:id="@+id/wNext"
+            style="@style/PrimaryButton" />
+    </LinearLayout>
+</LinearLayout>

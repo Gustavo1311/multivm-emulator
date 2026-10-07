@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000"
+    android:orientation="vertical">
+
+    <!-- barra de controles: icones com rotulo -->
+    <HorizontalScrollView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@drawable/toolbar_bg"
+        android:scrollbars="none">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingStart="4dp"
+            android:paddingTop="2dp"
+            android:paddingEnd="4dp">
+
+            <Button android:id="@+id/btnView" style="@style/ToolButton" android:drawableTop="@drawable/ic_terminal" android:text="Terminal" />
+            <Button android:id="@+id/btnKbd" style="@style/ToolButton" android:drawableTop="@drawable/ic_keyboard" android:text="Teclado" />
+            <Button android:id="@+id/btnMedia" style="@style/ToolButton" android:drawableTop="@drawable/ic_media" android:text="Mídia" />
+            <Button android:id="@+id/btnMouse" style="@style/ToolButton" android:drawableTop="@drawable/ic_mouse" android:text="Mouse 1x" />
+            <Button android:id="@+id/btnTrackpad" style="@style/ToolButton" android:drawableTop="@drawable/ic_touchpad" android:text="Trackpad" />
+            <Button android:id="@+id/btnRotate" style="@style/ToolButton" android:drawableTop="@drawable/ic_rotate" android:text="Girar" />
+            <Button android:id="@+id/btnSound" style="@style/ToolButton" android:drawableTop="@drawable/ic_volume" android:text="Som" />
+            <Button android:id="@+id/btnPause" style="@style/ToolButton" android:drawableTop="@drawable/ic_pause" android:text="Pausar" />
+            <Button android:id="@+id/btnReset" style="@style/ToolButton" android:drawableTop="@drawable/ic_restart" android:text="Reiniciar" />
+            <Button android:id="@+id/btnPower" style="@style/ToolButton" android:drawableTop="@drawable/ic_power" android:text="Energia" />
+            <Button android:id="@+id/btnStop" style="@style/ToolButton" android:drawableTint="@color/danger" android:drawableTop="@drawable/ic_stop" android:text="Parar" />
+        </LinearLayout>
+    </HorizontalScrollView>
+
+    <!-- estado: bolinha colorida + texto -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/bg"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="10dp"
+        android:paddingTop="3dp"
+        android:paddingEnd="10dp"
+        android:paddingBottom="3dp">
+
+        <View
+            android:id="@+id/statusDot"
+            android:layout_width="8dp"
+            android:layout_height="8dp"
+            android:background="@drawable/dot"
+            android:backgroundTint="@color/ok" />
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:fontFamily="monospace"
+            android:singleLine="true"
+            android:textColor="@color/text2"
+            android:textSize="11sp" />
+    </LinearLayout>
+
+    <FrameLayout
+        android:id="@+id/vmArea"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <com.multivm.app.ScreenView
+            android:id="@+id/screen"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <LinearLayout
+            android:id="@+id/terminal"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <ScrollView
+                android:id="@+id/termScroll"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1">
+
+                <TextView
+                    android:id="@+id/termText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="monospace"
+                    android:padding="4dp"
+                    android:background="#05080C"
+                    android:textColor="#D8E0E8"
+                    android:textIsSelectable="true"
+                    android:textSize="11sp" />
+            </ScrollView>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@color/bg"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="6dp">
+
+                <EditText
+                    android:id="@+id/termInput"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:fontFamily="monospace"
+                    android:hint="comando (Enter envia)"
+                    android:imeOptions="actionSend|flagNoExtractUi"
+                    android:inputType="text|textNoSuggestions"
+                    android:textSize="13sp" />
+
+                <Button android:id="@+id/termCtrlC" style="@style/KeyButton" android:text="^C" />
+                <Button android:id="@+id/termTab" style="@style/KeyButton" android:text="Tab" />
+                <Button android:id="@+id/termUp" style="@style/KeyButton" android:text="↑" />
+                <Button android:id="@+id/termClear" style="@style/KeyButton" android:text="Limpar" />
+            </LinearLayout>
+        </LinearLayout>
+    </FrameLayout>
+
+    <HorizontalScrollView
+        android:id="@+id/keyBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/bg"
+        android:paddingStart="2dp"
+        android:paddingTop="2dp"
+        android:paddingEnd="2dp"
+        android:paddingBottom="2dp"
+        android:scrollbars="none">
+
+        <LinearLayout
+            android:id="@+id/keyRow"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal" />
+    </HorizontalScrollView>
+</LinearLayout>
