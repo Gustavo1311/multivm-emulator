@@ -223,6 +223,21 @@ uint32_t mvm_fb_generation(mvm_vm *vm);
  * (nesse caso 'info' traz o tamanho necessario). */
 bool mvm_fb_copy(mvm_vm *vm, void *dst, size_t dst_size, mvm_fb_info *info);
 
+/* Formatos de destino de mvm_fb_copy_rows. */
+typedef enum {
+    MVM_FB_COPY_XRGB, /* como o framebuffer (uint32 0x00RRGGBB) */
+    MVM_FB_COPY_ARGB, /* uint32 0xFFRRGGBB (android.graphics.Color) */
+    MVM_FB_COPY_RGBA, /* bytes R,G,B,0xFF (Bitmap ARGB_8888 / RGBA_8888) */
+} mvm_fb_copy_fmt;
+
+/* Copia so as linhas alteradas desde a geracao *since (copia tudo na primeira vez,
+ * se o historico nao cobrir o intervalo ou se o tamanho mudou) para dst (dst_w x dst_h,
+ * dst_stride bytes por linha) e atualiza *since. Devolve 1 se copiou, com as linhas em
+ * [*y0, *y1); 0 se nada mudou; -1 se o tamanho do destino nao bate com o framebuffer
+ * ('info' traz o tamanho atual) ou se nao ha framebuffer. */
+int mvm_fb_copy_rows(mvm_vm *vm, void *dst, uint32_t dst_w, uint32_t dst_h, size_t dst_stride,
+                     mvm_fb_copy_fmt fmt, uint32_t *since, uint32_t *y0, uint32_t *y1, mvm_fb_info *info);
+
 /* Conteudo da tela em modo texto VGA (ASCII, linhas separadas por '\n').
  * Retorna o numero de bytes ou 0 se a tela nao estiver em modo texto. */
 size_t mvm_text_screen(mvm_vm *vm, char *buf, size_t len);

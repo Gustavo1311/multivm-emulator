@@ -703,7 +703,8 @@ static int pc_init(mvm_vm *vm, char *err, size_t errlen)
         st_le(m->vga_pci->cfg + 0x2c, 0x1af4, 2);
         st_le(m->vga_pci->cfg + 0x2e, 0x1100, 2);
         st_le(m->vga_pci->cfg + 4, 3, 2);
-        pci_set_ram_bar(m->vga_pci, 0, VGA_VRAM_MB << 20, vga_vram(m->vgadev), vga_vram_gen(m->vgadev), true,
+        pci_set_ram_bar(m->vga_pci, 0, VGA_VRAM_MB << 20, vga_vram(m->vgadev), vga_vram_gen(m->vgadev),
+                        vga_vram_dirty(m->vgadev), true,
                         VGA_LFB_BASE);
         char *vpath = vm->cfg.vga_bios ? strdup(vm->cfg.vga_bios) : default_vgabios(vm->cfg.firmware);
         size_t vlen;

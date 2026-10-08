@@ -21,6 +21,7 @@ typedef struct pci_dev {
     void *bar_opaque[6];
     uint8_t *bar_host[6];              /* BAR de memoria respaldado por RAM (ex.: VRAM) */
     _Atomic uint32_t *bar_gen[6];      /* contador de escrita para BAR de RAM */
+    uint64_t *bar_dirty[6];            /* paginas sujas do BAR de RAM (ou NULL) */
     uint32_t default_bar[6];
     uint16_t default_cmd;
     void (*cfg_write)(struct pci_dev *d, unsigned off, uint32_t val, unsigned size);
@@ -48,7 +49,8 @@ pci_dev *pci_add_fn(pci_bus *b, int slot, int fn, uint16_t vendor, uint16_t devi
 /* ROM de expansao: os dados sao copiados; o tamanho e arredondado para potencia de 2 */
 void pci_set_rom(pci_dev *d, const uint8_t *data, size_t len);
 void pci_set_bar(pci_dev *d, int i, uint32_t size, bool io, const mvm_io_ops *ops, void *opaque, uint32_t addr);
-void pci_set_ram_bar(pci_dev *d, int i, uint32_t size, uint8_t *host, _Atomic uint32_t *gen, bool prefetch, uint32_t addr);
+void pci_set_ram_bar(pci_dev *d, int i, uint32_t size, uint8_t *host, _Atomic uint32_t *gen, uint64_t *dirty,
+                     bool prefetch, uint32_t addr);
 void pci_finalize(pci_dev *d);
 void pci_reset_dev(pci_dev *d);
 

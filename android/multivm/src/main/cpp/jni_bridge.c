@@ -5,6 +5,7 @@
  * nativeRun(); todo o codigo da VM (e os callbacks de serial) roda nela.
  * As demais funcoes podem ser chamadas de qualquer thread.
  */
+#include <dlfcn.h>
 #include <jni.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -509,6 +510,61 @@ JNIEXPORT jlong JNICALL JNI_FN(nativeFbCopyRgba)(JNIEnv *env, jclass cls, jlong 
             p[4 * i + 3] = 0xff;
         }
     return fb_result(ok, &fi);
+}
+
+/* libjnigraphics por dlopen (o build sem NDK nao tem os headers): prototipos de <android/bitmap.h> */
+typedef struct {
+    uint32_t width, height, stride;
+    int32_t format;
+    uint32_t flags;
+} bmp_info;
+#define BMP_FORMAT_RGBA_8888 1
+static struct {
+    int (*get_info)(JNIEnv *, jobject, bmp_info *);
+    int (*lock)(JNIEnv *, jobject, void **);
+    int (*unlock)(JNIEnv *, jobject);
+} jg;
+static pthread_once_t jg_once = PTHREAD_ONCE_INIT;
+
+static void jg_load(void)
+{
+    void *h = dlopen("libjnigraphics.so", RTLD_NOW);
+    if (!h)
+        return;
+    *(void **)&jg.get_info = dlsym(h, "AndroidBitmap_getInfo");
+    *(void **)&jg.lock = dlsym(h, "AndroidBitmap_lockPixels");
+    *(void **)&jg.unlock = dlsym(h, "AndroidBitmap_unlockPixels");
+    if (!jg.get_info || !jg.lock || !jg.unlock)
+        jg.lock = NULL;
+}
+
+/* Copia direto nos pixels de um Bitmap ARGB_8888 so as linhas alteradas desde state[0]
+ * (geracao ja copiada; 0 = nada). state[1..2] recebem as linhas copiadas.
+ * Devolve 1 se copiou, 0 se nada mudou, -1 se o tamanho nao bate (ou sem framebuffer)
+ * e -2 se a libjnigraphics nao estiver disponivel (use nativeFbCopyRgba). */
+JNIEXPORT jint JNICALL JNI_FN(nativeFbCopyBitmap)(JNIEnv *env, jclass cls, jlong h, jobject bitmap, jintArray state)
+{
+    (void)cls;
+    pthread_once(&jg_once, jg_load);
+    if (!jg.lock)
+        return -2;
+    bmp_info bi;
+    if (jg.get_info(env, bitmap, &bi) != 0 || bi.format != BMP_FORMAT_RGBA_8888)
+        return -2;
+    jint st[3];
+    (*env)->GetIntArrayRegion(env, state, 0, 3, st);
+    void *px = NULL;
+    if (jg.lock(env, bitmap, &px) != 0 || !px)
+        return -2;
+    uint32_t since = (uint32_t)st[0], y0 = 0, y1 = 0;
+    int r = mvm_fb_copy_rows(ctx_of(h)->vm, px, bi.width, bi.height, bi.stride, MVM_FB_COPY_RGBA, &since, &y0, &y1,
+                             NULL);
+    jg.unlock(env, bitmap);
+    st[0] = (jint)since;
+    st[1] = (jint)y0;
+    st[2] = (jint)y1;
+    (*env)->SetIntArrayRegion(env, state, 0, 3, st);
+    return r;
 }
 
 /* Tela em modo texto VGA (BIOS, boot loaders, console do DOS/Linux), ou null. */

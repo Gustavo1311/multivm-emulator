@@ -14,6 +14,7 @@ void vga_reset(vga *v);
 uint8_t *vga_vram(vga *v);
 uint32_t vga_vram_size(vga *v);
 _Atomic uint32_t *vga_vram_gen(vga *v);
+uint64_t *vga_vram_dirty(vga *v); /* 1 bit por pagina de 4 KiB da VRAM */
 /* texto da tela em modo texto (ASCII); 0 se nao estiver em modo texto */
 size_t vga_text(vga *v, char *buf, size_t len);
 

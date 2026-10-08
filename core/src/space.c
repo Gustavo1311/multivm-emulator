@@ -100,7 +100,7 @@ void space_write(mvm_space *s, uint64_t addr, uint64_t val, unsigned size)
             space_code_check(s, addr, size);
             st_le(r->host + off, val, size);
             if (r->dirty_gen)
-                atomic_fetch_add_explicit(r->dirty_gen, 1, memory_order_relaxed);
+                region_mark_dirty(r, off, size);
             return;
         }
         for (unsigned i = 0; i < size; i++)
@@ -116,11 +116,13 @@ uint8_t *space_ram_ptr(mvm_space *s, uint64_t addr, uint64_t len, bool write)
     mvm_region *r = space_find(s, addr);
     if (!r || !r->host)
         return NULL;
-    if (write && (r->readonly || r->dirty_gen))
+    if (write && (r->readonly || (r->dirty_gen && !r->dirty_bits)))
         return NULL;
     uint64_t off = addr - r->base;
     if (off + len > r->size)
         return NULL;
+    if (write && r->dirty_gen)
+        region_mark_dirty(r, off, len);
     if (write) /* o chamador vai escrever: codigo traduzido nessas paginas fica invalido */
         space_code_check(s, addr, len);
     return r->host + off;

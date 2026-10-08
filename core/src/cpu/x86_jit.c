@@ -15,7 +15,10 @@
  *
  * Codigo automodificavel: paginas com codigo traduzido ficam marcadas em
  * mem->code_bits; o TLB manda as escritas nelas pelo caminho lento e
- * space_write/space_ram_ptr chamam code_hook, que invalida os blocos da pagina.
+ * space_write/space_ram_ptr chamam code_hook, que invalida os blocos da pagina se a
+ * escrita acertar um trecho de 64 bytes com codigo traduzido (j->chunks): o kernel do
+ * XP mistura codigo e dados na mesma pagina, e invalidar a cada escrita de dado fazia o
+ * JIT retraduzir sem parar.
  * Blocos so se encadeiam dentro da mesma pagina fisica e do mesmo modo.
  */
 #include "x86_jit.h"
@@ -75,6 +78,7 @@ struct x86_jit {
     jit_block **pages;
     uint64_t npages;
     uint8_t *bits;
+    uint64_t *chunks; /* por pagina: trechos de 64 bytes com codigo traduzido */
     uint64_t n_trans, n_inval, n_flush, n_chain, n_enter, exit_why[8], ret_interp, ret_budget, ret_nomode, ret_nopage;
     unsigned max_insns;     /* MVM_JIT_MAXINSN (depuracao) */
     uint8_t skip[0x200];    /* MVM_JIT_SKIP=op,op,... opcodes deixados ao interpretador */
@@ -85,6 +89,7 @@ struct x86_jit {
      * na consulta, de modo que trocas de CR3/INVLPG nao exigem esvaziar o cache */
     struct { uint64_t key; uint32_t *code; uint64_t phys, pad; } jc[JC_SIZE];
     bool jc_used;   /* ha entradas validas no cache de saltos */
+    uint16_t *jc_cnt; /* entradas do cache de saltos por pagina fisica (< npages) */
     uint64_t site_gen;          /* geracao dos caches por ponto de salto (copia em jc[0].pad) */
     uint64_t *pending_site;     /* slot a preencher com o proximo bloco executado */
     uint64_t pending_flush;
@@ -408,6 +413,7 @@ typedef struct {
     bool stored;    /* a instrucao atual escreveu na memoria */
     bool dead;      /* os flags desta instrucao sao sobrescritos antes de serem lidos */
     uint64_t csbase, page_lin;  /* base do CS e pagina linear do bloco */
+    unsigned end_off;           /* deslocamento (na pagina) do fim da ultima instrucao */
     uint32_t mode;
     int flags_size;
     bool code64;
@@ -1403,6 +1409,245 @@ static bool emit_sse(jctx *x, jinsn *in)
     return true;
 }
 
+/* ---- MMX e operacoes inteiras SSE2 em NEON ----
+ * O XP desenha o cursor (e o GDI mistura cores) com MMX: antes cada instrucao ia ao
+ * interpretador. MMX = registradores D (64 bits) em c->mmx[]; SSE2 (66) = Q em c->xmm[]. */
+enum { VK_NONE, VK_V3, VK_V3SWAP, VK_SHIFT, VK_PACK, VK_MOVQ_LD, VK_MOVQ_ST, VK_MOVD_LD, VK_MOVD_ST };
+
+#define OFF_M(i) ((uint32_t)(offsetof(x86_cpu, mmx) + 8 * (unsigned)((i) & 7)))
+#define VQ 0x40000000u /* bit Q: vetor de 128 bits */
+
+static int vec_kind(const jinsn *in, uint32_t *vop, int *arg)
+{
+    if ((in->op & 0xf00) != 0x100 || in->rep || in->repne)
+        return VK_NONE;
+    int o = in->op & 0xff;
+    bool x = in->p66;
+    *arg = 0;
+    if (!x) {
+        switch (o) {
+        case 0x6f: return VK_MOVQ_LD;
+        case 0x7f: return VK_MOVQ_ST;
+        case 0x6e: *arg = (in->rex & 8) ? 8 : 4; return VK_MOVD_LD;
+        case 0x7e: *arg = (in->rex & 8) ? 8 : 4; return VK_MOVD_ST;
+        default: break;
+        }
+    }
+    uint32_t v;
+    switch (o) {
+    case 0xdb: v = 0x0E201C00u; break;                 /* pand */
+    case 0xdf: *vop = 0x0E601C00u; return VK_V3SWAP;   /* pandn = src & ~dst */
+    case 0xeb: v = 0x0EA01C00u; break;                 /* por */
+    case 0xef: v = 0x2E201C00u; break;                 /* pxor */
+    case 0xfc: case 0xfd: case 0xfe: v = 0x0E208400u | ((uint32_t)(o - 0xfc) << 22); break; /* padd b/w/d */
+    case 0xd4: v = x ? 0x0E208400u | (3u << 22) : 0x5EE08400u; break; /* paddq (mm: .1D nao existe, D escalar) */
+    case 0xf8: case 0xf9: case 0xfa: v = 0x2E208400u | ((uint32_t)(o - 0xf8) << 22); break; /* psub b/w/d */
+    case 0xfb: v = x ? 0x2E208400u | (3u << 22) : 0x7EE08400u; break; /* psubq */
+    case 0x74: case 0x75: case 0x76: v = 0x2E208C00u | ((uint32_t)(o - 0x74) << 22); break; /* pcmpeq */
+    case 0x64: case 0x65: case 0x66: v = 0x0E203400u | ((uint32_t)(o - 0x64) << 22); break; /* pcmpgt */
+    case 0xdc: case 0xdd: v = 0x2E200C00u | ((uint32_t)(o - 0xdc) << 22); break; /* paddus b/w */
+    case 0xd8: case 0xd9: v = 0x2E202C00u | ((uint32_t)(o - 0xd8) << 22); break; /* psubus b/w */
+    case 0xec: case 0xed: v = 0x0E200C00u | ((uint32_t)(o - 0xec) << 22); break; /* padds b/w */
+    case 0xe8: case 0xe9: v = 0x0E202C00u | ((uint32_t)(o - 0xe8) << 22); break; /* psubs b/w */
+    case 0xd5: v = 0x0E209C00u | (1u << 22); break;    /* pmullw */
+    case 0x60: case 0x61: case 0x62: v = 0x0E003800u | ((uint32_t)(o - 0x60) << 22); break; /* punpckl */
+    case 0x68: case 0x69: case 0x6a: v = 0x0E007800u | ((uint32_t)(o - 0x68) << 22); break; /* punpckh */
+    case 0x6c: if (!x) return VK_NONE; v = 0x0E003800u | (3u << 22); break; /* punpcklqdq */
+    case 0x6d: if (!x) return VK_NONE; v = 0x0E007800u | (3u << 22); break; /* punpckhqdq */
+    case 0xda: v = 0x2E206C00u; break;                 /* pminub */
+    case 0xde: v = 0x2E206400u; break;                 /* pmaxub */
+    case 0xea: v = 0x0E206C00u | (1u << 22); break;    /* pminsw */
+    case 0xee: v = 0x0E206400u | (1u << 22); break;    /* pmaxsw */
+    case 0xe0: v = 0x2E201400u; break;                 /* pavgb */
+    case 0xe3: v = 0x2E201400u | (1u << 22); break;    /* pavgw */
+    case 0x63: *arg = 0; return VK_PACK;               /* packsswb */
+    case 0x6b: *arg = 1; return VK_PACK;               /* packssdw */
+    case 0x67: *arg = 2; return VK_PACK;               /* packuswb */
+    case 0x71: case 0x72: case 0x73: {                 /* shifts por imediato (so registrador) */
+        if (in->mem)
+            return VK_NONE;
+        int r = in->reg & 7;
+        if (!(r == 2 || r == 6 || (r == 4 && o != 0x73)))
+            return VK_NONE;
+        *arg = ((o - 0x71 + 1) << 8) | (r << 4); /* log2(bytes do elemento) e operacao */
+        return VK_SHIFT;
+    }
+    default: return VK_NONE;
+    }
+    *vop = v | (x ? VQ : 0);
+    return VK_V3;
+}
+
+/* Vt = registrador MMX/XMM i (D ou Q) */
+static void vec_ld(jctx *x, int vt, int i, bool q)
+{
+    if (q) {
+        xmm_addr(x, i);
+        a64_ldr_q(&x->a, vt, 12);
+    } else {
+        a64_put(&x->a, 0xFD400000u | ((OFF_M(i) / 8) << 10) | ((uint32_t)RC << 5) | (uint32_t)vt);
+    }
+}
+
+static void vec_st(jctx *x, int vt, int i, bool q)
+{
+    if (q) {
+        xmm_addr(x, i);
+        a64_str_q(&x->a, vt, 12);
+    } else {
+        a64_put(&x->a, 0xFD000000u | ((OFF_M(i) / 8) << 10) | ((uint32_t)RC << 5) | (uint32_t)vt);
+    }
+}
+
+static bool emit_vec(jctx *x, jinsn *in)
+{
+    uint32_t vop = 0;
+    int arg;
+    int k = vec_kind(in, &vop, &arg);
+    if (k == VK_NONE || OFF_M(7) + 8 > 32760)
+        return false;
+    a64 *a = &x->a;
+    bool q = in->p66;
+    int bytes = q ? 16 : 8;
+    uint32_t *slow[4];
+    int ns = 0;
+    a64_ldr(a, 8, 9, RC, OFF(cr0));
+    a64_and_bitmask(a, 9, 9, (1u << 12) | (62u << 6) | 1u); /* TS | EM */
+    slow[ns++] = a64_here(a);
+    a64_cbnz(a, 1, 9, a64_here(a));
+    x->nocache++;
+    int rg = in->reg, rm = in->rm;
+    bool mem = in->mem;
+    uint32_t *s1, *s2;
+#define VEC_TLB(n, tag)                                                                        \
+    do {                                                                                       \
+        emit_ea(x, in);                                                                        \
+        emit_tlb(x, REA, n, (uint32_t)offsetof(x86_tlbe, tag), &s1, &s2);                      \
+        slow[ns++] = s1;                                                                       \
+        if (s2)                                                                                \
+            slow[ns++] = s2;                                                                   \
+    } while (0)
+    /* fonte (r/m) em v1 */
+#define VEC_SRC()                                                                              \
+    do {                                                                                       \
+        if (mem) {                                                                             \
+            VEC_TLB(bytes, tag_r);                                                             \
+            if (q)                                                                             \
+                a64_ldr_q_reg(a, 1, 10, REA);                                                  \
+            else                                                                               \
+                a64_put(a, 0xFC606800u | ((uint32_t)REA << 16) | (10u << 5) | 1u);            \
+        } else {                                                                               \
+            vec_ld(x, 1, rm, q);                                                               \
+        }                                                                                      \
+    } while (0)
+    switch (k) {
+    case VK_V3:
+    case VK_V3SWAP:
+        VEC_SRC();
+        vec_ld(x, 0, rg, q);
+        if (k == VK_V3)
+            a64_v3(a, vop | (q ? VQ : 0), 0, 0, 1);
+        else
+            a64_v3(a, vop | (q ? VQ : 0), 0, 1, 0);
+        vec_st(x, 0, rg, q);
+        break;
+    case VK_PACK: {
+        static const uint32_t narrow[3] = {0x0E214800u, 0x0E614800u, 0x2E212800u}; /* sqxtn.8b, sqxtn.4h, sqxtun.8b */
+        VEC_SRC();
+        vec_ld(x, 0, rg, q);
+        if (q) {
+            a64_put(a, narrow[arg] | (0u << 5) | 2u);       /* v2 = estreita(dst) (metade baixa) */
+            a64_put(a, narrow[arg] | VQ | (1u << 5) | 2u);  /* v2 metade alta = estreita(src) */
+            vec_st(x, 2, rg, q);
+        } else {
+            a64_put(a, 0x6E180400u | (1u << 5) | 0u);       /* v0.d[1] = v1.d[0] */
+            a64_put(a, narrow[arg] | (0u << 5) | 0u);
+            vec_st(x, 0, rg, q);
+        }
+        break;
+    }
+    case VK_SHIFT: {
+        int lg = arg >> 8, op = (arg >> 4) & 15; /* lg: 1=16 2=32 3=64 bits */
+        int es = 8 << lg, n = (int)(in->imm & 0xff);
+        int r = rm & (q ? 15 : 7);
+        vec_ld(x, 0, r, q);
+        if (op == 4 && n >= es)
+            n = es; /* psra: preenche com o sinal */
+        if (n == 0) {
+            /* nada */
+        } else if (n >= es && op != 4) {
+            a64_v3(a, 0x2E201C00u | (q ? VQ : 0), 0, 0, 0); /* eor: zera */
+        } else if (lg == 3 && !q) {                         /* D escalar */
+            if (op == 2)
+                a64_put(a, 0x7F000400u | ((uint32_t)(128 - n) << 16));
+            else
+                a64_put(a, 0x5F005400u | ((uint32_t)(64 + n) << 16));
+        } else if (op == 2) {
+            a64_put(a, 0x2F000400u | (q ? VQ : 0) | ((uint32_t)(2 * es - n) << 16)); /* ushr */
+        } else if (op == 4) {
+            a64_put(a, 0x0F000400u | (q ? VQ : 0) | ((uint32_t)(2 * es - n) << 16)); /* sshr */
+        } else {
+            a64_put(a, 0x0F005400u | (q ? VQ : 0) | ((uint32_t)(es + n) << 16));     /* shl */
+        }
+        vec_st(x, 0, r, q);
+        break;
+    }
+    case VK_MOVQ_LD: /* movq mm, mm/m64 */
+        if (mem) {
+            VEC_TLB(8, tag_r);
+            a64_ldr_reg(a, 8, 11, 10, REA);
+        } else {
+            a64_ldr(a, 8, 11, RC, OFF_M(rm));
+        }
+        a64_str(a, 8, 11, RC, OFF_M(rg));
+        break;
+    case VK_MOVQ_ST: /* movq mm/m64, mm (valor em x12: emit_tlb usa x9-x11) */
+        a64_ldr(a, 8, 12, RC, OFF_M(rg));
+        if (mem) {
+            VEC_TLB(8, tag_w);
+            a64_str_reg(a, 8, 12, 10, REA);
+            x->stored = true;
+        } else {
+            a64_str(a, 8, 12, RC, OFF_M(rm));
+        }
+        break;
+    case VK_MOVD_LD: /* movd/movq mm, r/m */
+        if (mem) {
+            VEC_TLB(arg, tag_r);
+            a64_ldr_reg(a, arg, 11, 10, REA);
+        } else {
+            ld_greg(x, 11, rm, arg, true);
+        }
+        a64_str(a, 8, 11, RC, OFF_M(rg));
+        break;
+    case VK_MOVD_ST: /* movd/movq r/m, mm */
+        a64_ldr(a, arg, 12, RC, OFF_M(rg));
+        if (mem) {
+            VEC_TLB(arg, tag_w);
+            a64_str_reg(a, arg, 12, 10, REA);
+            x->stored = true;
+        } else {
+            st_greg(x, 12, rm, arg, true);
+        }
+        break;
+    }
+#undef VEC_SRC
+#undef VEC_TLB
+    x->nocache--;
+    uint32_t *jdone = a64_here(a);
+    a64_b(a, a64_here(a));
+    for (int i = 0; i < ns; i++)
+        a64_patch(slow[i], a64_here(a));
+    int fop = x->flags_op, fsz = x->flags_size;
+    x->slowpath++;
+    emit_icall(x, in);
+    x->slowpath--;
+    x->flags_op = fop; /* MMX/SSE inteiro nao altera flags */
+    x->flags_size = fsz;
+    a64_patch(jdone, a64_here(a));
+    return true;
+}
+
 /* ---- instrucoes "icall" feitas em codigo nativo ---- */
 
 /* CF = cf, demais flags aritmeticos preservados */
@@ -1677,7 +1922,7 @@ static int emit_insn(jctx *x, jinsn *in)
     a64 *a = &x->a;
     int op = in->op, sz = op_size(in);
     bool rex = rexf(in);
-    if (in->icall && emit_sse(x, in))
+    if (in->icall && (emit_sse(x, in) || (!(x->j->off & 64) && emit_vec(x, in))))
         return 1;
     if (in->icall) {
         int nk = native_icall_kind(in);
@@ -2170,15 +2415,24 @@ static bool mode_ok(x86_cpu *c)
 
 static unsigned hash_of(uint64_t lin, uint32_t mode) { return (unsigned)((lin >> 2) ^ (lin >> 17) ^ mode) & ((1u << HASH_BITS) - 1); }
 
-static void mark_code_page(struct x86_jit *j, uint64_t phys)
+static uint64_t chunk_mask(unsigned lo, unsigned hi) /* trechos de 64 bytes em [lo, hi) */
+{
+    if (hi <= lo)
+        return 0;
+    unsigned a = lo >> 6, b = (hi - 1) >> 6;
+    return (b >= 63 ? ~0ULL : (2ULL << b) - 1) & ~((1ULL << a) - 1);
+}
+
+static void mark_code_page(struct x86_jit *j, uint64_t phys, unsigned end_off)
 {
     if (phys >= j->mem->code_limit)
         return;
     uint64_t pg = phys >> 12;
+    j->chunks[pg] |= chunk_mask((unsigned)(phys & 0xfff), end_off);
     if (!((j->bits[pg >> 3] >> (pg & 7)) & 1)) {
         j->bits[pg >> 3] |= (uint8_t)(1u << (pg & 7));
         /* as entradas de TLB para escrita nessa pagina precisam ir pelo caminho lento */
-        x86_tlb_flush(j->c);
+        x86_tlb_protect_page(j->c, phys & ~0xfffULL);
     }
 }
 
@@ -2186,6 +2440,23 @@ static void mark_code_page(struct x86_jit *j, uint64_t phys)
 static void jc_reset(struct x86_jit *j)
 {
     memset(j->jc, 0xff, sizeof(j->jc)); /* chave ~0 nunca bate */
+    if (j->jc_cnt)
+        memset(j->jc_cnt, 0, j->npages * sizeof(uint16_t));
+    j->jc[0].pad = ++j->site_gen;
+    j->pending_site = NULL;
+}
+
+/* invalida so as entradas do cache de saltos da pagina pg (e os caches por ponto de salto) */
+static void jc_drop_page(struct x86_jit *j, uint64_t pg)
+{
+    if (j->jc_cnt[pg]) {
+        for (unsigned i = 0; i < JC_SIZE; i++)
+            if (j->jc[i].phys >> 12 == pg) {
+                j->jc[i].key = ~0ULL;
+                j->jc[i].phys = ~0ULL;
+            }
+        j->jc_cnt[pg] = 0;
+    }
     j->jc[0].pad = ++j->site_gen;
     j->pending_site = NULL;
 }
@@ -2204,6 +2475,8 @@ void x86_jit_flush(struct x86_jit *j)
         memset(j->pages, 0, j->npages * sizeof(jit_block *));
     if (j->bits)
         memset(j->bits, 0, (j->npages + 7) / 8);
+    if (j->chunks)
+        memset(j->chunks, 0, j->npages * sizeof(uint64_t));
     j->nblocks = 0;
     j->pos = j->exit_stub + 32; /* o stub fica no inicio */
     j->c->jit_exit = NULL;
@@ -2215,19 +2488,23 @@ void x86_jit_flush(struct x86_jit *j)
 static void code_hook(void *opaque, uint64_t pa, uint64_t len)
 {
     struct x86_jit *j = opaque;
-    (void)len;
     uint64_t pg = pa >> 12;
     if (pg >= j->npages)
         return;
+    /* escrita em dado vizinho de codigo: a pagina continua traduzida (e com escritas lentas) */
+    unsigned lo = (unsigned)(pa & 0xfff), hi = lo + (unsigned)(len > 0x1000 - lo ? 0x1000 - lo : len);
+    if (!(j->chunks[pg] & chunk_mask(lo, hi ? hi : lo + 1)))
+        return;
+    j->chunks[pg] = 0;
     for (jit_block *b = j->pages[pg]; b; b = b->pnext)
         b->valid = false;
     j->pages[pg] = NULL;
     j->bits[pg >> 3] &= (uint8_t)~(1u << (pg & 7));
     j->n_inval++;
     j->c->jit_smc = 1;
-    jc_reset(j);
+    jc_drop_page(j, pg);
     /* a pagina volta a aceitar escritas rapidas */
-    x86_tlb_flush(j->c);
+    x86_tlb_unprotect_page(j->c, pa & ~0xfffULL);
 }
 
 static jit_block *lookup(struct x86_jit *j, uint64_t lin, uint64_t phys, uint32_t mode, uint64_t csbase)
@@ -2328,6 +2605,7 @@ static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const b
         ins[n] = in;
         stored[n] = x->stored;
         n++;
+        x->end_off = off + (unsigned)in.len;
         rip = in.next;
         if (r == 0) {
             ended = true;
@@ -2442,7 +2720,7 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
         fflush(dis);
     }
     __builtin___clear_cache((char *)b->code, (char *)j->pos);
-    mark_code_page(j, phys);
+    mark_code_page(j, phys, x.end_off);
     if ((phys >> 12) < j->npages) {
         b->pnext = j->pages[phys >> 12];
         j->pages[phys >> 12] = b;
@@ -2512,6 +2790,11 @@ int64_t x86_jit_run(x86_cpu *c, int64_t budget)
     if (!csbase) { /* registra no cache de saltos */
         uint64_t key = c->rip ^ ((uint64_t)mode << 59);
         unsigned h = (unsigned)(c->rip ^ (c->rip >> 12)) & (JC_SIZE - 1);
+        uint64_t opg = j->jc[h].phys >> 12, npg = phys >> 12;
+        if (j->jc[h].key != ~0ULL && opg < j->npages && j->jc_cnt[opg])
+            j->jc_cnt[opg]--;
+        if (npg < j->npages && j->jc_cnt[npg] < 0xffff)
+            j->jc_cnt[npg]++;
         j->jc[h].key = key;
         j->jc[h].code = b->code;
         j->jc[h].phys = phys & ~0xfffULL;
@@ -2583,6 +2866,8 @@ struct x86_jit *x86_jit_new(x86_cpu *c)
     j->npages = (c->vm->ram_size + 0xfff) >> 12;
     j->pages = calloc(j->npages, sizeof(jit_block *));
     j->bits = calloc((j->npages + 7) / 8 + 1, 1);
+    j->jc_cnt = calloc(j->npages, sizeof(uint16_t));
+    j->chunks = calloc(j->npages, sizeof(uint64_t));
     c->mem->code_bits = j->bits;
     c->mem->code_limit = j->npages << 12;
     c->mem->code_hook = code_hook;
@@ -2622,6 +2907,8 @@ void x86_jit_free(struct x86_jit *j)
     free(j->blocks);
     free(j->pages);
     free(j->bits);
+    free(j->jc_cnt);
+    free(j->chunks);
     free(j);
 }
 

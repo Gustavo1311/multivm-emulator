@@ -41,8 +41,10 @@ static void bar_update(pci_dev *d, int i)
         }
         if (d->bar_host[i]) {
             mvm_region *r = space_add_ram(sp, base, d->bar_size[i], d->bar_host[i], false, "pci-bar-ram");
-            if (r)
+            if (r) {
                 r->dirty_gen = d->bar_gen[i];
+                r->dirty_bits = d->bar_dirty[i];
+            }
         } else {
             space_add_io(sp, base, d->bar_size[i], d->bar_ops[i], d->bar_opaque[i], "pci-bar");
         }
@@ -220,12 +222,14 @@ void pci_set_bar(pci_dev *d, int i, uint32_t size, bool io, const mvm_io_ops *op
     st_le(d->cfg + 0x10 + 4 * i, (addr & ~(size - 1)) | (io ? 1 : 0), 4);
 }
 
-void pci_set_ram_bar(pci_dev *d, int i, uint32_t size, uint8_t *host, _Atomic uint32_t *gen, bool prefetch, uint32_t addr)
+void pci_set_ram_bar(pci_dev *d, int i, uint32_t size, uint8_t *host, _Atomic uint32_t *gen, uint64_t *dirty,
+                     bool prefetch, uint32_t addr)
 {
     d->bar_size[i] = size;
     d->bar_io[i] = false;
     d->bar_host[i] = host;
     d->bar_gen[i] = gen;
+    d->bar_dirty[i] = dirty;
     st_le(d->cfg + 0x10 + 4 * i, (addr & ~(size - 1)) | (prefetch ? 8 : 0), 4);
 }
 

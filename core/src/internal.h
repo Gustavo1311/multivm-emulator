@@ -40,6 +40,9 @@ typedef struct {
     uint8_t *host;        /* nao-NULL: RAM/ROM mapeada diretamente */
     bool readonly;
     _Atomic uint32_t *dirty_gen; /* incrementado a cada escrita (framebuffer/VRAM) */
+    /* com dirty_gen: 1 bit por pagina (4 KiB, relativa a base) marcado na escrita. Paginas ja
+     * marcadas aceitam escrita direta pelo TLB ate o dono zerar o bit (ex.: VRAM da VGA). */
+    uint64_t *dirty_bits;
     const mvm_io_ops *ops;
     void *opaque;
     const char *name;
@@ -71,7 +74,22 @@ static inline void space_code_check(mvm_space *s, uint64_t pa, uint64_t len)
         return;
     for (uint64_t p = pa & ~0xfffULL; p < pa + len; p += 0x1000)
         if (space_is_code(s, p))
-            s->code_hook(s->code_opaque, p, 0x1000);
+            s->code_hook(s->code_opaque, p > pa ? p : pa, (pa + len < p + 0x1000 ? pa + len : p + 0x1000) - (p > pa ? p : pa));
+}
+
+static inline bool region_page_dirty(const mvm_region *r, uint64_t pa)
+{
+    uint64_t pg = (pa - r->base) >> 12;
+    return r->dirty_bits && ((__atomic_load_n(&r->dirty_bits[pg >> 6], __ATOMIC_RELAXED) >> (pg & 63)) & 1);
+}
+
+/* marca [off, off+len) da regiao como escrita */
+static inline void region_mark_dirty(const mvm_region *r, uint64_t off, uint64_t len)
+{
+    if (r->dirty_bits && len)
+        for (uint64_t pg = off >> 12; pg <= (off + len - 1) >> 12; pg++)
+            __atomic_fetch_or(&r->dirty_bits[pg >> 6], 1ULL << (pg & 63), __ATOMIC_RELAXED);
+    atomic_fetch_add_explicit(r->dirty_gen, 1, memory_order_relaxed);
 }
 
 mvm_region *space_add_ram(mvm_space *s, uint64_t base, uint64_t size, uint8_t *host,
@@ -179,6 +197,8 @@ typedef struct {
     void (*dump)(void *cpu, FILE *f);
     void (*destroy)(void *cpu);
     void (*tlb_flush)(void *cpu); /* mapa fisico mudou (ex.: BAR PCI realocado) */
+    /* paginas sujas consumidas: escritas na RAM do host em [host, host+len) voltam ao caminho lento */
+    void (*tlb_protect)(void *cpu, const uint8_t *host, size_t len);
 } mvm_cpu_ops;
 
 /* ---- maquina ---- */
@@ -253,6 +273,11 @@ struct mvm_vm {
     uint32_t fb_w, fb_h, fb_stride;
     uint64_t fb_size;
     _Atomic uint32_t fb_gen;
+    /* linhas alteradas por renderizacao (geracao -> faixa), para copias parciais; sob fb_lock */
+    struct { uint32_t gen; uint32_t y0, y1; } fb_log[32];
+    _Atomic int64_t fb_watch_ns; /* ultima vez que alguem olhou o framebuffer (host_clock_ns) */
+    void (*fb_flush)(void *opaque); /* desenha o que estiver pendente (thread da VM) */
+    void *fb_flush_opaque;
 
     /* entrada (produtor: threads externas; consumidor: thread da VM) */
     pthread_mutex_t in_lock;
@@ -284,6 +309,10 @@ void vm_kick(mvm_vm *vm, bool urgent);
 void vm_request_guest_reset(mvm_vm *vm);
 void vm_fatal(mvm_vm *vm, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static inline void vm_fb_touch(mvm_vm *vm) { atomic_fetch_add_explicit(&vm->fb_gen, 1, memory_order_relaxed); }
+/* com fb_lock: nova geracao do framebuffer com as linhas [y0, y1) alteradas */
+void vm_fb_rows_changed(mvm_vm *vm, uint32_t y0, uint32_t y1);
+/* alguem mostrou o framebuffer nos ultimos ms milissegundos? (senao a VGA pode adiar o desenho) */
+bool vm_fb_watched(mvm_vm *vm, int64_t ms);
 
 /* ---- rede em modo usuario (net/) ---- */
 typedef struct mvm_net mvm_net;

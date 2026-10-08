@@ -29,6 +29,13 @@ struct vga {
     _Atomic uint32_t vram_gen;
     uint32_t drawn_gen;
     bool regs_dirty;
+    /* paginas (4 KiB) da VRAM escritas desde o ultimo desenho; o LFB marca pelo caminho lento
+     * do TLB e depois escreve direto ate o desenho zerar o bit (tlb_protect) */
+    uint64_t *dirty;
+    uint32_t dirty_words;
+    uint64_t *snap; /* copia de dirty durante o desenho */
+    int drawn_mode; /* modo do ultimo desenho (-1: nenhum) */
+    bool resized;
 
     uint8_t misc, fcr;
     uint8_t sr_idx, sr[8];
@@ -110,6 +117,12 @@ static uint8_t mem_readb(vga *v, uint32_t addr)
     return (uint8_t)(~r);
 }
 
+static inline void mark_dirty(vga *v, uint32_t off)
+{
+    uint32_t pg = off >> 12;
+    __atomic_fetch_or(&v->dirty[pg >> 6], 1ULL << (pg & 63), __ATOMIC_RELAXED);
+}
+
 static void mem_writeb(vga *v, uint32_t addr, uint8_t val)
 {
     if (map_addr(v, &addr) < 0)
@@ -117,21 +130,26 @@ static void mem_writeb(vga *v, uint32_t addr, uint8_t val)
     v->vram_gen++;
     if (v->sr[4] & 0x08) {
         uint32_t mask = 1u << (addr & 3);
-        if ((v->sr[2] & mask) && addr < v->vram_size)
+        if ((v->sr[2] & mask) && addr < v->vram_size) {
             v->vram[addr] = val;
+            mark_dirty(v, addr);
+        }
         return;
     }
     if (v->gr[5] & 0x10) {
         uint32_t plane = (v->gr[4] & 2) | (addr & 1);
         if (v->sr[2] & (1u << plane)) {
             uint32_t off = ((addr & ~1u) << 1) | plane;
-            if (off < v->vram_size)
+            if (off < v->vram_size) {
                 v->vram[off] = val;
+                mark_dirty(v, off);
+            }
         }
         return;
     }
     if (addr * 4 + 4 > v->vram_size)
         return;
+    mark_dirty(v, addr * 4);
     uint32_t w, bit_mask, b;
     switch (v->gr[5] & 3) {
     case 0:
@@ -482,6 +500,7 @@ static bool set_size(vga *v, uint32_t w, uint32_t h)
     mvm_vm *vm = v->vm;
     if (w == 0 || h == 0 || (uint64_t)w * h * 4 > vm->fb_size)
         return false;
+    v->resized = vm->fb_w != w || vm->fb_h != h;
     vm->fb_w = w;
     vm->fb_h = h;
     vm->fb_stride = w * 4;
@@ -553,17 +572,45 @@ static void draw_text(vga *v)
     txt[tn] = 0;
 }
 
-static void draw_vbe(vga *v)
+/* alguma pagina de [lo, hi) da VRAM foi escrita? (snap NULL: desenho completo) */
+static bool range_dirty(const vga *v, const uint64_t *snap, uint64_t lo, uint64_t hi)
+{
+    if (!snap)
+        return true;
+    if (hi > v->vram_size)
+        hi = v->vram_size;
+    if (lo >= hi)
+        return false;
+    for (uint64_t pg = lo >> 12; pg <= (hi - 1) >> 12; pg++)
+        if ((snap[pg >> 6] >> (pg & 63)) & 1)
+            return true;
+    return false;
+}
+
+static inline void row_done(uint32_t y, uint32_t *y0, uint32_t *y1)
+{
+    if (y < *y0)
+        *y0 = y;
+    if (y + 1 > *y1)
+        *y1 = y + 1;
+}
+
+static void draw_vbe(vga *v, const uint64_t *snap, uint32_t *y0, uint32_t *y1)
 {
     unsigned w = v->vbe[VBE_IDX_XRES], h = v->vbe[VBE_IDX_YRES], bpp = v->vbe[VBE_IDX_BPP];
     if (!set_size(v, w, h))
         return;
+    if (v->resized)
+        snap = NULL;
     uint32_t *out = (uint32_t *)v->vm->fb;
     for (unsigned y = 0; y < h; y++) {
         uint64_t lo = v->vbe_start + (uint64_t)y * v->vbe_line;
         uint32_t *d = out + (size_t)y * w;
         const uint8_t *s = v->vram + lo;
         uint64_t need = bpp == 4 ? w / 2 : (uint64_t)w * ((bpp + 7) / 8);
+        if (!range_dirty(v, snap, lo, lo + need))
+            continue;
+        row_done(y, y0, y1);
         if (lo + need > v->vram_size) {
             memset(d, 0, (size_t)w * 4);
             continue;
@@ -599,7 +646,7 @@ static void draw_vbe(vga *v)
     }
 }
 
-static void draw_graphics(vga *v)
+static void draw_graphics(vga *v, const uint64_t *snap, uint32_t *y0, uint32_t *y1)
 {
     unsigned shift = (v->gr[5] >> 5) & 3;
     unsigned hde = v->cr[1] + 1u;
@@ -615,6 +662,8 @@ static void draw_graphics(vga *v)
     h = (vde + 1) / ms;
     if (!set_size(v, w, h))
         return;
+    if (v->resized || shift == 1)
+        snap = NULL;
     uint32_t *out = (uint32_t *)v->vm->fb;
     uint32_t start = (((uint32_t)v->cr[0xc] << 8) | v->cr[0xd]) * 4;
     uint32_t line = (uint32_t)v->cr[0x13] << 3;
@@ -630,6 +679,9 @@ static void draw_graphics(vga *v)
             la = start + (y >> 1) * line + ((y & 1) ? 0x2000 * 4 : 0);
         else
             la = start + y * line;
+        if (!range_dirty(v, snap, la, la + (shift == 2 ? w : (w / 8) * 4)))
+            continue;
+        row_done(y, y0, y1);
         for (unsigned x = 0; x < w; x++) {
             uint32_t c;
             if (shift == 2) {
@@ -655,23 +707,77 @@ static void draw_graphics(vga *v)
     }
 }
 
-static void render(vga *v)
+enum { MODE_BLANK, MODE_VBE, MODE_TEXT, MODE_GRAPHICS };
+
+static int cur_mode(vga *v)
+{
+    if (vbe_on(v))
+        return MODE_VBE;
+    if (!(v->ar_idx & 0x20))
+        return MODE_BLANK; /* PAS = 0: tela apagada; mantem a ultima imagem */
+    return (v->gr[6] & 1) ? MODE_GRAPHICS : MODE_TEXT;
+}
+
+/* Desenha as linhas cujas paginas de VRAM mudaram (ou tudo, se full). Thread da VM. */
+static void render(vga *v, bool full)
 {
     mvm_vm *vm = v->vm;
+    int mode = cur_mode(v);
+    bool any = false;
+    for (uint32_t i = 0; i < v->dirty_words; i++) {
+        v->snap[i] = __atomic_exchange_n(&v->dirty[i], 0, __ATOMIC_RELAXED);
+        any |= v->snap[i] != 0;
+    }
+    /* as proximas escritas nessas paginas precisam passar de novo pelo caminho lento */
+    if (any && vm->cpu_ops && vm->cpu_ops->tlb_protect)
+        vm->cpu_ops->tlb_protect(vm->cpu, v->vram, v->vram_size);
+    if (mode != v->drawn_mode)
+        full = true;
+    const uint64_t *snap = full ? NULL : v->snap;
+    uint32_t y0 = UINT32_MAX, y1 = 0;
+    v->resized = false;
     pthread_mutex_lock(&vm->fb_lock);
     v->text_mode = false;
-    if (vbe_on(v)) {
-        draw_vbe(v);
-    } else if (!(v->ar_idx & 0x20)) {
-        /* PAS = 0: tela apagada; mantem a ultima imagem */
-    } else if (!(v->gr[6] & 1)) {
+    switch (mode) {
+    case MODE_VBE:
+        draw_vbe(v, snap, &y0, &y1);
+        break;
+    case MODE_TEXT:
         v->text_mode = true;
         draw_text(v);
-    } else {
-        draw_graphics(v);
+        y0 = 0;
+        y1 = vm->fb_h;
+        break;
+    case MODE_GRAPHICS:
+        draw_graphics(v, snap, &y0, &y1);
+        break;
+    default:
+        break;
     }
+    if (y0 < y1)
+        vm_fb_rows_changed(vm, y0, y1 > vm->fb_h ? vm->fb_h : y1);
     pthread_mutex_unlock(&vm->fb_lock);
-    vm_fb_touch(vm);
+    v->drawn_mode = mode;
+}
+
+static bool vram_dirty(vga *v)
+{
+    for (uint32_t i = 0; i < v->dirty_words; i++)
+        if (__atomic_load_n(&v->dirty[i], __ATOMIC_RELAXED))
+            return true;
+    return false;
+}
+
+/* Desenha o que estiver pendente (fim da execucao, VM pausada). Thread da VM. */
+static void flush_cb(void *opaque)
+{
+    vga *v = opaque;
+    if (v->regs_dirty || v->drawn_mode != cur_mode(v) || vram_dirty(v)) {
+        bool full = v->regs_dirty;
+        v->regs_dirty = false;
+        v->drawn_gen = v->vram_gen;
+        render(v, full);
+    }
 }
 
 static void refresh_cb(void *opaque)
@@ -685,16 +791,23 @@ static void refresh_cb(void *opaque)
         blink_changed = !(v->gr[6] & 1) && !vbe_on(v);
     }
     uint32_t gen = v->vram_gen;
-    if (gen != v->drawn_gen || v->regs_dirty || blink_changed) {
-        v->drawn_gen = gen;
-        v->regs_dirty = false;
-        render(v);
+    int mode = cur_mode(v);
+    bool full = v->regs_dirty || blink_changed;
+    if (full || gen != v->drawn_gen || mode != v->drawn_mode || vram_dirty(v)) {
+        /* modo grafico sem ninguem olhando (app em segundo plano, sem VNC): adia o desenho;
+         * as paginas continuam marcadas e o modo texto sempre e desenhado (texto da tela) */
+        if (mode == MODE_TEXT || mode == MODE_BLANK || vm_fb_watched(v->vm, 500)) {
+            v->drawn_gen = gen;
+            v->regs_dirty = false;
+            render(v, full);
+        }
     }
     timer_mod(v->vm, &v->refresh, now + REFRESH_NS);
 }
 
 _Atomic uint32_t *vga_vram_gen(vga *v) { return &v->vram_gen; }
 uint8_t *vga_vram(vga *v) { return v->vram; }
+uint64_t *vga_vram_dirty(vga *v) { return v->dirty; }
 uint32_t vga_vram_size(vga *v) { return v->vram_size; }
 
 size_t vga_text(vga *v, char *buf, size_t len)
@@ -728,6 +841,7 @@ void vga_reset(vga *v)
     v->vbe[VBE_IDX_ID] = VBE_ID;
     v->bank_offset = 0;
     v->regs_dirty = true;
+    v->drawn_mode = -1;
     timer_mod(v->vm, &v->refresh, mvm_now(v->vm) + REFRESH_NS);
 }
 
@@ -737,7 +851,12 @@ vga *vga_new(mvm_vm *vm, uint32_t vram_mb)
     v->vm = vm;
     v->vram_size = vram_mb << 20;
     v->vram = calloc(1, v->vram_size);
+    v->dirty_words = (v->vram_size / 4096 + 63) / 64;
+    v->dirty = calloc(v->dirty_words, 8);
+    v->snap = calloc(v->dirty_words, 8);
     timer_init(&v->refresh, refresh_cb, v);
+    vm->fb_flush = flush_cb;
+    vm->fb_flush_opaque = v;
     vga_reset(v);
     return v;
 }
@@ -747,6 +866,10 @@ void vga_free(vga *v)
     if (!v)
         return;
     timer_del(v->vm, &v->refresh);
+    if (v->vm->fb_flush_opaque == v)
+        v->vm->fb_flush = NULL;
     free(v->vram);
+    free(v->dirty);
+    free(v->snap);
     free(v);
 }

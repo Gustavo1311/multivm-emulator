@@ -554,6 +554,8 @@ int mvm_run(mvm_vm *vm)
 {
     atomic_store(&vm->running, 1);
     int r = run_loop(vm);
+    if (vm->fb_flush) /* a ultima imagem fica disponivel depois da execucao */
+        vm->fb_flush(vm->fb_flush_opaque);
     atomic_store(&vm->running, 0);
     media_service(vm); /* pedido que chegou na saida */
     pthread_mutex_lock(&vm->media_lock);
@@ -592,6 +594,8 @@ static int run_loop(mvm_vm *vm)
             vm->paused_at = host_clock_ns();
             while (atomic_load(&vm->pause_req) && !atomic_load(&vm->stop_req)) {
                 media_service(vm); /* troca de midia tambem com a VM pausada */
+                if (vm->fb_flush && vm_fb_watched(vm, 500)) /* desenho adiado sem espectador */
+                    vm->fb_flush(vm->fb_flush_opaque);
                 wait_until(vm, host_clock_ns() + 100000000LL);
             }
             vm->clock_offset += host_clock_ns() - vm->paused_at;
@@ -682,12 +686,105 @@ bool mvm_fb_info_get(mvm_vm *vm, mvm_fb_info *info)
     return true;
 }
 
-uint32_t mvm_fb_generation(mvm_vm *vm) { return atomic_load(&vm->fb_gen); }
+/* Quem consulta a geracao esta mostrando a tela: a VGA so desenha modos graficos assim. */
+uint32_t mvm_fb_generation(mvm_vm *vm)
+{
+    atomic_store_explicit(&vm->fb_watch_ns, host_clock_ns(), memory_order_relaxed);
+    return atomic_load(&vm->fb_gen);
+}
+
+bool vm_fb_watched(mvm_vm *vm, int64_t ms)
+{
+    return host_clock_ns() - atomic_load_explicit(&vm->fb_watch_ns, memory_order_relaxed) < ms * 1000000LL;
+}
+
+void vm_fb_rows_changed(mvm_vm *vm, uint32_t y0, uint32_t y1)
+{
+    uint32_t g = atomic_fetch_add(&vm->fb_gen, 1) + 1;
+    unsigned n = sizeof(vm->fb_log) / sizeof(vm->fb_log[0]);
+    vm->fb_log[g % n].gen = g;
+    vm->fb_log[g % n].y0 = y0;
+    vm->fb_log[g % n].y1 = y1;
+}
+
+static void copy_row(uint32_t *d, const uint32_t *s, uint32_t w, mvm_fb_copy_fmt fmt)
+{
+    switch (fmt) {
+    case MVM_FB_COPY_ARGB:
+        for (uint32_t x = 0; x < w; x++)
+            d[x] = s[x] | 0xff000000u;
+        break;
+    case MVM_FB_COPY_RGBA: /* 0x00RRGGBB -> bytes R,G,B,FF (little-endian: 0xFFBBGGRR) */
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t p = s[x];
+            d[x] = 0xff000000u | (p & 0xff00u) | ((p >> 16) & 0xffu) | ((p & 0xffu) << 16);
+        }
+        break;
+    default:
+        memcpy(d, s, (size_t)w * 4);
+        break;
+    }
+}
+
+int mvm_fb_copy_rows(mvm_vm *vm, void *dst, uint32_t dst_w, uint32_t dst_h, size_t dst_stride,
+                     mvm_fb_copy_fmt fmt, uint32_t *since, uint32_t *y0, uint32_t *y1, mvm_fb_info *info)
+{
+    if (!vm->fb)
+        return -1;
+    atomic_store_explicit(&vm->fb_watch_ns, host_clock_ns(), memory_order_relaxed);
+    pthread_mutex_lock(&vm->fb_lock);
+    mvm_fb_info fi = {vm->fb_w, vm->fb_h, vm->fb_w * 4, MVM_FB_XRGB8888};
+    if (info)
+        *info = fi;
+    if (fi.width != dst_w || fi.height != dst_h || dst_stride < (size_t)fi.width * 4) {
+        pthread_mutex_unlock(&vm->fb_lock);
+        return -1;
+    }
+    uint32_t cur = atomic_load(&vm->fb_gen);
+    if (cur == *since) {
+        pthread_mutex_unlock(&vm->fb_lock);
+        return 0;
+    }
+    /* uniao das faixas de cada geracao em (since, cur]; sem historico completo, tudo */
+    unsigned n = sizeof(vm->fb_log) / sizeof(vm->fb_log[0]);
+    uint32_t a = 0, b = fi.height;
+    uint32_t span = cur - *since;
+    if (*since != 0 && span < n) {
+        a = UINT32_MAX;
+        b = 0;
+        for (uint32_t g = *since + 1; g != cur + 1; g++) {
+            if (vm->fb_log[g % n].gen != g) {
+                a = 0;
+                b = fi.height;
+                break;
+            }
+            if (vm->fb_log[g % n].y0 < a)
+                a = vm->fb_log[g % n].y0;
+            if (vm->fb_log[g % n].y1 > b)
+                b = vm->fb_log[g % n].y1;
+        }
+        if (b > fi.height)
+            b = fi.height;
+        if (a > b)
+            a = b;
+    }
+    for (uint32_t y = a; y < b; y++)
+        copy_row((uint32_t *)((uint8_t *)dst + (size_t)y * dst_stride),
+                 (const uint32_t *)(vm->fb + (size_t)y * vm->fb_stride), fi.width, fmt);
+    pthread_mutex_unlock(&vm->fb_lock);
+    *since = cur;
+    if (y0)
+        *y0 = a;
+    if (y1)
+        *y1 = b;
+    return a < b ? 1 : 0;
+}
 
 bool mvm_fb_copy(mvm_vm *vm, void *dst, size_t dst_size, mvm_fb_info *info)
 {
     if (!vm->fb)
         return false;
+    atomic_store_explicit(&vm->fb_watch_ns, host_clock_ns(), memory_order_relaxed);
     pthread_mutex_lock(&vm->fb_lock);
     mvm_fb_info fi = {vm->fb_w, vm->fb_h, vm->fb_w * 4, MVM_FB_XRGB8888};
     bool ok = (size_t)fi.stride * fi.height <= dst_size;

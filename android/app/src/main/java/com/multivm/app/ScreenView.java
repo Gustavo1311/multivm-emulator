@@ -85,15 +85,20 @@ public class ScreenView extends View {
     void refresh(VirtualMachine vm) {
         int gen = vm.getFramebufferGeneration();
         if (gen == lastGen && bitmap != null) return;
-        FramebufferInfo fi = vm.getFramebufferInfo();
-        if (fi == null || fi.width <= 0 || fi.height <= 0) return;
-        if (bitmap == null || bitmap.getWidth() != fi.width || bitmap.getHeight() != fi.height) {
-            bitmap = Bitmap.createBitmap(fi.width, fi.height, Bitmap.Config.ARGB_8888);
-        }
-        if (vm.copyFramebuffer(bitmap)) {
-            lastGen = gen;
+        int r = bitmap != null ? vm.updateBitmap(bitmap) : -1;
+        if (r < 0) {
+            /* primeiro quadro ou o convidado trocou de resolucao */
+            FramebufferInfo fi = vm.getFramebufferInfo();
+            if (fi == null || fi.width <= 0 || fi.height <= 0) return;
+            if (bitmap == null || bitmap.getWidth() != fi.width || bitmap.getHeight() != fi.height)
+                bitmap = Bitmap.createBitmap(fi.width, fi.height, Bitmap.Config.ARGB_8888);
+            r = vm.updateBitmap(bitmap);
+            if (r < 0) return;
+            invalidate();
+        } else if (r > 0) {
             invalidate();
         }
+        lastGen = gen;
     }
 
     /** Resolucao atual do convidado (para o status), ou null. */

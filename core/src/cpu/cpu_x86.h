@@ -174,6 +174,13 @@ typedef struct x86_cpu {
 
     x86_tlbe tlb[2][X86_TLB_SIZE];
     uint8_t tlb_g[2][X86_TLB_SIZE]; /* entrada de pagina global (CR4.PGE): sobrevive a troca de CR3 */
+    /* entradas preenchidas desde o ultimo esvaziamento ((user << X86_TLB_BITS) | indice): o
+     * NTLDR troca de modo (CR0) a cada leitura de disco pela BIOS e esvaziar o TLB inteiro
+     * custava ~20% do boot; assim o esvaziamento so visita o que foi usado */
+    uint16_t tlb_used[2 * X86_TLB_SIZE];
+    uint8_t tlb_inlist[2][X86_TLB_SIZE];
+    unsigned tlb_nused;
+    bool tlb_listed; /* falso ate o primeiro esvaziamento completo */
     uint64_t fetch_page;
     uint8_t *fetch_host;
     /* janela de busca da instrucao atual (bytes contiguos ja mapeados) */

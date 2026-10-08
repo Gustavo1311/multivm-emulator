@@ -314,6 +314,32 @@ public final class VirtualMachine implements AutoCloseable {
      * novo Bitmap com {@link #getFramebufferInfo()} e tente de novo.
      */
     public boolean copyFramebuffer(Bitmap bitmap) {
+        return updateBitmap(bitmap) >= 0;
+    }
+
+    private Bitmap lastBitmap;
+    private final int[] bitmapState = new int[3];
+    private boolean noDirectBitmap;
+
+    /**
+     * Atualiza um Bitmap ARGB_8888 com o framebuffer, copiando so as linhas que mudaram
+     * desde a ultima chamada com o mesmo Bitmap. Retorna 1 se o Bitmap mudou, 0 se nada
+     * mudou e -1 se as dimensoes nao batem (crie um novo com {@link #getFramebufferInfo()}).
+     */
+    public int updateBitmap(Bitmap bitmap) {
+        if (bitmap != lastBitmap) {
+            lastBitmap = bitmap;
+            bitmapState[0] = 0;
+        }
+        if (!noDirectBitmap && bitmap.getConfig() == Bitmap.Config.ARGB_8888) {
+            int r = NativeBridge.nativeFbCopyBitmap(handle(), bitmap, bitmapState);
+            if (r != -2) return r;
+            noDirectBitmap = true;
+        }
+        return copyBitmapBuffer(bitmap) ? 1 : -1;
+    }
+
+    private boolean copyBitmapBuffer(Bitmap bitmap) {
         FramebufferInfo fi = getFramebufferInfo();
         if (fi == null || bitmap.getWidth() != fi.width || bitmap.getHeight() != fi.height
                 || bitmap.getConfig() != Bitmap.Config.ARGB_8888) return false;

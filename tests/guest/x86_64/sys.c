@@ -271,6 +271,37 @@ void sys_tests(void)
     check("pit irq", cnt[32] >= 5);
     check("tsc", t1 - t0 >= 40000000ULL); /* >= 40 ms a 1 GHz */
 
+    /* 6. codigo automodificavel: escrita em dado na mesma pagina do codigo nao pode
+     * deixar codigo velho, e escrita no proprio bloco em execucao vale na hora */
+    {
+        static uint8_t smc[4096] __attribute__((aligned(4096)));
+        volatile uint8_t *p = smc;
+        typedef int (*fn)(void);
+        fn f0 = (fn)(void *)smc, f1 = (fn)(void *)(smc + 0x100);
+        p[0] = 0xb8; p[1] = 1; p[2] = 0; p[3] = 0; p[4] = 0; p[5] = 0xc3; /* mov eax, 1; ret */
+        int r = 0;
+        for (int i = 0; i < 100; i++)
+            r += f0();
+        check("smc: codigo novo", r == 100);
+        for (int i = 0; i < 100; i++) {
+            p[2048 + (i & 63)] = (uint8_t)i; /* dado em outro trecho da pagina */
+            p[40] = (uint8_t)i;              /* dado logo depois do codigo */
+            r += f0();
+        }
+        check("smc: dado vizinho", r == 200);
+        p[1] = 2; /* muda o imediato */
+        check("smc: imediato alterado", f0() == 2);
+        /* mov byte [rip+1], 5 ; mov eax, 1 ; ret -> o mov grava o imediato da instrucao seguinte */
+        static const uint8_t self[] = {0xc6, 0x05, 1, 0, 0, 0, 5, 0xb8, 1, 0, 0, 0, 0xc3};
+        int ok = 1;
+        for (int i = 0; i < 50; i++) {
+            for (unsigned k = 0; k < sizeof(self); k++)
+                p[0x100 + k] = self[k];
+            ok &= f1() == 5;
+        }
+        check("smc: proprio bloco", ok);
+    }
+
     puts_(fails ? "SYS FAIL\n" : "SYS OK\n");
     (void)hex;
 }

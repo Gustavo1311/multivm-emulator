@@ -143,23 +143,82 @@ void x86_debug_dump(void *opaque);
 
 /* ------------------------------------------------------------ TLB/MMU */
 
+#define TLB_E(c, k) (&(c)->tlb[0][0] + (k)) /* k = (user << X86_TLB_BITS) | indice */
+
 void x86_tlb_flush(x86_cpu *c)
 {
-    for (int u = 0; u < 2; u++)
-        for (unsigned i = 0; i < X86_TLB_SIZE; i++)
-            c->tlb[u][i].tag_r = c->tlb[u][i].tag_w = c->tlb[u][i].tag_x = XTLB_INVALID;
+    if (!c->tlb_listed) {
+        for (int u = 0; u < 2; u++)
+            for (unsigned i = 0; i < X86_TLB_SIZE; i++)
+                c->tlb[u][i].tag_r = c->tlb[u][i].tag_w = c->tlb[u][i].tag_x = XTLB_INVALID;
+        memset(c->tlb_inlist, 0, sizeof(c->tlb_inlist));
+        c->tlb_listed = true;
+    } else {
+        for (unsigned n = 0; n < c->tlb_nused; n++) {
+            unsigned k = c->tlb_used[n];
+            x86_tlbe *e = TLB_E(c, k);
+            e->tag_r = e->tag_w = e->tag_x = XTLB_INVALID;
+            (&c->tlb_inlist[0][0])[k] = 0;
+        }
+    }
+    c->tlb_nused = 0;
     c->fetch_page = 1;
     if (c->jit)
         x86_jit_tlb_flushed(c->jit);
 }
 
+/* paginas sujas de VRAM foram consumidas: as escritas nelas voltam ao caminho lento */
+static void x86_tlb_protect(void *opaque, const uint8_t *host, size_t len)
+{
+    x86_cpu *c = opaque;
+    for (unsigned n = 0; n < c->tlb_nused; n++) {
+        x86_tlbe *e = TLB_E(c, c->tlb_used[n]);
+        if (!(e->tag_w & (XTLB_INVALID | XTLB_IO)) &&
+            (uintptr_t)(e->addend + (e->tag_w & ~0xfffULL)) - (uintptr_t)host < len)
+            e->tag_w |= XTLB_IO;
+    }
+}
+
+/* a pagina fisica ppage passou a ter codigo traduzido: escritas nela pelo caminho lento.
+ * So as entradas que apontam para ela mudam (esvaziar o TLB inteiro custava caro). */
+void x86_tlb_protect_page(x86_cpu *c, uint64_t ppage)
+{
+    for (unsigned n = 0; n < c->tlb_nused; n++) {
+        x86_tlbe *e = TLB_E(c, c->tlb_used[n]);
+        if (e->pa == ppage && !(e->tag_w & (XTLB_INVALID | XTLB_IO)))
+            e->tag_w |= XTLB_IO;
+    }
+}
+
+/* a pagina deixou de ter codigo: a proxima escrita refaz a entrada (rapida de novo) */
+void x86_tlb_unprotect_page(x86_cpu *c, uint64_t ppage)
+{
+    for (unsigned n = 0; n < c->tlb_nused; n++) {
+        x86_tlbe *e = TLB_E(c, c->tlb_used[n]);
+        if (e->pa == ppage && (e->tag_w & XTLB_IO) && !(e->tag_w & XTLB_INVALID))
+            e->tag_w = XTLB_INVALID;
+    }
+}
+
 /* troca de CR3: mantem as entradas de paginas globais */
 void x86_tlb_flush_nonglobal(x86_cpu *c)
 {
-    for (int u = 0; u < 2; u++)
-        for (unsigned i = 0; i < X86_TLB_SIZE; i++)
-            if (!c->tlb_g[u][i])
-                c->tlb[u][i].tag_r = c->tlb[u][i].tag_w = c->tlb[u][i].tag_x = XTLB_INVALID;
+    if (!c->tlb_listed) {
+        x86_tlb_flush(c);
+        return;
+    }
+    unsigned keep = 0;
+    for (unsigned n = 0; n < c->tlb_nused; n++) {
+        unsigned k = c->tlb_used[n];
+        if ((&c->tlb_g[0][0])[k]) {
+            c->tlb_used[keep++] = (uint16_t)k;
+        } else {
+            x86_tlbe *e = TLB_E(c, k);
+            e->tag_r = e->tag_w = e->tag_x = XTLB_INVALID;
+            (&c->tlb_inlist[0][0])[k] = 0;
+        }
+    }
+    c->tlb_nused = keep;
     c->fetch_page = 1;
     if (c->jit)
         x86_jit_tlb_flushed(c->jit);
@@ -352,13 +411,20 @@ static x86_tlbe *tlb_fill(x86_cpu *c, uint64_t lin, int acc, int user)
     int perm;
     uint64_t pa = walk(c, lin, acc, user, &perm);
     uint64_t page = lin & ~0xfffULL, ppage = pa & ~0xfffULL;
-    x86_tlbe *e = &c->tlb[user][(lin >> 12) & (X86_TLB_SIZE - 1)];
+    unsigned idx = (unsigned)(lin >> 12) & (X86_TLB_SIZE - 1);
+    x86_tlbe *e = &c->tlb[user][idx];
+    if (!c->tlb_inlist[user][idx]) {
+        c->tlb_inlist[user][idx] = 1;
+        c->tlb_used[c->tlb_nused++] = (uint16_t)(((unsigned)user << X86_TLB_BITS) | idx);
+    }
     mvm_region *reg = space_find(c->mem, ppage);
     uint8_t *host = (reg && reg->host && ppage - reg->base + 0x1000 <= reg->size) ? reg->host + (ppage - reg->base) : NULL;
     uint64_t io = host ? 0 : XTLB_IO;
     e->tag_r = page | io;
     /* paginas com codigo traduzido pelo JIT: escritas pelo caminho lento (invalidacao) */
-    bool fast_w = host && !reg->readonly && !reg->dirty_gen && !space_is_code(c->mem, ppage);
+    /* paginas de VRAM ja marcadas sujas tambem: o caminho lento so precisa ver a primeira escrita */
+    bool fast_w = host && !reg->readonly && (!reg->dirty_gen || region_page_dirty(reg, ppage)) &&
+                  !space_is_code(c->mem, ppage);
     e->tag_w = (perm & 2) ? page | (fast_w ? 0 : XTLB_IO) : XTLB_INVALID;
     e->tag_x = (perm & 4) ? page | io : XTLB_INVALID;
     e->addend = host ? (uintptr_t)host - (uintptr_t)page : 0;
@@ -1199,7 +1265,10 @@ void x86_write_cr(x86_cpu *c, int n, uint64_t v)
         }
         if (!(v & CR0_PG) && (old & CR0_PG))
             c->efer &= ~(uint64_t)EFER_LMA;
-        x86_tlb_flush(c);
+        /* o Windows liga CR0.TS a cada troca de thread (FPU preguicosa): so os bits que
+         * mudam a traducao esvaziam o TLB */
+        if ((old ^ v) & (CR0_PE | CR0_WP | CR0_PG))
+            x86_tlb_flush(c);
         update_mode(c);
         break;
     }
@@ -1214,8 +1283,10 @@ void x86_write_cr(x86_cpu *c, int n, uint64_t v)
     case 4:
         if (!(v & CR4_PAE) && (c->efer & EFER_LMA))
             x86_gp(c, 0);
+        /* PSE, PAE, PGE (o Windows alterna PGE para esvaziar paginas globais), PCIDE, SMEP, SMAP, PKE */
+        if ((c->cr4 ^ v) & (CR4_PSE | CR4_PAE | CR4_PGE | (1u << 17) | (1u << 20) | (1u << 21) | (1u << 22)))
+            x86_tlb_flush(c);
         c->cr4 = v;
-        x86_tlb_flush(c);
         break;
     case 8:
         c->cr8 = v & 15;
@@ -1434,8 +1505,10 @@ void x86_wrmsr(x86_cpu *c)
             x86_gp(c, 0);
         if (((v ^ c->efer) & EFER_LME) && (c->cr0 & CR0_PG))
             x86_gp(c, 0);
-        c->efer = (v & allowed) | (c->efer & EFER_LMA);
-        x86_tlb_flush(c);
+        uint64_t nefer = (v & allowed) | (c->efer & EFER_LMA);
+        if ((nefer ^ c->efer) & (EFER_NXE | EFER_LME | EFER_LMA))
+            x86_tlb_flush(c);
+        c->efer = nefer;
         break;
     }
     case 0xc0000081: c->star = v; break;
@@ -2231,6 +2304,7 @@ const mvm_cpu_ops x86_cpu_ops = {
     .reset = x86_reset,
     .run = x86_run,
     .halted = x86_halted,
+    .tlb_protect = x86_tlb_protect,
     .dump = x86_dump,
     .destroy = x86_destroy,
     .tlb_flush = cpu_tlb_flush_cb,

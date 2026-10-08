@@ -53,6 +53,8 @@ final class NativeBridge {
     /** (largura << 32) | altura; negativo se dst for pequeno; 0 sem framebuffer. */
     static native long nativeFbCopyInts(long handle, int[] dst);
     static native long nativeFbCopyRgba(long handle, ByteBuffer dst);
+    /** 1 copiou, 0 sem mudanca, -1 tamanho diferente, -2 sem libjnigraphics. state = {geracao, y0, y1}. */
+    static native int nativeFbCopyBitmap(long handle, android.graphics.Bitmap bitmap, int[] state);
     static native String nativeTextScreen(long handle);
     static native void nativeAudioMute(long handle, boolean muted);
     static native String[] nativeMediaList(long handle);

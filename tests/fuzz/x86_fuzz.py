@@ -78,7 +78,7 @@ def gen():
     """retorna (lista de linhas asm, mascara de flags, prologo extra)"""
     kind = os.environ.get("FUZZ_KIND") or rnd.choice(["alu"] * 6 + ["unary", "shift", "shift", "mul", "div", "bit", "bitscan", "ext",
                                      "cmov", "set", "lea", "xchg", "xadd", "cmpxchg", "bswap",
-                                     "flags", "string", "shld", "popcnt", "misc", "sse", "sse", "sse"])
+                                     "flags", "string", "shld", "popcnt", "misc", "sse", "sse", "sse", "mmx"])
     bits, suf, regs = rnd.choice(SIZES)
     pre = []
     if kind == "alu":
@@ -318,6 +318,27 @@ def gen():
             r = pick(regs)
             return ["neg%s %s" % (suf, r), "adc%s %s, %s" % (suf, pick(regs), r)], ALL, pre
         return ["nop"], 0, pre
+    if kind == "mmx":  # MMX (o cursor/GDI do XP): valores entram e saem pela memoria (buffer comparado)
+        def m8():
+            off = rnd.randrange(0, 24) * 8
+            return "buf+%d" % off if MODE == 32 else "%d(%%r15)" % off
+        g = rnd.choice(["paddb", "paddw", "paddd", "paddq", "psubb", "psubw", "psubd", "psubq", "pand", "pandn", "por",
+                        "pxor", "pcmpeqb", "pcmpeqw", "pcmpeqd", "pcmpgtb", "pcmpgtw", "pcmpgtd", "punpcklbw",
+                        "punpcklwd", "punpckldq", "punpckhbw", "punpckhwd", "punpckhdq", "packsswb", "packuswb",
+                        "packssdw", "pmullw", "pavgb", "pavgw", "pminub", "pmaxub", "pminsw", "pmaxsw", "paddsb",
+                        "paddsw", "paddusb", "paddusw", "psubsb", "psubsw", "psubusb", "psubusw", "psllw", "pslld",
+                        "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad", "movq", "movd"])
+        ma, mb = "%%mm%d" % rnd.randrange(8), "%%mm%d" % rnd.randrange(8)
+        lines = ["movq %s, %s" % (m8(), mb), "movq %s, %s" % (m8(), ma)]
+        if g in ("psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad"):
+            lines.append("%s $%d, %s" % (g, rnd.randrange(0, 70), ma))
+        elif g == "movd":
+            r = "%" + rnd.choice(R32)
+            lines += ["movd %s, %s" % (ma, r), "movd %s, %s" % (r, mb)] if rnd.random() < 0.5 else ["movd %s, %s" % (m8(), ma)]
+        else:
+            src = m8() if rnd.random() < 0.3 else mb
+            lines.append("%s %s, %s" % (g, src, ma))
+        return lines + ["movq %s, %s" % (ma, m8()), "movq %s, %s" % (mb, m8()), "emms"], 0, pre
     if kind == "sse":
         xs = ["%%xmm%d" % i for i in range(16 if MODE == 64 else 8)]
         op = rnd.choice(["paddb", "paddw", "paddd", "paddq", "psubb", "psubw", "psubd", "psubq", "pand", "pandn",

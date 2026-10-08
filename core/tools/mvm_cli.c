@@ -16,6 +16,7 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <sys/time.h>
 #include <ucontext.h>
 
@@ -28,6 +29,9 @@ static const char *g_expect;
 static char g_tail[4096];
 static size_t g_tail_len;
 static int g_expect_hit;
+static int g_viewer; /* --viewer: copia o framebuffer a 30 Hz como o app Android */
+static double g_viewer_cpu;
+static unsigned g_viewer_frames;
 
 static void serial_out(void *opaque, const uint8_t *data, size_t len)
 {
@@ -199,6 +203,9 @@ static bool write_ppm(const char *path)
     mvm_fb_info fi;
     if (!mvm_fb_info_get(g_vm, &fi))
         return false;
+    /* sem espectador a VGA adia o desenho dos modos graficos: avisa e espera um quadro */
+    mvm_fb_generation(g_vm);
+    usleep(60000);
     size_t sz = (size_t)fi.width * fi.height * 4 + 16 * 1024 * 1024;
     uint8_t *px = malloc(sz);
     bool ok = false;
@@ -221,6 +228,85 @@ static bool write_ppm(const char *path)
 /* --control FIFO: comandos durante a execucao, um por linha:
  *   type TEXTO | text ARQ | shot ARQ.ppm | power | reset | quit */
 static const char *g_control;
+
+static uint64_t *g_prof;
+static volatile unsigned g_prof_n;
+static double thread_cpu(void)
+{
+    struct rusage ru;
+    getrusage(RUSAGE_THREAD, &ru);
+    return (double)ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + (double)ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+}
+
+/* Simula a tela do app: a cada 33 ms, se o quadro mudou, copia para um "Bitmap" RGBA. */
+static void *viewer_thread(void *arg)
+{
+    (void)arg;
+    uint32_t last = 0;
+    uint8_t *buf = NULL, *bmp = NULL;
+    size_t cap = 0;
+    while (!g_quit) {
+        usleep(33000);
+        uint32_t gen = mvm_fb_generation(g_vm);
+        if (gen == last && buf)
+            continue;
+        mvm_fb_info fi;
+        if (!mvm_fb_info_get(g_vm, &fi) || !fi.width || !fi.height)
+            continue;
+        size_t need = (size_t)fi.width * fi.height * 4;
+        if (need > cap) {
+            free(buf);
+            free(bmp);
+            buf = malloc(need);
+            bmp = malloc(need);
+            cap = need;
+        }
+        if (!getenv("MVM_VIEWER_OLD")) { /* caminho do app: so as linhas alteradas, direto no Bitmap */
+            static uint32_t since, bw, bh;
+            if (bw != fi.width || bh != fi.height) {
+                bw = fi.width;
+                bh = fi.height;
+                since = 0;
+            }
+            if (mvm_fb_copy_rows(g_vm, bmp, bw, bh, (size_t)bw * 4, MVM_FB_COPY_RGBA, &since, NULL, NULL, NULL) > 0)
+                g_viewer_frames++;
+            if (getenv("MVM_VIEWER_CHECK")) { /* a copia parcial tem de bater com a completa */
+                mvm_fb_info f2;
+                if (mvm_fb_copy(g_vm, buf, cap, &f2) && f2.width == bw && f2.height == bh) {
+                    unsigned bad = 0;
+                    const uint32_t *full = (const uint32_t *)buf, *part = (const uint32_t *)bmp;
+                    for (size_t i = 0; i < (size_t)bw * bh; i++) {
+                        uint32_t p = full[i];
+                        if (part[i] != (0xff000000u | (p & 0xff00u) | ((p >> 16) & 0xffu) | ((p & 0xffu) << 16)))
+                            bad++;
+                    }
+                    static unsigned checks, fails;
+                    checks++;
+                    if (bad && mvm_fb_generation(g_vm) == since) /* sem quadro novo no meio */
+                        fprintf(stderr, "[viewer] DIFERENCA: %u pixels (verificacao %u, falhas %u)\n", bad, checks, ++fails);
+                }
+            }
+            last = gen;
+            continue;
+        }
+        /* caminho antigo do app: copia + troca R/B + copyPixelsFromBuffer */
+        if (!mvm_fb_copy(g_vm, buf, cap, &fi))
+            continue;
+        for (uint32_t i = 0; i < fi.width * fi.height; i++) {
+            uint8_t b = buf[4 * i], r = buf[4 * i + 2];
+            buf[4 * i] = r;
+            buf[4 * i + 2] = b;
+            buf[4 * i + 3] = 0xff;
+        }
+        memcpy(bmp, buf, (size_t)fi.width * fi.height * 4);
+        last = gen;
+        g_viewer_frames++;
+    }
+    g_viewer_cpu = thread_cpu();
+    free(buf);
+    free(bmp);
+    return NULL;
+}
 
 static void *control_thread(void *arg)
 {
@@ -247,6 +333,8 @@ static void *control_thread(void *arg)
                         fputs("(tela fora do modo texto)\n", o);
                     fclose(o);
                 }
+            } else if (!strcmp(line, "profreset")) { /* MVM_PROF: descarta as amostras ate aqui */
+                g_prof_n = 0;
             } else if (!strncmp(line, "shot ", 5)) {
                 write_ppm(line + 5);
             } else if (!strncmp(line, "mouse ", 6)) { /* mouse DX DY [BOTOES] (relativo, PS/2) */
@@ -321,8 +409,6 @@ static void *type_thread(void *arg)
 /* MVM_PROF=arquivo: perfil por amostragem do host (PC a cada ~1 ms de CPU da thread
  * da vCPU); grava os PCs e /proc/self/maps ao final, para simbolizar com nm. */
 #define PROF_MAX (1u << 22)
-static uint64_t *g_prof;
-static volatile unsigned g_prof_n;
 static void prof_handler(int sig, siginfo_t *si, void *uc)
 {
     (void)sig; (void)si;
@@ -513,6 +599,7 @@ static void usage(void)
             "      --load-addr HEX   endereco de carga para binario bruto\n"
             "      --fb WxH          framebuffer\n"
             "      --fb-dump ARQ     grava o framebuffer (PPM) ao sair\n"
+            "      --viewer          copia o framebuffer a 30 Hz como a tela do app (medicao de CPU)\n"
             "  -t, --timeout SEG     encerra apos SEG segundos\n"
             "  -e, --expect TXT      encerra com sucesso quando TXT aparecer no console\n"
             "  -v, --verbose         log detalhado\n"
@@ -537,7 +624,7 @@ int main(int argc, char **argv)
         {"vnc", required_argument, 0, 25}, {"vnc-password", required_argument, 0, 26},
         {"vgabios", required_argument, 0, 9}, {"text", no_argument, 0, 10}, {"type", required_argument, 0, 11}, {"type-after", required_argument, 0, 12}, {"control", required_argument, 0, 13},
         {"bios", required_argument, 0, 2}, {"load-addr", required_argument, 0, 3},
-        {"fb", required_argument, 0, 4}, {"fb-dump", required_argument, 0, 5},
+        {"fb", required_argument, 0, 4}, {"fb-dump", required_argument, 0, 5}, {"viewer", no_argument, 0, 27},
         {"timeout", required_argument, 0, 't'}, {"expect", required_argument, 0, 'e'},
         {"verbose", no_argument, 0, 'v'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
     int o, no_reboot = 0;
@@ -657,6 +744,7 @@ int main(int argc, char **argv)
             break;
         }
         case 26: g_vnc_password = optarg; break;
+        case 27: g_viewer = 1; break;
         case 24:
             g_audio_in = optarg;
             cfg.audio.mic = true;
@@ -768,6 +856,10 @@ int main(int argc, char **argv)
     if (g_control)
         pthread_create(&ctl_th, NULL, control_thread, NULL);
 
+    pthread_t vw_th;
+    if (g_viewer)
+        pthread_create(&vw_th, NULL, viewer_thread, NULL);
+
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     if (prof) {
@@ -782,7 +874,10 @@ int main(int argc, char **argv)
         prof_write(prof);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
+    double vm_cpu = thread_cpu();
     g_quit = 1;
+    if (g_viewer)
+        pthread_join(vw_th, NULL);
     restore_tty();
     g_raw = 0;
     double secs = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
@@ -790,6 +885,14 @@ int main(int argc, char **argv)
     fprintf(stderr, "\n[mvm-cli] fim (%s): %llu instrucoes em %.2fs (%.1f MIPS)\n",
             r == MVM_EXIT_SHUTDOWN ? "desligado" : r == MVM_EXIT_ERROR ? "erro" : r == MVM_EXIT_REBOOT ? "reinicio" : "parado",
             (unsigned long long)insns, secs, secs > 0 ? (double)insns / secs / 1e6 : 0.0);
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    double all_cpu = (double)ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + (double)ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+    fprintf(stderr, "[mvm-cli] CPU: total %.2fs (%.0f%%), thread da VM %.2fs (%.0f%%)", all_cpu,
+            secs > 0 ? 100.0 * all_cpu / secs : 0.0, vm_cpu, secs > 0 ? 100.0 * vm_cpu / secs : 0.0);
+    if (g_viewer)
+        fprintf(stderr, ", visualizador %.2fs (%u quadros)", g_viewer_cpu, g_viewer_frames);
+    fputc('\n', stderr);
     double lag = (double)mvm_clock_lag_ns(g_vm) / 1e9;
     if (lag > 0.001)
         fprintf(stderr, "[mvm-cli] relogio do convidado freado em %.2fs (%.0f%% do tempo)\n", lag,
