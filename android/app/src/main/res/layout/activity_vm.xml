@@ -7,6 +7,7 @@
 
     <!-- barra de controles: icones com rotulo -->
     <HorizontalScrollView
+        android:id="@+id/toolbar"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:background="@drawable/toolbar_bg"
@@ -22,6 +23,7 @@
 
             <Button android:id="@+id/btnView" style="@style/ToolButton" android:drawableTop="@drawable/ic_terminal" android:text="Terminal" />
             <Button android:id="@+id/btnKbd" style="@style/ToolButton" android:drawableTop="@drawable/ic_keyboard" android:text="Teclado" />
+            <Button android:id="@+id/btnKeys" style="@style/ToolButton" android:drawableTop="@drawable/ic_keys" android:text="Teclas" />
             <Button android:id="@+id/btnMedia" style="@style/ToolButton" android:drawableTop="@drawable/ic_media" android:text="Mídia" />
             <Button android:id="@+id/btnMouse" style="@style/ToolButton" android:drawableTop="@drawable/ic_mouse" android:text="Mouse 1x" />
             <Button android:id="@+id/btnTrackpad" style="@style/ToolButton" android:drawableTop="@drawable/ic_touchpad" android:text="Trackpad" />
@@ -36,6 +38,7 @@
 
     <!-- estado: bolinha colorida + texto -->
     <LinearLayout
+        android:id="@+id/statusRow"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:background="@color/bg"
@@ -129,6 +132,7 @@
 
     <HorizontalScrollView
         android:id="@+id/keyBar"
+        android:visibility="gone"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:background="@color/bg"

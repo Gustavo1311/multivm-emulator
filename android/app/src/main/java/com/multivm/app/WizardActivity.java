@@ -133,8 +133,8 @@ public class WizardActivity extends Activity implements MediaListView.Host {
         back = findViewById(R.id.wBack);
         next = findViewById(R.id.wNext);
 
-        pages.setInAnimation(this, android.R.anim.fade_in);
-        pages.setOutAnimation(this, android.R.anim.fade_out);
+        pages.setInAnimation(this, R.anim.wiz_in);
+        pages.setOutAnimation(this, R.anim.wiz_out);
 
         arch.setAdapter(spinnerAdapter(AppFiles.ARCH_NAMES));
         arch.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
@@ -309,8 +309,8 @@ public class WizardActivity extends Activity implements MediaListView.Host {
         }
         pages.setDisplayedChild(s);
         if (!animate) {
-            pages.setInAnimation(this, android.R.anim.fade_in);
-            pages.setOutAnimation(this, android.R.anim.fade_out);
+            pages.setInAnimation(this, R.anim.wiz_in);
+            pages.setOutAnimation(this, R.anim.wiz_out);
         }
         scroll.scrollTo(0, 0);
         if (s == STEP_BOOT) updateBootHelp();

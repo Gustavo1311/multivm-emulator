@@ -5,6 +5,7 @@ import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -12,6 +13,8 @@ import android.os.SystemClock;
 import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
@@ -21,6 +24,7 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import com.multivm.core.ExitReason;
 import com.multivm.core.KeyMapper;
@@ -42,17 +46,17 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
     private VirtualMachine vm;
     private TerminalBuffer terminal;
     private ScreenView screen;
-    private View terminalView, keyBar;
+    private View terminalView, keyBar, toolbar, statusRow;
     private TextView termText, status;
     private View statusDot;
     private ScrollView termScroll;
     private EditText termInput;
     private Button btnView, btnPause, btnMouse;
-    private boolean showTerminal, muted;
+    private boolean showTerminal, muted, fullscreen, keysShown;
     private int sensIdx;
     private MediaPanel mediaPanel;
     private TrackpadView trackpad;
-    private Button btnTrackpad, btnRotate;
+    private Button btnTrackpad, btnRotate, btnKeys;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final TerminalBuffer.Snapshot seen = new TerminalBuffer.Snapshot();
@@ -105,6 +109,8 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
         screen = findViewById(R.id.screen);
         terminalView = findViewById(R.id.terminal);
         keyBar = findViewById(R.id.keyBar);
+        toolbar = findViewById(R.id.toolbar);
+        statusRow = findViewById(R.id.statusRow);
         termText = findViewById(R.id.termText);
         termScroll = findViewById(R.id.termScroll);
         termInput = findViewById(R.id.termInput);
@@ -117,6 +123,8 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
         screen.setInputSink(this);
         btnView.setOnClickListener(v -> setTerminal(!showTerminal));
         findViewById(R.id.btnKbd).setOnClickListener(v -> toggleKeyboard());
+        btnKeys = findViewById(R.id.btnKeys);
+        btnKeys.setOnClickListener(v -> setKeysShown(!keysShown));
         btnPause.setOnClickListener(v -> {
             if (vm.isPaused()) vm.resume();
             else vm.pause();
@@ -182,6 +190,7 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
         findViewById(R.id.termClear).setOnClickListener(v -> terminal.clear());
 
         buildKeyBar();
+        setKeysShown(getSharedPreferences("ui", MODE_PRIVATE).getBoolean("showKeys", false));
         vm.addStateListener(stateListener);
         setTerminal(!VmHolder.hasScreen);
         if (vm.getState() == VirtualMachine.State.STOPPED) onVmState(vm.getState(), vm.getLastExitReason());
@@ -225,8 +234,20 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
     }
 
     @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        /* o sistema pode reexibir as barras (teclado, dialogos): esconde de novo */
+        if (hasFocus && fullscreen) applySystemBars();
+    }
+
+    /** Voltar alterna a tela cheia; para parar a VM use o botao Parar. */
+    @Override
     public void onBackPressed() {
-        askStop();
+        if (ended) {
+            closeVm();
+            return;
+        }
+        setFullscreen(!fullscreen);
     }
 
     /* ---- controles ---- */
@@ -237,6 +258,49 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
 
     private static String fmt(float f) {
         return f == (int) f ? Integer.toString((int) f) : Float.toString(f);
+    }
+
+    /** Tela cheia: esconde a barra de controles, o estado e as barras do sistema. */
+    private void setFullscreen(boolean on) {
+        fullscreen = on;
+        toolbar.setVisibility(on ? View.GONE : View.VISIBLE);
+        statusRow.setVisibility(on ? View.GONE : View.VISIBLE);
+        applySystemBars();
+        if (trackpad != null) screen.post(trackpad::keepInside);
+        if (on) Toast.makeText(this, "Tela cheia: toque em Voltar para sair", Toast.LENGTH_SHORT).show();
+    }
+
+    @SuppressWarnings("deprecation")
+    private void applySystemBars() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowInsetsController c = getWindow().getInsetsController();
+            if (c == null) return;
+            if (fullscreen) {
+                c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                c.hide(WindowInsets.Type.systemBars());
+            } else {
+                c.show(WindowInsets.Type.systemBars());
+            }
+        } else {
+            getWindow().getDecorView().setSystemUiVisibility(fullscreen
+                    ? View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY : 0);
+        }
+    }
+
+    /** Mostra/esconde a barra de teclas especiais (Esc, Tab, Ctrl, F1...). */
+    private void setKeysShown(boolean on) {
+        keysShown = on;
+        updateKeyBar();
+        btnKeys.setTextColor(getColor(on ? R.color.accent : R.color.text2));
+        btnKeys.setCompoundDrawableTintList(on
+                ? android.content.res.ColorStateList.valueOf(getColor(R.color.accent)) : null);
+        getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("showKeys", on).apply();
+        if (trackpad != null) screen.post(trackpad::keepInside);
+    }
+
+    private void updateKeyBar() {
+        keyBar.setVisibility(keysShown && !showTerminal ? View.VISIBLE : View.GONE);
     }
 
     /** Mostra/esconde o trackpad flutuante sobre a tela da VM. */
@@ -360,7 +424,7 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
         showTerminal = on;
         terminalView.setVisibility(on ? View.VISIBLE : View.GONE);
         screen.setVisibility(on ? View.GONE : View.VISIBLE);
-        keyBar.setVisibility(on ? View.GONE : View.VISIBLE);
+        updateKeyBar();
         btnView.setText(on ? "Tela" : "Terminal");
         setTopIcon(btnView, on ? R.drawable.ic_monitor : R.drawable.ic_terminal);
         if (on) {
