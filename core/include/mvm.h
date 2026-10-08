@@ -16,7 +16,7 @@
 extern "C" {
 #endif
 
-#define MVM_VERSION "0.1.0"
+#define MVM_VERSION "0.2.0"
 #define MVM_MAX_DISKS 10 /* ex.: 4 discos + 4 CDs + 2 disquetes */
 
 typedef enum {
