@@ -90,6 +90,7 @@ struct x86_jit {
     unsigned n_interp_log;
     bool smp;               /* varias CPUs (ou MVM_SMP_FORCE): ordem TSO e atomicos de verdade */
     bool lrcpc;             /* host com LDAPR (ARMv8.3) */
+    bool lse;               /* host com atomicos LSE (ARMv8.1) */
     long off_gen;           /* geracao de x86_jit_new_off ja aplicada (CLI "jitoff") */
     struct jinsn_s *tr_ins; /* buffers do tradutor (por JIT: cada CPU traduz na sua thread) */
     bool *tr_stored, *tr_dead;
@@ -2740,6 +2741,193 @@ static void emit_incdec(jctx *x, jinsn *in, int dec, int s)
     emit_lazy(x, dec ? CC_DEC : CC_INC, s, RR, RA, RB);
 }
 
+/* caminho lento de uma instrucao LOCK nativa: o interpretador (com compare-and-swap). Com
+ * o RIP esperado volta pelo desvio devolvido em *jok; senao sai do bloco (falta de pagina) */
+static void emit_lse_slow(jctx *x, jinsn *in, uint32_t **jok)
+{
+    a64 *a = &x->a;
+    a64_mov_imm(a, 9, in->rip);
+    a64_str(a, 8, 9, RC, OFF(rip));
+    a64_str(a, 8, 9, RC, OFF(cur_rip));
+    a64_mov(a, 1, 0, RC);
+    a64_mov_imm(a, 1, 3);
+    x->slowpath++;
+    emit_call(x, (const void *)jit_interp1_smp);
+    x->slowpath--;
+    a64_ldr(a, 8, 0, RC, OFF(rip));
+    a64_mov_imm(a, 1, in->next);
+    a64_cmp(a, 1, 0, 1);
+    *jok = a64_here(a);
+    a64_bcond(a, A_EQ, a64_here(a));
+    rc_writeback(x);
+    emit_exit_why(x, EX_CSBASE);
+    a64_str(a, 8, XZR, RC, OFF(jit_exit));
+    a64_b(a, x->j->exit_stub); /* RIP ja em c->rip */
+}
+
+/*
+ * Modo SMP: instrucao LOCK de leitura-modificacao-escrita (e XCHG com memoria) com um
+ * atomico LSE do host (LDADDAL, LDCLRAL, LDEORAL, LDSETAL, SWPAL, CASAL; acquire+release
+ * mantem a ordem total do x86). Acesso desalinhado, pagina sem escrita direta no TLB (MMIO,
+ * codigo traduzido, falta) vai ao interpretador fora da linha. Retorna false se nao cobre.
+ */
+static bool emit_lse(jctx *x, jinsn *in)
+{
+    a64 *a = &x->a;
+    struct x86_jit *j = x->j;
+    if (!j->lse || (j->off & 1048576) || !in->mem) /* 1048576: LOCK sempre no interpretador */
+        return false;
+    int op = in->op, k, s; /* k: 0 add 1 or 4 and 5 sub 6 xor, 8 inc 9 dec 10 not 11 xadd 12 xchg 13 cmpxchg 14-16 bts/btr/btc */
+    bool regsrc = false;
+    if (op < 0x40 && (op & 7) < 2 && ((op >> 3) == 0 || (op >> 3) == 1 || (op >> 3) == 4 || (op >> 3) == 5 || (op >> 3) == 6)) {
+        k = op >> 3; s = (op & 1) ? in->osz : 1; regsrc = true;
+    } else if ((op == 0x80 || op == 0x81 || op == 0x83) &&
+               ((in->reg & 7) == 0 || (in->reg & 7) == 1 || (in->reg & 7) == 4 || (in->reg & 7) == 5 || (in->reg & 7) == 6)) {
+        k = in->reg & 7; s = op == 0x80 ? 1 : in->osz;
+    } else if ((op == 0xfe || op == 0xff) && (in->reg & 7) < 2) {
+        k = 8 + (in->reg & 7); s = op == 0xfe ? 1 : in->osz;
+    } else if ((op == 0xf6 || op == 0xf7) && (in->reg & 7) == 2) {
+        k = 10; s = op == 0xf6 ? 1 : in->osz;
+    } else if (op == 0x1c0 || op == 0x1c1) {
+        k = 11; s = op == 0x1c0 ? 1 : in->osz;
+    } else if (op == 0x86 || op == 0x87) {
+        k = 12; s = op == 0x86 ? 1 : in->osz;
+    } else if (op == 0x1b0 || op == 0x1b1) {
+        k = 13; s = op == 0x1b0 ? 1 : in->osz;
+    } else if (op == 0x1ba && (in->reg & 7) >= 5) {
+        k = 9 + (in->reg & 7); s = in->osz;
+    } else {
+        return false;
+    }
+    if (!in->lock && k != 12)
+        return false;
+    if (x->nm2c + 2 > COLD_FIX || x->nc2m + 2 > COLD_FIX)
+        return false;
+    set_cur_rip(x, in);
+    if ((k == 8 || k == 9) && !x->dead)
+        emit_carry(x); /* RT = CF (INC/DEC o preservam) */
+    emit_ea(x, in);
+    int bit = 0;
+    if (regsrc || k == 11 || k == 12)
+        ld_greg(x, RB, in->reg, s, rexf(in));
+    else if (k == 13) {
+        ld_greg(x, RB, R_AX, s, false);
+        ld_greg(x, RT, in->reg, s, rexf(in));
+    } else if (k >= 14) {
+        bit = (int)((uint64_t)in->imm & (uint64_t)(s * 8 - 1));
+        a64_mov_imm(a, RB, 1ULL << bit);
+    } else if (k == 8 || k == 9)
+        a64_mov_imm(a, RB, 1);
+    else if (k == 10)
+        a64_mov_imm(a, RB, ~0ULL);
+    else
+        a64_mov_imm(a, RB, (uint64_t)in->imm);
+    /* os registradores gravados no caminho rapido (fonte do XADD/XCHG, RAX do CMPXCHG) ja
+     * estao no cache pelo ld_greg acima: o caminho lento ve os mesmos registradores do host */
+    /* alinhado ao tamanho: nao cruza a pagina, basta a etiqueta */
+    uint32_t *salign = NULL, *s1, *s2;
+    if (s > 1) {
+        uint32_t enc = 0;
+        a64_encode_bitmask((uint64_t)(s - 1), 1, &enc);
+        a64_logic_imm(a, 1, 3, XZR, REA, enc); /* tst REA, #s-1 */
+        salign = a64_here(a);
+        a64_bcond(a, A_NE, a64_here(a));
+    }
+    emit_tlb(x, REA, 1, (uint32_t)offsetof(x86_tlbe, tag_w), &s1, &s2);
+    a64_add(a, 9, 10, REA);
+    switch (k) {
+    case 0: case 8: /* LDADDAL */
+        a64_ldop_al(a, s, 0, RB, RA, 9);
+        a64_add(a, RR, RA, RB);
+        break;
+    case 5: case 9: /* subtrai: soma o negativo */
+        a64_sub(a, 11, XZR, RB);
+        a64_ldop_al(a, s, 0, 11, RA, 9);
+        a64_sub(a, RR, RA, RB);
+        break;
+    case 1: case 14: /* LDSETAL */
+        a64_ldop_al(a, s, 3, RB, RA, 9);
+        a64_logic(a, 1, 1, 0, RR, RA, RB);
+        break;
+    case 4: /* AND: LDCLRAL com o complemento */
+        a64_logic(a, 1, 1, 1, 11, XZR, RB);
+        a64_ldop_al(a, s, 1, 11, RA, 9);
+        a64_logic(a, 1, 0, 0, RR, RA, RB);
+        break;
+    case 15: /* BTR: LDCLRAL com a mascara */
+        a64_ldop_al(a, s, 1, RB, RA, 9);
+        break;
+    case 6: case 10: case 16: /* LDEORAL */
+        a64_ldop_al(a, s, 2, RB, RA, 9);
+        a64_logic(a, 1, 2, 0, RR, RA, RB);
+        break;
+    case 11:
+        a64_ldop_al(a, s, 0, RB, RA, 9);
+        a64_add(a, RR, RA, RB);
+        st_greg(x, RA, in->reg, s, rexf(in));
+        break;
+    case 12:
+        a64_swpal(a, s, RB, RA, 9);
+        st_greg(x, RA, in->reg, s, rexf(in));
+        break;
+    case 13: { /* RA = esperado -> valor antigo */
+        a64_mov(a, 1, RA, RB);
+        a64_casal(a, s, RA, RT, 9);
+        a64_cmp(a, 1, RB, RA);
+        uint32_t *jeq = a64_here(a);
+        a64_bcond(a, A_EQ, a64_here(a));
+        x->nocache++;
+        st_greg(x, RA, R_AX, s, false);
+        x->nocache--;
+        a64_patch(jeq, a64_here(a));
+        a64_sub(a, RR, RB, RA);
+        break;
+    }
+    }
+    /* flags */
+    if (k == 0 || k == 5)
+        emit_lazy(x, k ? CC_SUB : CC_ADD, s, RR, RA, RB);
+    else if (k <= 6)
+        emit_lazy(x, CC_LOGIC, s, RR, XZR, XZR);
+    else if (k == 8 || k == 9) {
+        if (!x->dead)
+            a64_str(a, 8, RT, RC, OFF(cc_aux));
+        emit_lazy(x, k == 9 ? CC_DEC : CC_INC, s, RR, RA, RB);
+    } else if (k == 11)
+        emit_lazy(x, CC_ADD, s, RR, RA, RB);
+    else if (k == 13)
+        emit_lazy(x, CC_SUB, s, RR, RB, RA);
+    else if (k >= 14 && !x->dead) {
+        a64_ubfx(a, 1, RA, bit, 1);
+        a64_mov(a, 1, 0, RC);
+        x->slowpath++; /* so neste caminho: o estado do cache nao pode mudar */
+        emit_call(x, (const void *)jit_set_cf);
+        x->slowpath--;
+    }
+    /* caminho lento */
+    uint32_t *first = salign ? salign : s1, *second = salign ? s1 : NULL, *jok;
+    if (cold_begin(x, first, second)) {
+        uint32_t *done = x->hot_p;
+        emit_lse_slow(x, in, &jok);
+        j->c2m[x->nc2m].coff = (unsigned)(jok - j->cold);
+        j->c2m[x->nc2m++].target = done;
+        cold_end_exit(x);
+    } else {
+        uint32_t *jdone = a64_here(a);
+        a64_b(a, a64_here(a));
+        a64_patch(s1, a64_here(a));
+        if (salign)
+            a64_patch(salign, a64_here(a));
+        emit_lse_slow(x, in, &jok);
+        a64_patch(jok, a64_here(a));
+        a64_patch(jdone, a64_here(a));
+    }
+    x->stored = true; /* o caminho lento pode ter escrito em codigo traduzido */
+    x->flags_op = 0;  /* flags em c->cc_* (dos dois caminhos), sem estado conhecido no bloco */
+    x->ccop_mem = -1;
+    return true;
+}
+
 /*
  * Emite uma instrucao. Retorna 1 se o bloco continua, 0 se a instrucao
  * terminou o bloco (desvio).
@@ -2764,8 +2952,9 @@ static int emit_insn(jctx *x, jinsn *in)
         return 1;
     }
     if (x->j->smp && in->mem && (in->lock || op == 0x86 || op == 0x87)) {
-        /* varias CPUs: LOCK (e XCHG com memoria) no interpretador, com compare-and-swap */
-        emit_icall(x, in);
+        /* varias CPUs: LOCK (e XCHG com memoria) com atomico nativo ou no interpretador */
+        if (!emit_lse(x, in))
+            emit_icall(x, in);
         return 1;
     }
     if (in->icall && (emit_sse(x, in) || (!(x->j->off & 64) && emit_vec(x, in)) ||
@@ -4024,6 +4213,7 @@ struct x86_jit *x86_jit_new(x86_cpu *c)
     j->smp = c->smp;
 #if defined(__aarch64__) && defined(__linux__)
     j->lrcpc = (getauxval(AT_HWCAP) & (1UL << 15)) != 0; /* HWCAP_LRCPC */
+    j->lse = (getauxval(AT_HWCAP) & (1UL << 8)) != 0;    /* HWCAP_ATOMICS */
 #endif
     if (j->smp)
         LOGI("JIT: modo SMP (ordem TSO%s)", j->lrcpc ? ", LDAPR" : ", LDAR");

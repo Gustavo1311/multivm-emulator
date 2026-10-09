@@ -168,6 +168,22 @@ static inline void a64_stlr(a64 *a, int size, int rt, int rn) /* release */
 {
     a64_put(a, 0x089FFC00u | (a64_size_bits(size) << 30) | ((uint32_t)rn << 5) | (uint32_t)rt);
 }
+/* atomicos LSE (ARMv8.1) com acquire+release: opc 0 = LDADD, 1 = LDCLR, 2 = LDEOR, 3 = LDSET;
+ * rt recebe o valor antigo; rs e o operando */
+static inline void a64_ldop_al(a64 *a, int size, int opc, int rs, int rt, int rn)
+{
+    a64_put(a, 0x38E00000u | (a64_size_bits(size) << 30) | ((uint32_t)rs << 16) | ((uint32_t)opc << 12) |
+                   ((uint32_t)rn << 5) | (uint32_t)rt);
+}
+static inline void a64_swpal(a64 *a, int size, int rs, int rt, int rn)
+{
+    a64_put(a, 0x38E08000u | (a64_size_bits(size) << 30) | ((uint32_t)rs << 16) | ((uint32_t)rn << 5) | (uint32_t)rt);
+}
+/* CASAL: compara [rn] com rs (que recebe o valor antigo) e grava rt se igual */
+static inline void a64_casal(a64 *a, int size, int rs, int rt, int rn)
+{
+    a64_put(a, 0x08E0FC00u | (a64_size_bits(size) << 30) | ((uint32_t)rs << 16) | ((uint32_t)rn << 5) | (uint32_t)rt);
+}
 #define A64_DMB_ISHLD 0xD50339BFu
 #define A64_DMB_ISHST 0xD5033ABFu
 #define A64_DMB_ISH 0xD5033BBFu
