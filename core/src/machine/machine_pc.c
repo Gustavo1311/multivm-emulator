@@ -45,7 +45,8 @@
 
 typedef struct {
     i8259 *pic;
-    lapic *lapic;
+    lapic *lapic;      /* LAPIC da BSP (recebe o 8259) */
+    apic_bus *apic;    /* LAPICs de todas as CPUs */
     acpi_pm *pm;
     hpet *hpet;
     ioapic *ioapic;
@@ -94,10 +95,34 @@ typedef struct {
 
 static void cpu_intr(void *cpu, int level) { x86_set_intr(cpu, level); }
 
-static int intr_ack(void *opaque)
+static int intr_ack(void *opaque) { return lapic_intr_ack(opaque); } /* opaque = LAPIC da CPU */
+
+/* INIT/SIPI/NMI de uma IPI: atendidos na thread da CPU alvo */
+static void cpu_startup(void *cpu, int kind, int vector)
 {
-    pc_machine *m = opaque;
-    return lapic_ack(m->lapic);
+    if (kind == APIC_STARTUP_INIT)
+        x86_request_init(cpu);
+    else if (kind == APIC_STARTUP_SIPI)
+        x86_request_sipi(cpu, vector);
+    else
+        x86_request_nmi(cpu);
+}
+
+static void a20_work(mvm_vm *vm, void *arg)
+{
+    int *a = arg; /* [indice da CPU, ligado] */
+    x86_set_a20(vm->vcpu[a[0]].cpu, a[1] != 0);
+}
+
+/* A20 vale para todas as CPUs (cada TLB na thread da sua CPU) */
+static void set_a20_all(mvm_vm *vm, bool on)
+{
+    for (int i = 0; i < vm->ncpus; i++) {
+        int *a = malloc(2 * sizeof(int));
+        a[0] = i;
+        a[1] = on;
+        vm_run_on_cpu(vm, i, a20_work, a);
+    }
 }
 
 /* IRQ ISA: vai ao 8259 e ao IOAPIC (IRQ0 do PIT tambem no pino 2, como no QEMU) */
@@ -204,7 +229,7 @@ static void sysctl_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
     switch (off) {
     case 0x61: i8254_port61_write(m->pit, (uint8_t)v); break;
     case 0x92:
-        x86_set_a20(vm->cpu, v & 2);
+        set_a20_all(vm, v & 2);
         if (v & 1) {
             LOGI("porta 0x92: reset");
             vm_request_guest_reset(vm);
@@ -413,7 +438,8 @@ static void build_identity_pt(mvm_vm *vm)
 static void acpi_config_for(mvm_vm *vm, acpi_config *c)
 {
     c->pci_hole_start = vm->ram_size > 0x80000000ULL ? 0xc0000000u : 0x80000000u;
-    c->ioapic_id = 0;
+    c->ioapic_id = (uint8_t)vm->ncpus; /* depois dos IDs dos LAPICs, como o SeaBIOS faz */
+    c->ncpus = (uint8_t)vm->ncpus;
     c->hpet_block_id = hpet_block_id();
     pc_machine *m = vm->mach;
     c->floppies = (uint8_t)((m->fd_cmos[0] ? 1 : 0) | (m->fd_cmos[1] ? 2 : 0));
@@ -531,9 +557,9 @@ static void setup_fw_cfg(mvm_vm *vm, pc_machine *m)
 {
     fw_cfg *f = m->fw;
     fw_cfg_add_u64(f, 0x03, vm->ram_size);        /* RAM_SIZE */
-    uint16_t one = 1, zero16 = 0;
-    fw_cfg_add_bytes(f, 0x05, &one, 2);            /* NB_CPUS */
-    fw_cfg_add_bytes(f, 0x0f, &one, 2);            /* MAX_CPUS */
+    uint16_t ncpus = (uint16_t)vm->ncpus, zero16 = 0;
+    fw_cfg_add_bytes(f, 0x05, &ncpus, 2);          /* NB_CPUS */
+    fw_cfg_add_bytes(f, 0x0f, &ncpus, 2);          /* MAX_CPUS */
     fw_cfg_add_bytes(f, 0x0e, &zero16, 2);         /* BOOT_MENU */
     uint64_t numa[1] = {0};
     fw_cfg_add_bytes(f, 0x0d, numa, 8);            /* NUMA: 0 nos */
@@ -602,9 +628,12 @@ static int pc_init(mvm_vm *vm, char *err, size_t errlen)
     pc_machine *m = calloc(1, sizeof(*m));
     vm->mach = m;
     vm->ram_base = 0;
-    vm->cpu = x86_cpu_new(vm, vm->cfg.arch == MVM_ARCH_X86_64);
+    int ncpus = vm->cfg.cpus ? (int)vm->cfg.cpus : 1;
+    for (int i = 0; i < ncpus; i++) {
+        void *c = x86_cpu_new(vm, vm->cfg.arch == MVM_ARCH_X86_64);
+        x86_set_cpu_index(c, vm_add_cpu(vm, c), (unsigned)ncpus);
+    }
     vm->cpu_ops = &x86_cpu_ops;
-    x86_set_intr_ack(vm->cpu, intr_ack, m);
     m->bios_mode = vm->cfg.firmware && !vm->cfg.kernel;
 
     if (vm->cfg.firmware) {
@@ -618,13 +647,24 @@ static int pc_init(mvm_vm *vm, char *err, size_t errlen)
         space_add_ram(&vm->mem, 0x100000000ULL - m->bios_size, m->bios_size, m->bios, true, "bios");
     }
 
-    m->lapic = lapic_new(vm, vm->cpu, cpu_intr, NULL);
+    m->apic = apic_bus_new(vm, cpu_startup);
+    for (int i = 0; i < vm->ncpus; i++) { /* um LAPIC por CPU (ID = indice) */
+        void *c = vm->vcpu[i].cpu;
+        lapic *a = lapic_new(vm, c, cpu_intr, NULL);
+        apic_bus_add(m->apic, a);
+        x86_set_apic(c, a, lapic_get_base, lapic_set_base, lapic_get_tpr, lapic_set_tpr);
+        x86_set_intr_ack(c, intr_ack, a);
+    }
+    m->lapic = apic_bus_get(m->apic, 0);
     m->pic = i8259_new(vm, lapic_pic_intr, m->lapic);
     lapic_set_pic(m->lapic, m->pic);
-    m->ioapic = ioapic_new(vm, m->lapic);
-    x86_set_apic(vm->cpu, m->lapic, lapic_get_base, lapic_set_base, lapic_get_tpr, lapic_set_tpr);
-    space_add_io(&vm->mem, LAPIC_MMIO_BASE, 0x1000, &lapic_mmio_ops, m->lapic, "lapic");
-    space_add_io(&vm->mem, IOAPIC_MMIO_BASE, 0x1000, &ioapic_mmio_ops, m->ioapic, "ioapic");
+    m->ioapic = ioapic_new(vm, m->apic);
+    mvm_region *rl = space_add_io(&vm->mem, LAPIC_MMIO_BASE, 0x1000, &apic_bus_mmio_ops, m->apic, "lapic");
+    if (rl)
+        rl->nolock = true; /* o APIC tem trava propria */
+    mvm_region *ri = space_add_io(&vm->mem, IOAPIC_MMIO_BASE, 0x1000, &ioapic_mmio_ops, m->ioapic, "ioapic");
+    if (ri)
+        ri->nolock = true;
     m->hpet = hpet_new(vm, hpet_irq, m);
     space_add_io(&vm->mem, HPET_MMIO_BASE, 0x400, &hpet_mmio_ops, m->hpet, "hpet");
     m->pit = i8254_new(vm, pic_line(m, 0));
@@ -908,7 +948,11 @@ static void pc_reset(mvm_vm *vm)
     pc_machine *m = vm->mach;
     char err[256];
     i8259_reset(m->pic);
-    lapic_reset(m->lapic);
+    for (int i = 0; i < vm->ncpus; i++) {
+        lapic_reset(apic_bus_get(m->apic, i));
+        if (i > 0) /* CPUs extras voltam a esperar o SIPI */
+            x86_request_init(vm->vcpu[i].cpu);
+    }
     ioapic_reset(m->ioapic);
     cmos_reset(m->rtc);
     acpi_pm_reset(m->pm);
@@ -965,7 +1009,11 @@ static void pc_poll(mvm_vm *vm)
             last = now;
         if (now - last > dbg * 1000000000LL) {
             last = now;
-            x86_debug_dump(vm->cpu);
+            for (int i = 0; i < vm->ncpus; i++) {
+                if (vm->ncpus > 1)
+                    LOGI("--- CPU %d", i);
+                x86_debug_dump(vm->vcpu[i].cpu);
+            }
             i8259_debug_dump(m->pic);
             lapic_debug_dump(m->lapic);
             i8254_debug_dump(m->pit);
@@ -1010,7 +1058,9 @@ static void pc_destroy(mvm_vm *vm)
     if (m->rtc)
         cmos_reset(m->rtc);
     ide_free(m->ide);
-    lapic_free(m->lapic);
+    for (int i = 0; m->apic && i < vm->ncpus; i++)
+        lapic_free(apic_bus_get(m->apic, i));
+    apic_bus_free(m->apic);
     acpi_pm_free(m->pm);
     hpet_free(m->hpet);
     ahci_free(m->ahci);

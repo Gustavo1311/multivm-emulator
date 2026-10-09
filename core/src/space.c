@@ -5,42 +5,32 @@
 
 static void tlb_flush_on_cpu(mvm_vm *vm, void *arg)
 {
-    (void)arg;
-    if (vm->cpu && vm->cpu_ops && vm->cpu_ops->tlb_flush)
-        vm->cpu_ops->tlb_flush(vm->cpu);
+    int idx = arg ? *(int *)arg : 0;
+    void *cpu = idx < vm->ncpus ? vm->vcpu[idx].cpu : vm->cpu;
+    if (cpu && vm->cpu_ops && vm->cpu_ops->tlb_flush)
+        vm->cpu_ops->tlb_flush(cpu);
 }
 
+/* o mapa mudou: o TLB de cada CPU (privado da thread dela) e esvaziado */
 static void space_changed(mvm_space *s)
 {
     mvm_vm *vm = s->vm;
-    if (vm && s == &vm->mem && vm->cpu && vm->cpu_ops && vm->cpu_ops->tlb_flush)
-        vm_run_on_cpu(vm, tlb_flush_on_cpu, NULL); /* o TLB e da thread da CPU */
+    if (!vm || s != &vm->mem || !vm->cpu || !vm->cpu_ops || !vm->cpu_ops->tlb_flush)
+        return;
+    int n = vm->ncpus ? vm->ncpus : 1;
+    for (int i = 0; i < n; i++) {
+        int *a = malloc(sizeof(int));
+        *a = i;
+        vm_run_on_cpu(vm, i, tlb_flush_on_cpu, a);
+    }
 }
 
-struct code_hit { mvm_space *s; uint64_t pa, len; };
-
-static void code_hit_on_cpu(mvm_vm *vm, void *arg)
-{
-    (void)vm;
-    struct code_hit *h = arg;
-    if (h->s->code_hook)
-        h->s->code_hook(h->s->code_opaque, h->pa, h->len);
-}
-
-/* escrita em pagina com codigo traduzido: o JIT e da thread da CPU; uma escrita de outra
- * thread (DMA na thread de E/S) e invalidada antes da proxima fatia da CPU */
+/* escrita em pagina com codigo traduzido: o despachante do JIT (code_hook) sabe em que
+ * thread cada CPU roda e invalida cada uma na sua */
 void space_code_hit(mvm_space *s, uint64_t pa, uint64_t len)
 {
-    mvm_vm *vm = s->vm;
-    if (!vm || vm_on_cpu_thread(vm)) {
+    if (s->code_hook)
         s->code_hook(s->code_opaque, pa, len);
-        return;
-    }
-    struct code_hit *h = malloc(sizeof(*h));
-    h->s = s;
-    h->pa = pa;
-    h->len = len;
-    vm_run_on_cpu(vm, code_hit_on_cpu, h);
 }
 
 static mvm_region *space_add(mvm_space *s, const mvm_region *nr)
@@ -116,9 +106,10 @@ uint64_t space_read(mvm_space *s, uint64_t addr, unsigned size)
     }
     if (!r->ops->read)
         return 0;
-    if (!s->vm)
+    if (!s->vm || r->nolock)
         return r->ops->read(r->opaque, off, size);
     vm_bql_lock(s->vm);
+    r->hits++;
     uint64_t v = r->ops->read(r->opaque, off, size);
     vm_bql_unlock(s->vm);
     return v;
@@ -149,11 +140,12 @@ void space_write(mvm_space *s, uint64_t addr, uint64_t val, unsigned size)
     }
     if (!r->ops->write)
         return;
-    if (!s->vm) {
+    if (!s->vm || r->nolock) {
         r->ops->write(r->opaque, off, val, size);
         return;
     }
     vm_bql_lock(s->vm);
+    r->hits++;
     r->ops->write(r->opaque, off, val, size);
     vm_bql_unlock(s->vm);
 }

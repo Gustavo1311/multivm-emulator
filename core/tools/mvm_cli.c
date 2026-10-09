@@ -339,6 +339,9 @@ static void *control_thread(void *arg)
             } else if (!strncmp(line, "iothread ", 9)) { /* depuracao: thread de E/S ligada (1) ou nao (0) */
                 extern void vm_debug_iothread(mvm_vm *vm, int on);
                 vm_debug_iothread(g_vm, atoi(line + 9));
+            } else if (!strcmp(line, "smpstats")) { /* depuracao: tempo das CPUs e uso da trava (zera) */
+                extern void vm_debug_smp_stats(mvm_vm *vm);
+                vm_debug_smp_stats(g_vm);
             } else if (!strcmp(line, "icount")) { /* instrucoes executadas + tempo (MIPS de um trecho) */
                 struct timespec ts;
                 clock_gettime(CLOCK_MONOTONIC, &ts);

@@ -52,6 +52,9 @@ final class VmSettings {
 
     /** Relogio do convidado (RTC). */
     static final int RTC_UTC = 0, RTC_LOCAL = 1, RTC_FIXED = 2;
+    static final int CPU_MAX = 4;
+    static final String[] CPU_NAMES = {"1 processador", "2 processadores", "3 processadores", "4 processadores"};
+
     static final String[] RTC_NAMES = {"UTC (Linux, padrão)", "Hora local do aparelho (Windows, DOS)",
             "Data fixa (começa na data escolhida)"};
 
@@ -110,6 +113,8 @@ final class VmSettings {
     String dtb;
     String rawAddr = "";
     int rtc;
+    /** processadores (so x86) */
+    int cpus = 1;
     String rtcDate = "2000-01-01 00:00";
     /* som e rede: indices em NIC_NAMES e SOUND_NAMES */
     int nic, sound;
@@ -214,6 +219,7 @@ final class VmSettings {
         s.dtb = p.getString("dtb", null);
         s.rawAddr = p.getString("rawAddr", "");
         s.rtc = clamp(p.getInt("rtc", RTC_UTC), RTC_NAMES.length);
+        s.cpus = Math.max(1, Math.min(CPU_MAX, p.getInt("cpus", 1)));
         s.rtcDate = p.getString("rtcDate", "2000-01-01 00:00");
         for (int k = 0; k < 3; k++)
             for (int i = 0; i < MAX[k]; i++) {
@@ -296,6 +302,7 @@ final class VmSettings {
                 .putString("dtb", dtb)
                 .putString("rawAddr", rawAddr == null ? "" : rawAddr)
                 .putInt("rtc", rtc)
+                .putInt("cpus", cpus)
                 .putString("rtcDate", rtcDate)
                 .putInt("nic", nic)
                 .putInt("sound", sound)
@@ -323,6 +330,8 @@ final class VmSettings {
         StringBuilder sb = new StringBuilder();
         sb.append(AppFiles.ARCH_NAMES[Math.max(0, Math.min(AppFiles.ARCH_NAMES.length - 1, arch))]);
         sb.append(" · ").append(ram.trim()).append(" MiB");
+        if (cpus > 1)
+            sb.append(" · ").append(cpus).append(" CPUs");
         int d = disks().size(), c = cdroms().size(), f = floppies().size();
         if (d > 0) sb.append(" · ").append(d).append(d == 1 ? " disco" : " discos");
         if (c > 0) sb.append(" · ").append(c).append(c == 1 ? " ISO" : " ISOs");

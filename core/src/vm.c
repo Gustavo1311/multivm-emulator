@@ -59,6 +59,8 @@ void vm_request_shutdown(mvm_vm *vm)
 {
     vm->shutdown = 1;
     atomic_store(&vm->cpu_exit, 1);
+    for (int i = 1; i < vm->ncpus; i++)
+        vm_cpu_kick(vm, i);
 }
 
 void vm_request_guest_reset(mvm_vm *vm)
@@ -103,8 +105,12 @@ mvm_vm *mvm_create(const mvm_config *cfg, char *err, size_t errlen)
         snprintf(err, errlen, "arquitetura invalida");
         return NULL;
     }
-    if (cfg->cpus > 1) {
-        snprintf(err, errlen, "varios processadores ainda nao sao suportados (em desenvolvimento)");
+    if (cfg->cpus > 1 && cfg->arch != MVM_ARCH_X86_64 && cfg->arch != MVM_ARCH_I386) {
+        snprintf(err, errlen, "varios processadores so no x86 (por enquanto)");
+        return NULL;
+    }
+    if (cfg->cpus > MVM_MAX_CPUS) {
+        snprintf(err, errlen, "processadores demais (%u; maximo %d)", cfg->cpus, MVM_MAX_CPUS);
         return NULL;
     }
     if (cfg->ram_mb < 4 || cfg->ram_mb > 3072) {
@@ -154,8 +160,8 @@ mvm_vm *mvm_create(const mvm_config *cfg, char *err, size_t errlen)
     pthread_mutexattr_init(&ma);
     pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&vm->bql, &ma); /* reentrante: callback de dispositivo -> dispatch */
+    pthread_mutex_init(&vm->timers_lock, NULL);
     pthread_mutexattr_destroy(&ma);
-    pthread_mutex_init(&vm->work_lock, NULL);
     const char *iot = getenv("MVM_IOTHREAD");
     vm->iothread = !(iot && *iot == '0');
     chr_init(&vm->serial);
@@ -252,6 +258,9 @@ void mvm_destroy(mvm_vm *vm)
     net_free(vm->net);
     audio_free(vm->audio);
     free(vm->s_dns);
+    for (int i = vm->ncpus - 1; i >= 1; i--) /* CPUs extras (a 0 e vm->cpu) */
+        if (vm->vcpu[i].cpu && vm->cpu_ops)
+            vm->cpu_ops->destroy(vm->vcpu[i].cpu);
     if (vm->cpu && vm->cpu_ops)
         vm->cpu_ops->destroy(vm->cpu);
     for (int i = 0; i < MVM_MAX_DISKS; i++) {
@@ -279,13 +288,16 @@ void mvm_destroy(mvm_vm *vm)
     pthread_mutex_destroy(&vm->in_lock);
     pthread_mutex_destroy(&vm->lock);
     pthread_cond_destroy(&vm->cond);
-    while (vm->work_head) { /* trabalho que sobrou de uma execucao interrompida */
-        struct vm_work *w = vm->work_head;
-        vm->work_head = w->next;
-        free(w->arg);
-        free(w);
+    for (int i = 0; i < vm->ncpus; i++) { /* trabalho que sobrou de uma execucao interrompida */
+        struct vm_vcpu *v = &vm->vcpu[i];
+        while (v->work_head) {
+            struct vm_work *w = v->work_head;
+            v->work_head = w->next;
+            free(w->arg);
+            free(w);
+        }
+        pthread_mutex_destroy(&v->work_lock);
     }
-    pthread_mutex_destroy(&vm->work_lock);
     pthread_mutex_destroy(&vm->bql);
     free(vm);
 }
@@ -293,46 +305,142 @@ void mvm_destroy(mvm_vm *vm)
 /* ------------------------------------------------------------ threads */
 
 static _Thread_local mvm_vm *tls_cpu_vm; /* VM cuja CPU roda nesta thread */
+static _Thread_local int tls_cpu_idx = -1;
+static _Atomic uint64_t st_kick, st_cpukick, st_wait; /* estatistica: acordar/esperar (chamadas de sistema) */
 static void wait_flag(mvm_vm *vm, _Atomic int *flag, int64_t host_deadline);
 static void kick(mvm_vm *vm);
 
-void vm_bql_lock(mvm_vm *vm) { pthread_mutex_lock(&vm->bql); }
-void vm_bql_unlock(mvm_vm *vm) { pthread_mutex_unlock(&vm->bql); }
+/* estatistica (MVM_SMP_STATS): quanto tempo cada thread segura a trava (fora das reentradas) */
+static _Thread_local int tls_bql_depth;
+static _Thread_local int64_t tls_bql_t0;
+static int64_t bql_hold[MVM_MAX_CPUS + 1], bql_hold_max[MVM_MAX_CPUS + 1];
+static uint64_t bql_hold_n[MVM_MAX_CPUS + 1];
+static int bql_stats = -1;
 
-bool vm_on_cpu_thread(mvm_vm *vm) { return tls_cpu_vm == vm || !atomic_load(&vm->running); }
-
-void vm_run_on_cpu(mvm_vm *vm, void (*fn)(mvm_vm *vm, void *arg), void *arg)
+static void bql_acquired(void)
 {
-    if (vm_on_cpu_thread(vm)) {
+    if (tls_bql_depth++ == 0 && bql_stats > 0)
+        tls_bql_t0 = host_clock_ns();
+}
+
+void vm_bql_lock(mvm_vm *vm)
+{
+    /* as retencoes sao curtas: gira um pouco antes de dormir (dormir custa uma chamada
+     * de sistema para cada lado) */
+    static int spin = -1;
+    if (bql_stats < 0)
+        bql_stats = getenv("MVM_SMP_STATS") != NULL;
+    if (spin < 0)
+        spin = getenv("MVM_BQL_SPIN") ? atoi(getenv("MVM_BQL_SPIN")) : 400;
+    for (int k = 0; k < spin; k++) {
+        if (pthread_mutex_trylock(&vm->bql) == 0) {
+            bql_acquired();
+            return;
+        }
+#if defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+    }
+    int i = tls_cpu_vm == vm ? tls_cpu_idx : -1;
+    if (i < 0) {
+        pthread_mutex_lock(&vm->bql);
+        bql_acquired();
+        return;
+    }
+    int64_t t0 = host_clock_ns(); /* contencao: conta para a estatistica da CPU */
+    pthread_mutex_lock(&vm->bql);
+    bql_acquired();
+    vm->vcpu[i].st_bql += host_clock_ns() - t0;
+    vm->vcpu[i].st_bql_n++;
+}
+void vm_bql_unlock(mvm_vm *vm)
+{
+    if (--tls_bql_depth == 0 && bql_stats > 0) {
+        int i = tls_cpu_vm == vm && tls_cpu_idx >= 0 ? tls_cpu_idx : MVM_MAX_CPUS; /* ultima = outras threads */
+        int64_t d = host_clock_ns() - tls_bql_t0;
+        bql_hold[i] += d;
+        bql_hold_n[i]++;
+        if (d > bql_hold_max[i])
+            bql_hold_max[i] = d;
+    }
+    pthread_mutex_unlock(&vm->bql);
+}
+
+int vm_cpu_index(mvm_vm *vm) { return tls_cpu_vm == vm ? tls_cpu_idx : -1; }
+
+bool vm_is_cpu_thread(mvm_vm *vm, int idx)
+{
+    return (tls_cpu_vm == vm && tls_cpu_idx == idx) || !atomic_load(&vm->running);
+}
+
+int vm_add_cpu(mvm_vm *vm, void *cpu)
+{
+    int i = vm->ncpus++;
+    struct vm_vcpu *v = &vm->vcpu[i];
+    v->cpu = cpu;
+    pthread_mutex_init(&v->work_lock, NULL);
+    if (i == 0)
+        vm->cpu = cpu;
+    return i;
+}
+
+_Atomic int *vm_cpu_exit_flag(mvm_vm *vm, int idx) { return idx == 0 ? &vm->cpu_exit : &vm->vcpu[idx].exit_req; }
+
+void vm_cpu_kick(mvm_vm *vm, int idx)
+{
+    if (idx == 0) {
+        vm_kick(vm, true);
+        return;
+    }
+    atomic_store(&vm->vcpu[idx].exit_req, 1);
+    atomic_fetch_add(&st_cpukick, 1);
+    pthread_mutex_lock(&vm->lock);
+    atomic_store(&vm->vcpu[idx].wake, 1);
+    pthread_cond_broadcast(&vm->cond);
+    pthread_mutex_unlock(&vm->lock);
+}
+
+/* todas as CPUs saem da fatia (parada, reset, desligamento) */
+static void kick_all_cpus(mvm_vm *vm)
+{
+    for (int i = 0; i < vm->ncpus; i++)
+        vm_cpu_kick(vm, i);
+}
+
+void vm_run_on_cpu(mvm_vm *vm, int idx, void (*fn)(mvm_vm *vm, void *arg), void *arg)
+{
+    if (idx >= vm->ncpus || vm_is_cpu_thread(vm, idx)) {
         fn(vm, arg);
         free(arg);
         return;
     }
+    struct vm_vcpu *v = &vm->vcpu[idx];
     struct vm_work *w = malloc(sizeof(*w));
     w->fn = fn;
     w->arg = arg;
     w->next = NULL;
-    pthread_mutex_lock(&vm->work_lock);
-    if (vm->work_tail)
-        vm->work_tail->next = w;
+    pthread_mutex_lock(&v->work_lock);
+    if (v->work_tail)
+        v->work_tail->next = w;
     else
-        vm->work_head = w;
-    vm->work_tail = w;
-    atomic_store(&vm->work_pending, 1);
-    pthread_mutex_unlock(&vm->work_lock);
-    vm_kick(vm, true); /* a CPU sai da fatia e faz o trabalho antes de continuar */
+        v->work_head = w;
+    v->work_tail = w;
+    atomic_store(&v->work_pending, 1);
+    pthread_mutex_unlock(&v->work_lock);
+    vm_cpu_kick(vm, idx); /* a CPU sai da fatia e faz o trabalho antes de continuar */
 }
 
-/* thread da CPU (com a bql): executa o trabalho pedido por outras threads */
-static void work_run(mvm_vm *vm)
+/* thread da CPU idx (com a bql): executa o trabalho pedido por outras threads */
+static void work_run(mvm_vm *vm, int idx)
 {
-    if (!atomic_load(&vm->work_pending))
+    struct vm_vcpu *v = &vm->vcpu[idx];
+    if (!atomic_load(&v->work_pending))
         return;
-    pthread_mutex_lock(&vm->work_lock);
-    struct vm_work *w = vm->work_head;
-    vm->work_head = vm->work_tail = NULL;
-    atomic_store(&vm->work_pending, 0);
-    pthread_mutex_unlock(&vm->work_lock);
+    pthread_mutex_lock(&v->work_lock);
+    struct vm_work *w = v->work_head;
+    v->work_head = v->work_tail = NULL;
+    atomic_store(&v->work_pending, 0);
+    pthread_mutex_unlock(&v->work_lock);
     while (w) {
         struct vm_work *n = w->next;
         w->fn(vm, w->arg);
@@ -352,12 +460,6 @@ void vm_debug_iothread(mvm_vm *vm, int on)
     kick(vm);
 }
 
-void vm_cpu_signal(mvm_vm *vm)
-{
-    if (tls_cpu_vm != vm)
-        vm_kick(vm, true);
-}
-
 static void wait_until(mvm_vm *vm, int64_t host_deadline) { wait_flag(vm, &vm->kick, host_deadline); }
 
 static void wait_flag(mvm_vm *vm, _Atomic int *flag, int64_t host_deadline)
@@ -374,6 +476,7 @@ static void wait_flag(mvm_vm *vm, _Atomic int *flag, int64_t host_deadline)
     clock_gettime(CLOCK_MONOTONIC, &now);
     int64_t abs_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec + delta;
     struct timespec ts = {.tv_sec = abs_ns / 1000000000LL, .tv_nsec = abs_ns % 1000000000LL};
+    atomic_fetch_add(&st_wait, 1);
     pthread_mutex_lock(&vm->lock);
     if (!atomic_exchange(flag, 0))
         pthread_cond_timedwait(&vm->cond, &vm->lock, &ts);
@@ -384,6 +487,7 @@ static void wait_flag(mvm_vm *vm, _Atomic int *flag, int64_t host_deadline)
 /* acorda a thread da CPU e a de E/S (cada uma consome a sua marca) */
 static void kick(mvm_vm *vm)
 {
+    atomic_fetch_add(&st_kick, 1);
     pthread_mutex_lock(&vm->lock);
     atomic_store(&vm->kick, 1);
     atomic_store(&vm->io_kick, 1);
@@ -650,6 +754,42 @@ int mvm_media_add_disk(mvm_vm *vm, const char *path, int fd, bool readonly, cons
 
 static int run_loop(mvm_vm *vm);
 
+/* CPU extra (indice >= 1): roda em fatias na sua thread. Comeca parada (espera o SIPI);
+ * timers e dispositivos ficam com a CPU 0 e a thread de E/S. */
+struct ap_arg { mvm_vm *vm; int idx; };
+
+static void *ap_loop(void *arg)
+{
+    struct ap_arg *aa = arg;
+    mvm_vm *vm = aa->vm;
+    int idx = aa->idx;
+    free(aa);
+    struct vm_vcpu *v = &vm->vcpu[idx];
+    tls_cpu_vm = vm;
+    tls_cpu_idx = idx;
+    /* sem a bql: o trabalho entre as fatias (TLB, JIT, A20) e privado desta CPU; os
+     * acessos a dispositivos durante a execucao tomam a trava na dispatch */
+    while (!atomic_load(&vm->aps_quit)) {
+        atomic_store(&v->exit_req, 0);
+        work_run(vm, idx);
+        if (atomic_load(&vm->pause_req) || __atomic_load_n(&vm->shutdown, __ATOMIC_RELAXED) ||
+            __atomic_load_n(&vm->fatal, __ATOMIC_RELAXED) || atomic_load(&vm->stop_req) || vm->cpu_ops->halted(v->cpu)) {
+            int64_t t0 = host_clock_ns();
+            wait_flag(vm, &v->wake, t0 + 10000000LL);
+            v->st_halt += host_clock_ns() - t0;
+            continue;
+        }
+        int64_t t0 = host_clock_ns();
+        int64_t n = vm->cpu_ops->run(v->cpu, SLICE_INSNS);
+        v->st_run += host_clock_ns() - t0;
+        v->st_insns += (uint64_t)n;
+        atomic_fetch_add_explicit(&vm->insn_count, (uint64_t)n, memory_order_relaxed);
+    }
+    tls_cpu_vm = NULL;
+    tls_cpu_idx = -1;
+    return NULL;
+}
+
 /* thread de E/S: entrada, midia e polling de rede/serial (com a bql) */
 static void *io_loop(void *arg)
 {
@@ -677,6 +817,7 @@ int mvm_run(mvm_vm *vm)
 {
     atomic_store(&vm->running, 1);
     tls_cpu_vm = vm;
+    tls_cpu_idx = 0;
     if (vm->iothread) {
         atomic_store(&vm->io_quit, 0);
         atomic_store(&vm->io_active, 1);
@@ -684,7 +825,25 @@ int mvm_run(mvm_vm *vm)
         if (!vm->io_started)
             LOGW("sem thread de E/S: tudo na thread da CPU");
     }
+    atomic_store(&vm->aps_quit, 0);
+    for (int i = 1; i < vm->ncpus; i++) {
+        struct ap_arg *aa = malloc(sizeof(*aa));
+        aa->vm = vm;
+        aa->idx = i;
+        vm->vcpu[i].started = pthread_create(&vm->vcpu[i].thread, NULL, ap_loop, aa) == 0;
+        if (!vm->vcpu[i].started)
+            free(aa);
+    }
     int r = run_loop(vm);
+    if (vm->ncpus > 1) { /* as CPUs extras param antes da thread de E/S */
+        atomic_store(&vm->aps_quit, 1);
+        kick_all_cpus(vm);
+        for (int i = 1; i < vm->ncpus; i++)
+            if (vm->vcpu[i].started) {
+                pthread_join(vm->vcpu[i].thread, NULL);
+                vm->vcpu[i].started = false;
+            }
+    }
     if (vm->io_started) {
         atomic_store(&vm->io_quit, 1);
         kick(vm);
@@ -692,9 +851,11 @@ int mvm_run(mvm_vm *vm)
         vm->io_started = false;
     }
     vm_bql_lock(vm);
-    work_run(vm);
+    for (int i = 0; i < vm->ncpus; i++)
+        work_run(vm, i);
     vm_bql_unlock(vm);
     tls_cpu_vm = NULL;
+    tls_cpu_idx = -1;
     if (vm->fb_flush) /* a ultima imagem fica disponivel depois da execucao */
         vm->fb_flush(vm->fb_flush_opaque);
     atomic_store(&vm->running, 0);
@@ -705,14 +866,62 @@ int mvm_run(mvm_vm *vm)
     return r;
 }
 
+/* depuracao (MVM_SMP_STATS / CLI "smpstats"): tempo de cada CPU e uso da trava; zera depois */
+void vm_debug_smp_stats(mvm_vm *vm)
+{
+    for (int i = 0; i < vm->ncpus; i++) {
+        LOGI("CPU %d: %.2f G instrucoes, %.0f MIPS executando", i, vm->vcpu[i].st_insns / 1e9,
+             vm->vcpu[i].st_run ? vm->vcpu[i].st_insns / (vm->vcpu[i].st_run / 1e3) : 0.0);
+        vm->vcpu[i].st_insns = 0;
+        LOGI("CPU %d: executando %.1fs, em HLT %.1fs, esperando a trava %.2fs (%llu vezes); segurou %.2fs em %llu (max %.2f ms)", i,
+             vm->vcpu[i].st_run / 1e9, vm->vcpu[i].st_halt / 1e9, vm->vcpu[i].st_bql / 1e9,
+             (unsigned long long)vm->vcpu[i].st_bql_n, bql_hold[i] / 1e9, (unsigned long long)bql_hold_n[i],
+             bql_hold_max[i] / 1e6);
+        vm->vcpu[i].st_run = vm->vcpu[i].st_halt = vm->vcpu[i].st_bql = 0;
+        vm->vcpu[i].st_bql_n = 0;
+        bql_hold[i] = bql_hold_max[i] = 0;
+        bql_hold_n[i] = 0;
+    }
+    LOGI("outras threads: seguraram a trava %.2fs em %llu (max %.2f ms)", bql_hold[MVM_MAX_CPUS] / 1e9,
+         (unsigned long long)bql_hold_n[MVM_MAX_CPUS], bql_hold_max[MVM_MAX_CPUS] / 1e6);
+    bql_hold[MVM_MAX_CPUS] = bql_hold_max[MVM_MAX_CPUS] = 0;
+    bql_hold_n[MVM_MAX_CPUS] = 0;
+    LOGI("acordar: kick %llu, cpu_kick %llu, esperas %llu", (unsigned long long)atomic_exchange(&st_kick, 0),
+         (unsigned long long)atomic_exchange(&st_cpukick, 0), (unsigned long long)atomic_exchange(&st_wait, 0));
+    mvm_space *sp[2] = {&vm->mem, &vm->io};
+    for (int k = 0; k < 2; k++)
+        for (int i = 0; i < sp[k]->n; i++) {
+            if (sp[k]->r[i].hits > 1000)
+                LOGI("regiao %s %s: %llu acessos", k ? "io" : "mem", sp[k]->r[i].name, (unsigned long long)sp[k]->r[i].hits);
+            sp[k]->r[i].hits = 0;
+        }
+}
+
 static int run_loop(mvm_vm *vm)
 {
     vm->shutdown = 0;
     vm->fatal = 0;
     int ret;
-    /* a CPU segura a bql fora da execucao do codigo do convidado */
-    vm_bql_lock(vm);
+    /* a CPU 0 segura a bql na fase de servico (timers, reset, pausa, polling); quando nao
+     * ha nada a fazer, volta a executar sem tocar na trava (as outras CPUs disputam menos) */
+    bool locked = false;
     for (;;) {
+        if (!locked) {
+            if (vm->ncpus > 1 && !atomic_load(&vm->stop_req) && !__atomic_load_n(&vm->shutdown, __ATOMIC_RELAXED) &&
+                !__atomic_load_n(&vm->fatal, __ATOMIC_RELAXED) && !atomic_load(&vm->reset_req) &&
+                !atomic_load(&vm->pause_req) && !atomic_load(&vm->vcpu[0].work_pending) && vm->io_started &&
+                atomic_load(&vm->io_active) && mvm_now(vm) < atomic_load(&vm->timer_next) && !vm->cpu_ops->halted(vm->cpu)) {
+                atomic_store(&vm->cpu_exit, 0); /* nada a servir: executa sem tocar na trava */
+                int64_t t0 = host_clock_ns();
+                int64_t n = vm->cpu_ops->run(vm->cpu, SLICE_INSNS);
+                vm->vcpu[0].st_run += host_clock_ns() - t0;
+                vm->vcpu[0].st_insns += (uint64_t)n;
+                atomic_fetch_add_explicit(&vm->insn_count, (uint64_t)n, memory_order_relaxed);
+                continue;
+            }
+            vm_bql_lock(vm);
+            locked = true;
+        }
         if (atomic_load(&vm->stop_req)) {
             atomic_store(&vm->stop_req, 0);
             ret = MVM_EXIT_STOPPED;
@@ -734,7 +943,7 @@ static int run_loop(mvm_vm *vm)
             break;
         }
         atomic_store(&vm->cpu_exit, 0);
-        work_run(vm);
+        work_run(vm, 0);
         if (atomic_exchange(&vm->reset_req, 0)) {
             LOGI("reiniciando a maquina");
             vm->machine->reset(vm);
@@ -744,7 +953,7 @@ static int run_loop(mvm_vm *vm)
             while (atomic_load(&vm->pause_req) && !atomic_load(&vm->stop_req)) {
                 if (!vm->io_started || !atomic_load(&vm->io_active))
                     media_service(vm); /* troca de midia tambem com a VM pausada */
-                work_run(vm);
+                work_run(vm, 0);
                 if (vm->fb_flush && vm_fb_watched(vm, 500)) /* desenho adiado sem espectador */
                     vm->fb_flush(vm->fb_flush_opaque);
                 vm_bql_unlock(vm);
@@ -772,7 +981,9 @@ static int run_loop(mvm_vm *vm)
                 limit = next;
             if (limit > now) {
                 vm_bql_unlock(vm);
+                int64_t t0 = host_clock_ns();
                 wait_until(vm, limit + vm->clock_offset);
+                vm->vcpu[0].st_halt += host_clock_ns() - t0;
                 vm_bql_lock(vm);
             }
             /* ainda executa a CPU: ela sai do HLT se houver interrupcao */
@@ -780,11 +991,17 @@ static int run_loop(mvm_vm *vm)
         if (atomic_load(&vm->cpu_exit))
             continue;
         vm_bql_unlock(vm);
+        locked = false;
+        int64_t t0 = host_clock_ns();
         int64_t n = vm->cpu_ops->run(vm->cpu, SLICE_INSNS);
-        vm_bql_lock(vm);
+        vm->vcpu[0].st_run += host_clock_ns() - t0;
+        vm->vcpu[0].st_insns += (uint64_t)n;
         atomic_fetch_add_explicit(&vm->insn_count, (uint64_t)n, memory_order_relaxed);
     }
-    vm_bql_unlock(vm);
+    if (locked)
+        vm_bql_unlock(vm);
+    if (getenv("MVM_SMP_STATS"))
+        vm_debug_smp_stats(vm);
     return ret;
 }
 

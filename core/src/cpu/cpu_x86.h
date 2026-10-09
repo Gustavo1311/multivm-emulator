@@ -194,6 +194,12 @@ typedef struct x86_cpu {
     unsigned trace_n, trace_pos;
     bool trace_dumped, trace_jit;
     bool smp;            /* varias CPUs (ou MVM_SMP_FORCE): ordem TSO e LOCK atomico */
+    int index;           /* CPU 0 = BSP */
+    unsigned apic_id, ncpus;
+    _Atomic int *exit_flag;  /* sair da fatia (sinal de outra thread) */
+    bool wait_sipi;          /* CPU extra parada esperando o SIPI (depois do INIT) */
+    _Atomic int init_req;    /* INIT pedido por outra CPU */
+    _Atomic int sipi_req;    /* SIPI pedido (vetor), -1 = nenhum */
     /* instrucao LOCK em execucao no modo SMP: a 1a leitura fixa o operando travado e a
      * escrita nele vira compare-and-swap na memoria do host (lk_retry: outra CPU mudou o
      * valor; a instrucao e desfeita e repetida) */
@@ -227,6 +233,7 @@ uint64_t x86_lk_read(x86_cpu *c, uint64_t lin, unsigned size);
 void x86_lk_write(x86_cpu *c, uint64_t lin, uint64_t v, unsigned size);
 uint8_t *x86_lk_host(x86_cpu *c, uint64_t lin, unsigned size);
 bool x86_cas128(uint8_t *p, uint64_t *lo, uint64_t *hi, uint64_t nlo, uint64_t nhi);
+void x86_exec_one_known(x86_cpu *c, unsigned flags);
 
 static inline uint64_t x86_rd_lin(x86_cpu *c, uint64_t lin, unsigned size)
 {
@@ -374,6 +381,12 @@ void sse_fxrstor(x86_cpu *c, uint64_t lin, bool rex_w);
 void *x86_cpu_new(mvm_vm *vm, bool lm);
 extern const mvm_cpu_ops x86_cpu_ops;
 void x86_set_intr(void *cpu, int level);
+/* INIT/SIPI/NMI vindos de outra CPU (IPI): atendidos na thread da CPU alvo */
+void x86_request_init(void *cpu);
+void x86_request_sipi(void *cpu, int vector);
+void x86_request_nmi(void *cpu);
+/* CPU index de um total de ncpus (antes do primeiro reset); as extras comecam paradas */
+void x86_set_cpu_index(void *cpu, int index, unsigned ncpus);
 void x86_set_intr_ack(void *cpu, int (*ack)(void *), void *opaque);
 void x86_set_a20(void *cpu, bool on);
 void x86_set_apic(void *cpu, void *apic, uint64_t (*get_base)(void *), void (*set_base)(void *, uint64_t),

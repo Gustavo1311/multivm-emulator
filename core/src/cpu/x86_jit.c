@@ -1026,6 +1026,26 @@ static void jit_x87(x86_cpu *c, uint64_t info, uint64_t lin)
 void x86_exec_one(x86_cpu *c);
 /* executa a instrucao em c->rip pelo interpretador (chamado de dentro de um bloco) */
 static void jit_interp1(x86_cpu *c) { x86_exec_one(c); }
+/* modo SMP: o JIT diz se a instrucao e travada (1) e se acessa a memoria (2) */
+static void jit_interp1_smp(x86_cpu *c, uint64_t flags) { x86_exec_one_known(c, (unsigned)flags); }
+
+/* a instrucao (sem operando ModRM de memoria) le ou grava a memoria implicitamente? */
+static bool implicit_mem(const jinsn *in)
+{
+    int op = in->op;
+    if (op < 0x100)
+        return (op >= 0xa4 && op <= 0xa7) || (op >= 0xaa && op <= 0xaf) || (op >= 0x6c && op <= 0x6f) ||
+               op == 0x9c || op == 0x9d || op == 0xc2 || op == 0xc3 || op == 0xca || op == 0xcb || op == 0xcf ||
+               op == 0xe8 || op == 0xff || op == 0xc8 || op == 0xc9 || op == 0xd7 || op == 0x60 || op == 0x61 ||
+               op == 0x68 || op == 0x6a || op == 0x8f || (op >= 0x50 && op <= 0x5f) || op == 0x06 || op == 0x07 ||
+               op == 0x0e || op == 0x16 || op == 0x17 || op == 0x1e || op == 0x1f || op == 0xcc || op == 0xcd ||
+               op == 0xce || op == 0xf1 || op == 0x9a || op == 0xea;
+    int o = op & 0xff;
+    if (op < 0x200)
+        return o == 0xa0 || o == 0xa1 || o == 0xa8 || o == 0xa9 || o == 0x05 || o == 0x07 || o == 0x34 ||
+               o == 0x35 || o == 0x00 || o == 0xaa || o == 0xc7 || o == 0xae;
+    return false;
+}
 
 /* CF atual em x0 (0/1) */
 static uint64_t jit_cf(x86_cpu *c) { return x86_cf(c) ? 1 : 0; }
@@ -1599,7 +1619,14 @@ static void emit_icall(jctx *x, jinsn *in)
     a64_str(a, 8, 9, RC, OFF(rip));
     a64_str(a, 8, 9, RC, OFF(cur_rip));
     a64_mov(a, 1, 0, RC);
-    emit_call(x, (const void *)jit_interp1);
+    if (x->j->smp) {
+        unsigned fl = (in->lock || ((in->op == 0x86 || in->op == 0x87) && in->mem) ? 1u : 0u) |
+                      (in->mem || implicit_mem(in) ? 2u : 0u);
+        a64_mov_imm(a, 1, fl);
+        emit_call(x, (const void *)jit_interp1_smp);
+    } else {
+        emit_call(x, (const void *)jit_interp1);
+    }
     a64_ldr(a, 8, 0, RC, OFF(rip));
     a64_mov_imm(a, 1, in->next);
     a64_cmp(a, 1, 0, 1);
@@ -2722,6 +2749,20 @@ static int emit_insn(jctx *x, jinsn *in)
     a64 *a = &x->a;
     int op = in->op, sz = op_size(in);
     bool rex = rexf(in);
+    if (x->j->smp && in->mem && in->lock && (op == 0x83 || op == 0x81) && in->imm == 0 &&
+        ((in->reg & 7) == 1 || (in->reg & 7) == 0) && !(x->j->off & 524288)) {
+        /* LOCK OR/ADD $0, mem: o smp_mb() do Linux. Nao muda a memoria: basta uma barreira
+         * completa, a leitura (para os flags) e outra barreira */
+        int sz2 = in->osz;
+        a64_dmb(a, A64_DMB_ISH);
+        if (in->mem)
+            set_cur_rip(x, in);
+        load_rm(x, in, RA, sz2);
+        a64_mov_imm(a, RB, 0);
+        emit_alu(x, in->reg & 7, sz2);
+        a64_dmb(a, A64_DMB_ISH);
+        return 1;
+    }
     if (x->j->smp && in->mem && (in->lock || op == 0x86 || op == 0x87)) {
         /* varias CPUs: LOCK (e XCHG com memoria) no interpretador, com compare-and-swap */
         emit_icall(x, in);
@@ -2734,8 +2775,11 @@ static int emit_insn(jctx *x, jinsn *in)
         int nk = native_icall_kind(in);
         if ((nk >= 2 && (x->j->off & 2)) || (nk == 1 && (x->j->off & 8)))
             nk = 0;
-        if (nk == 1)
-            return 1; /* barreiras: uma vCPU, sem efeito */
+        if (nk == 1) { /* LFENCE/MFENCE/SFENCE */
+            if (x->j->smp && (in->reg & 7) == 6)
+                a64_dmb(a, A64_DMB_ISH); /* MFENCE: a unica que importa na ordem do x86 (escrita -> leitura) */
+            return 1;
+        }
         if (nk >= 2) {
             if (in->mem)
                 set_cur_rip(x, in); /* a falta de pagina precisa apontar para esta instrucao */
@@ -3303,6 +3347,92 @@ static uint64_t chunk_mask(unsigned lo, unsigned hi) /* trechos de 64 bytes em [
     return (b >= 63 ? ~0ULL : (2ULL << b) - 1) & ~((1ULL << a) - 1);
 }
 
+/* Varias CPUs: um JIT por CPU. O espaco de memoria aponta para o grupo: code_bits e o
+ * mapa comum (uniao das paginas traduzidas por qualquer CPU, consultado pelo TLB de todas)
+ * e code_hook despacha a invalidacao para a thread de cada CPU. */
+typedef struct {
+    struct x86_jit *jits[MVM_MAX_CPUS];
+    int n;
+    uint8_t *bits;
+    uint64_t npages;
+} jit_group;
+
+static void tlb_protect_work(mvm_vm *vm, void *arg)
+{
+    uint64_t *a = arg; /* [indice da CPU, pagina fisica] */
+    x86_tlb_protect_page((x86_cpu *)vm->vcpu[a[0]].cpu, a[1]);
+}
+
+/* pagina passou a ter codigo traduzido: o mapa comum e o TLB de todas as CPUs */
+static void group_mark(struct x86_jit *j, uint64_t pg)
+{
+    jit_group *g = j->mem->code_opaque;
+    if (!g || (void *)j->mem->code_bits != (void *)g->bits)
+        return;
+    uint8_t bit = (uint8_t)(1u << (pg & 7));
+    if (__atomic_fetch_or(&g->bits[pg >> 3], bit, __ATOMIC_SEQ_CST) & bit)
+        return; /* outra CPU ja tinha: os TLBs ja foram avisados */
+    mvm_vm *vm = j->c->vm;
+    for (int i = 0; i < vm->ncpus; i++) {
+        if (i == j->c->index)
+            continue;
+        uint64_t *a = malloc(2 * sizeof(uint64_t));
+        a[0] = (uint64_t)i;
+        a[1] = pg << 12;
+        vm_run_on_cpu(vm, i, tlb_protect_work, a);
+    }
+}
+
+static void code_hook(void *opaque, uint64_t pa, uint64_t len);
+
+struct hook_arg { struct x86_jit *j; uint64_t pa, len; };
+static void hook_work(mvm_vm *vm, void *arg)
+{
+    (void)vm;
+    struct hook_arg *h = arg;
+    code_hook(h->j, h->pa, h->len);
+}
+
+/* escrita (de qualquer thread) numa pagina do mapa comum */
+static void group_code_hook(void *opaque, uint64_t pa, uint64_t len)
+{
+    jit_group *g = opaque;
+    uint64_t pg = pa >> 12;
+    if (pg >= g->npages)
+        return;
+    unsigned lo = (unsigned)(pa & 0xfff), hi = lo + (unsigned)(len > 0x1000 - lo ? 0x1000 - lo : len);
+    uint64_t mask = chunk_mask(lo, hi ? hi : lo + 1);
+    bool any = false;
+    mvm_vm *vm = NULL;
+    for (int k = 0; k < g->n; k++) {
+        struct x86_jit *j = g->jits[k];
+        vm = j->c->vm;
+        if (!((__atomic_load_n(&j->bits[pg >> 3], __ATOMIC_RELAXED) >> (pg & 7)) & 1))
+            continue;
+        any = true;
+        if (!(__atomic_load_n(&j->chunks[pg], __ATOMIC_RELAXED) & mask))
+            continue; /* escrita em dado vizinho do codigo desta CPU */
+        if (vm_is_cpu_thread(vm, j->c->index)) {
+            code_hook(j, pa, len);
+        } else {
+            struct hook_arg *h = malloc(sizeof(*h));
+            h->j = j;
+            h->pa = pa;
+            h->len = len;
+            vm_run_on_cpu(vm, j->c->index, hook_work, h);
+        }
+    }
+    if (!any && vm) {
+        /* nenhuma CPU tem mais codigo aqui: a pagina volta a aceitar escritas rapidas */
+        __atomic_fetch_and(&g->bits[pg >> 3], (uint8_t) ~(1u << (pg & 7)), __ATOMIC_SEQ_CST);
+        int me = vm_cpu_index(vm);
+        if (me >= 0 && me < vm->ncpus)
+            x86_tlb_unprotect_page((x86_cpu *)vm->vcpu[me].cpu, pa & ~0xfffULL);
+        else if (!atomic_load(&vm->running) && g->n)
+            x86_tlb_unprotect_page(g->jits[0]->c, pa & ~0xfffULL);
+    }
+}
+
 static void mark_code_page(struct x86_jit *j, uint64_t phys, unsigned end_off)
 {
     if (phys >= j->mem->code_limit)
@@ -3310,9 +3440,10 @@ static void mark_code_page(struct x86_jit *j, uint64_t phys, unsigned end_off)
     uint64_t pg = phys >> 12;
     j->chunks[pg] |= chunk_mask((unsigned)(phys & 0xfff), end_off);
     if (!((j->bits[pg >> 3] >> (pg & 7)) & 1)) {
-        j->bits[pg >> 3] |= (uint8_t)(1u << (pg & 7));
+        __atomic_fetch_or(&j->bits[pg >> 3], (uint8_t)(1u << (pg & 7)), __ATOMIC_SEQ_CST);
         /* as entradas de TLB para escrita nessa pagina precisam ir pelo caminho lento */
         x86_tlb_protect_page(j->c, phys & ~0xfffULL);
+        group_mark(j, pg);
     }
 }
 
@@ -3379,12 +3510,22 @@ static void code_hook(void *opaque, uint64_t pa, uint64_t len)
     for (jit_block *b = j->pages[pg]; b; b = b->pnext)
         b->valid = false;
     j->pages[pg] = NULL;
-    j->bits[pg >> 3] &= (uint8_t)~(1u << (pg & 7));
+    __atomic_fetch_and(&j->bits[pg >> 3], (uint8_t) ~(1u << (pg & 7)), __ATOMIC_SEQ_CST);
     j->n_inval++;
     j->c->jit_smc = 1;
     jc_drop_page(j, pg);
-    /* a pagina volta a aceitar escritas rapidas */
-    x86_tlb_unprotect_page(j->c, pa & ~0xfffULL);
+    /* se nenhuma outra CPU tem codigo nesta pagina, ela volta a aceitar escritas rapidas */
+    jit_group *g = j->mem->code_opaque;
+    bool others = false;
+    if (g && (void *)j->mem->code_bits == (void *)g->bits)
+        for (int k = 0; k < g->n; k++)
+            if (g->jits[k] != j && ((__atomic_load_n(&g->jits[k]->bits[pg >> 3], __ATOMIC_RELAXED) >> (pg & 7)) & 1))
+                others = true;
+    if (!others) {
+        if (g && (void *)j->mem->code_bits == (void *)g->bits)
+            __atomic_fetch_and(&g->bits[pg >> 3], (uint8_t) ~(1u << (pg & 7)), __ATOMIC_SEQ_CST);
+        x86_tlb_unprotect_page(j->c, pa & ~0xfffULL);
+    }
 }
 
 static jit_block *lookup(struct x86_jit *j, uint64_t lin, uint64_t phys, uint32_t mode, uint64_t csbase)
@@ -3898,10 +4039,18 @@ struct x86_jit *x86_jit_new(x86_cpu *c)
     j->bits = calloc((j->npages + 7) / 8 + 1, 1);
     j->jc_cnt = calloc(j->npages, sizeof(uint16_t));
     j->chunks = calloc(j->npages, sizeof(uint64_t));
-    c->mem->code_bits = j->bits;
-    c->mem->code_limit = j->npages << 12;
-    c->mem->code_hook = code_hook;
-    c->mem->code_opaque = j;
+    jit_group *g = c->mem->code_hook == group_code_hook ? c->mem->code_opaque : NULL;
+    if (!g) {
+        g = calloc(1, sizeof(*g));
+        g->npages = j->npages;
+        g->bits = calloc((j->npages + 7) / 8 + 1, 1);
+        c->mem->code_bits = g->bits;
+        c->mem->code_limit = j->npages << 12;
+        c->mem->code_opaque = g;
+        c->mem->code_hook = group_code_hook;
+    }
+    if (g->n < MVM_MAX_CPUS)
+        g->jits[g->n++] = j;
     build_stubs(j);
     j->max_insns = BLOCK_MAX_INSNS;
     const char *st = getenv("MVM_JIT_STATS");
@@ -3931,9 +4080,20 @@ void x86_jit_free(struct x86_jit *j)
 {
     if (!j)
         return;
-    if (j->mem->code_opaque == j) {
-        j->mem->code_bits = NULL;
-        j->mem->code_hook = NULL;
+    jit_group *g = j->mem->code_hook == group_code_hook ? j->mem->code_opaque : NULL;
+    if (g) {
+        for (int k = 0; k < g->n; k++)
+            if (g->jits[k] == j) {
+                g->jits[k] = g->jits[--g->n];
+                break;
+            }
+        if (!g->n) { /* ultimo JIT: o espaco fica sem mapa de codigo */
+            j->mem->code_bits = NULL;
+            j->mem->code_hook = NULL;
+            j->mem->code_opaque = NULL;
+            free(g->bits);
+            free(g);
+        }
     }
     munmap(j->code, CODE_SIZE);
     free(j->blocks);

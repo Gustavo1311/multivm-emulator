@@ -1180,6 +1180,29 @@ static bool insn_locked(x86_cpu *c)
  * forte que a ordem do x86) e uma instrucao travada roda com o operando de memoria em
  * compare-and-swap; se outra CPU mudar o valor no meio, o estado e restaurado e ela
  * se repete. */
+static void exec_locked(x86_cpu *c);
+
+/* Chamado pelo JIT, que ja sabe como e a instrucao (flags: 1 = travada, 2 = acessa a
+ * memoria): dispensa a espiada dos prefixos e, sem memoria, as barreiras. */
+void x86_exec_one_known(x86_cpu *c, unsigned flags)
+{
+    if (!c->smp) {
+        exec_one_raw(c);
+        return;
+    }
+    if (flags & 1) {
+        exec_locked(c);
+        return;
+    }
+    if (!(flags & 2) || c->smp_nofence) {
+        exec_one_raw(c);
+        return;
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    exec_one_raw(c);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
 void x86_exec_one(x86_cpu *c)
 {
     if (likely(!c->smp)) {
@@ -1196,6 +1219,13 @@ void x86_exec_one(x86_cpu *c)
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         return;
     }
+    exec_locked(c);
+}
+
+/* instrucao travada: operando de memoria em compare-and-swap, repetindo se outra CPU
+ * mudou o valor no meio */
+static void exec_locked(x86_cpu *c)
+{
     uint64_t r[16], rip = c->rip, fl = c->eflags, dst = c->cc_dst, s1 = c->cc_src1, s2 = c->cc_src2, aux = c->cc_aux;
     int op = c->cc_op, size = c->cc_size;
     memcpy(r, c->r, sizeof(r));

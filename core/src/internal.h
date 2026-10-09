@@ -46,6 +46,8 @@ typedef struct {
     const mvm_io_ops *ops;
     void *opaque;
     const char *name;
+    uint64_t hits; /* estatistica (MVM_SMP_STATS): acessos pela dispatch */
+    bool nolock;   /* o dispositivo tem trava propria: a dispatch nao toma a bql */
 } mvm_region;
 
 #define MVM_MAX_REGIONS 96
@@ -232,6 +234,8 @@ typedef struct media_req media_req;
 extern const mvm_machine_ops machine_pc_ops;
 extern const mvm_machine_ops machine_virt_ops;
 
+#define MVM_MAX_CPUS 8
+
 struct mvm_vm {
     mvm_config cfg;
     char *s_kernel, *s_initrd, *s_cmdline, *s_dtb, *s_firmware, *s_vga_bios, *s_boot_order;
@@ -260,6 +264,8 @@ struct mvm_vm {
     void *mach;
 
     mvm_timer *timers;
+    _Atomic int64_t timer_next; /* prazo do primeiro timer (lido sem a bql pela CPU 0) */
+    pthread_mutex_t timers_lock; /* so a lista de timers (a mais interna das travas) */
     int64_t clock_offset;   /* ajusta o relogio durante pausas */
     _Atomic int64_t clock_last; /* maior valor ja devolvido por mvm_now (monotonico) */
     int64_t clock_warp_ns;  /* quanto o relogio do convidado foi freado por atraso */
@@ -308,10 +314,24 @@ struct mvm_vm {
     pthread_t io_thread;
     _Atomic int io_quit;
     _Atomic int io_kick;        /* acorda a thread de E/S */
-    /* trabalho pedido por outras threads que precisa rodar na thread da CPU */
-    pthread_mutex_t work_lock;
-    struct vm_work *work_head, *work_tail;
-    _Atomic int work_pending;
+    /* CPUs (a 0 roda na thread de mvm_run; as outras em threads proprias) */
+    int ncpus;
+    struct vm_vcpu {
+        void *cpu;
+        pthread_t thread;
+        bool started;
+        /* trabalho pedido por outras threads que precisa rodar na thread desta CPU */
+        pthread_mutex_t work_lock;
+        struct vm_work *work_head, *work_tail;
+        _Atomic int work_pending;
+        _Atomic int exit_req; /* sair da fatia ja (a CPU 0 usa cpu_exit) */
+        _Atomic int wake;     /* acordar do HLT (a CPU 0 usa kick) */
+        /* estatistica (MVM_SMP_STATS): ns executando, parada em HLT e esperando a bql */
+        int64_t st_run, st_halt, st_bql;
+        uint64_t st_insns;
+        uint64_t st_bql_n;
+    } vcpu[MVM_MAX_CPUS];
+    _Atomic int aps_quit;
 };
 
 typedef struct mvm_vm mvm_vm;
@@ -321,13 +341,21 @@ typedef struct mvm_vm mvm_vm;
  * nas chamadas diretas da CPU a dispositivos (PIC/APIC, GIC, timers). */
 void vm_bql_lock(mvm_vm *vm);
 void vm_bql_unlock(mvm_vm *vm);
-/* esta thread pode mexer no estado privado da CPU (TLB, JIT)? Tambem true com a VM parada. */
-bool vm_on_cpu_thread(mvm_vm *vm);
-/* roda fn(arg) na thread da CPU: na hora, se possivel; senao antes da proxima fatia
+/* indice da CPU que roda nesta thread (-1 = outra thread: E/S, app...) */
+int vm_cpu_index(mvm_vm *vm);
+/* esta thread pode mexer no estado privado da CPU idx (TLB, JIT)? Tambem com a VM parada. */
+bool vm_is_cpu_thread(mvm_vm *vm, int idx);
+static inline bool vm_on_cpu_thread(mvm_vm *vm) { return vm_is_cpu_thread(vm, 0); }
+/* roda fn(arg) na thread da CPU idx: na hora, se possivel; senao antes da proxima fatia
  * (arg alocado com malloc e liberado depois da chamada; NULL = sem argumento) */
-void vm_run_on_cpu(mvm_vm *vm, void (*fn)(mvm_vm *vm, void *arg), void *arg);
-/* linha de interrupcao mudou fora da thread da CPU: faz a CPU olhar para ela logo */
-void vm_cpu_signal(mvm_vm *vm);
+void vm_run_on_cpu(mvm_vm *vm, int idx, void (*fn)(mvm_vm *vm, void *arg), void *arg);
+/* a CPU idx sai da fatia e acorda do HLT (interrupcao, trabalho, INIT/SIPI) */
+void vm_cpu_kick(mvm_vm *vm, int idx);
+static inline void vm_cpu_signal(mvm_vm *vm) { vm_cpu_kick(vm, 0); }
+/* marca de "sair da fatia" da CPU idx (a CPU confere entre os blocos) */
+_Atomic int *vm_cpu_exit_flag(mvm_vm *vm, int idx);
+/* a maquina registra as CPUs em ordem (a 0 e a vm->cpu); devolve o indice */
+int vm_add_cpu(mvm_vm *vm, void *cpu);
 
 /* Chamado por dispositivos */
 void vm_request_shutdown(mvm_vm *vm);

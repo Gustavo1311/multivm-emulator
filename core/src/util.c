@@ -407,7 +407,18 @@ void timer_init(mvm_timer *t, void (*cb)(void *), void *opaque)
     t->opaque = opaque;
 }
 
+static void timer_del_locked(mvm_vm *vm, mvm_timer *t);
+
+/* A lista de timers tem trava propria (a mais interna): o LAPIC reprograma o timer com
+ * a trava do APIC, sem a bql. Os callbacks rodam fora dela. */
 void timer_del(mvm_vm *vm, mvm_timer *t)
+{
+    pthread_mutex_lock(&vm->timers_lock);
+    timer_del_locked(vm, t);
+    pthread_mutex_unlock(&vm->timers_lock);
+}
+
+static void timer_del_locked(mvm_vm *vm, mvm_timer *t)
 {
     if (!t->active)
         return;
@@ -419,11 +430,13 @@ void timer_del(mvm_vm *vm, mvm_timer *t)
     }
     t->active = false;
     t->next = NULL;
+    atomic_store(&vm->timer_next, vm->timers ? vm->timers->expire : INT64_MAX);
 }
 
 void timer_mod(mvm_vm *vm, mvm_timer *t, int64_t expire)
 {
-    timer_del(vm, t);
+    pthread_mutex_lock(&vm->timers_lock);
+    timer_del_locked(vm, t);
     t->expire = expire;
     t->active = true;
     mvm_timer **pp = &vm->timers;
@@ -431,6 +444,8 @@ void timer_mod(mvm_vm *vm, mvm_timer *t, int64_t expire)
         pp = &(*pp)->next;
     t->next = *pp;
     *pp = t;
+    atomic_store(&vm->timer_next, vm->timers->expire);
+    pthread_mutex_unlock(&vm->timers_lock);
 }
 
 /* Executa os temporizadores vencidos. Retorna o proximo prazo (ou INT64_MAX). */
@@ -440,6 +455,7 @@ void timer_mod(mvm_vm *vm, mvm_timer *t, int64_t expire)
 int64_t timers_run(mvm_vm *vm)
 {
     int64_t now = now_raw(vm);
+    pthread_mutex_lock(&vm->timers_lock);
     /* Se o emulador nao acompanha o tempo real (CPU lenta, host ocupado ou suspenso),
      * o relogio do convidado e freado: em vez de perder periodos do PIT/APIC (e o
      * Linux ver os jiffies atrasados em relacao ao TSC), todas as fontes de tempo
@@ -455,9 +471,15 @@ int64_t timers_run(mvm_vm *vm)
         vm->timers = t->next;
         t->active = false;
         t->next = NULL;
-        t->cb(t->opaque);
+        atomic_store(&vm->timer_next, vm->timers ? vm->timers->expire : INT64_MAX);
+        pthread_mutex_unlock(&vm->timers_lock);
+        t->cb(t->opaque); /* fora da trava da lista: pode reprogramar timers */
+        pthread_mutex_lock(&vm->timers_lock);
     }
-    return vm->timers ? vm->timers->expire : INT64_MAX;
+    int64_t next = vm->timers ? vm->timers->expire : INT64_MAX;
+    atomic_store(&vm->timer_next, next);
+    pthread_mutex_unlock(&vm->timers_lock);
+    return next;
 }
 
 int64_t host_clock_ns(void) { return host_ns(); }

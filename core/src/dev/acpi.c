@@ -158,10 +158,12 @@ void acpi_build(acpi_tables *t, const acpi_config *cfg)
     uint32_t m = 44;
     st_le(madt + 36, 0xfee00000u, 4);       /* APIC local */
     st_le(madt + 40, 1, 4);                 /* PCAT_COMPAT: ha 8259 */
-    madt[m] = 0; madt[m + 1] = 8;           /* APIC local da CPU 0 */
-    madt[m + 2] = 0; madt[m + 3] = 0;
-    st_le(madt + m + 4, 1, 4);
-    m += 8;
+    for (int i = 0; i < (cfg->ncpus ? cfg->ncpus : 1); i++) { /* APIC local de cada CPU */
+        madt[m] = 0; madt[m + 1] = 8;
+        madt[m + 2] = (uint8_t)i; madt[m + 3] = (uint8_t)i; /* UID do processador, APIC ID */
+        st_le(madt + m + 4, 1, 4);
+        m += 8;
+    }
     madt[m] = 1; madt[m + 1] = 12;          /* IOAPIC */
     madt[m + 2] = cfg->ioapic_id;
     st_le(madt + m + 4, 0xfec00000u, 4);

@@ -141,42 +141,29 @@ static bool dbg_read(x86_cpu *c, uint64_t lin, void *out, size_t n);
 static void x86_guest_process(x86_cpu *c, char *out, size_t n);
 void x86_debug_dump(void *opaque);
 
-/* Chamadas diretas da CPU ao PIC/APIC: o estado deles e compartilhado com a thread de E/S
- * (e, no futuro, com outras CPUs), entao passam pela trava global dos dispositivos. */
+/* Chamadas diretas da CPU ao PIC/APIC: o APIC tem trava propria (a do barramento) e o
+ * reconhecimento so toma a bql quando a interrupcao vem do 8259 (lapic_intr_ack). */
 static uint8_t apic_tpr_get(x86_cpu *c)
 {
-    vm_bql_lock(c->vm);
-    uint8_t v = c->apic_get_tpr(c->apic);
-    vm_bql_unlock(c->vm);
-    return v;
+    return c->apic_get_tpr(c->apic);
 }
 static void apic_tpr_set(x86_cpu *c, uint8_t v)
 {
-    vm_bql_lock(c->vm);
     c->apic_set_tpr(c->apic, v);
-    vm_bql_unlock(c->vm);
 }
 static uint64_t apic_base_get(x86_cpu *c)
 {
-    vm_bql_lock(c->vm);
-    uint64_t v = c->apic_get_base(c->apic);
-    vm_bql_unlock(c->vm);
-    return v;
+    return c->apic_get_base(c->apic);
 }
 static void apic_base_set(x86_cpu *c, uint64_t v)
 {
-    vm_bql_lock(c->vm);
     c->apic_set_base(c->apic, v);
-    vm_bql_unlock(c->vm);
 }
 static int intr_ack_locked(x86_cpu *c)
 {
     if (!c->intr_ack)
         return -1;
-    vm_bql_lock(c->vm);
-    int v = c->intr_ack(c->intr_opaque);
-    vm_bql_unlock(c->vm);
-    return v;
+    return c->intr_ack(c->intr_opaque);
 }
 
 /* ------------------------------------------------------------ TLB/MMU */
@@ -1512,7 +1499,7 @@ void x86_cpuid(x86_cpu *c)
         break;
     case 1:
         a = 0x000006f1; /* familia 6, modelo 15 */
-        b = (8 << 8) | (1 << 16);
+        b = (8 << 8) | ((c->ncpus > 1 ? c->ncpus : 1) << 16) | (c->apic_id << 24);
         /* SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT */
         cc = (1u << 0) | (1u << 9) | (1u << 19) | (1u << 20) | (1u << 23);
         cc |= 1u << 30; /* RDRAND: o Linux semeia o gerador aleatorio sem esperar entropia */
@@ -1523,7 +1510,9 @@ void x86_cpuid(x86_cpu *c)
             (1u << 11) | (1u << 12) | (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16) | (1u << 19) |
             (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26);
         if (c->apic)
-            d |= 1u << 9; /* APIC (ID 0 em EBX[31:24]) */
+            d |= 1u << 9; /* APIC (ID em EBX[31:24]) */
+        if (c->ncpus > 1)
+            d |= 1u << 28; /* HTT: EBX[23:16] = processadores logicos no pacote */
         break;
     case 2:
         /* descritores de cache; AL = 1 (numero de chamadas necessarias: CPUs reais
@@ -1538,11 +1527,30 @@ void x86_cpuid(x86_cpu *c)
             {1, 1, 8, 64}, {2, 1, 8, 64}, {3, 2, 8, 4096}, /* L1D 32K, L1I 32K, L2 2M; linha de 64 */
         };
         if (sub < 3) {
-            a = cache[sub].type | ((uint32_t)cache[sub].level << 5) | (1u << 8); /* autoinicializavel */
+            a = cache[sub].type | ((uint32_t)cache[sub].level << 5) | (1u << 8) | /* autoinicializavel */
+                ((c->ncpus > 1 ? c->ncpus - 1 : 0) << 26);                          /* nucleos - 1 */
             b = ((cache[sub].ways - 1) << 22) | (63u); /* 1 particao, linha de 64 bytes */
             cc = cache[sub].sets - 1;
             d = 0;
         }
+        break;
+    }
+    case 0xb: { /* topologia: 1 thread por nucleo, ncpus nucleos */
+        unsigned bits = 0;
+        while ((1u << bits) < c->ncpus)
+            bits++;
+        if (sub == 0) {
+            a = 0;
+            b = 1;
+            cc = sub | (1u << 8);
+        } else if (sub == 1) {
+            a = bits;
+            b = c->ncpus;
+            cc = sub | (2u << 8);
+        } else {
+            cc = sub;
+        }
+        d = c->apic_id;
         break;
     }
     case 7:
@@ -2284,6 +2292,8 @@ static void v86_log(x86_cpu *c)
         fclose(f);
 }
 
+static void x86_startup_ipis(x86_cpu *c);
+
 static int64_t x86_run(void *opaque, int64_t budget)
 {
     x86_cpu *c = opaque;
@@ -2294,6 +2304,10 @@ static int64_t x86_run(void *opaque, int64_t budget)
         if ((before & ~c->sample_mask) != (c->sample_icount & ~c->sample_mask))
             sample_dump(c);
     }
+    if (unlikely(c->init_req || c->sipi_req >= 0))
+        x86_startup_ipis(c);
+    if (c->wait_sipi)
+        return 0;
     if (c->halted) {
         if (!((c->intr_line && (c->eflags & EFL_IF)) || c->nmi_pending))
             return 0;
@@ -2323,7 +2337,7 @@ static int64_t x86_run(void *opaque, int64_t budget)
         } else {
             c->irq_inhibit = 0;
         }
-        if (unlikely(c->halted || atomic_load_explicit(&c->vm->cpu_exit, memory_order_relaxed)))
+        if (unlikely(c->halted || atomic_load_explicit(c->exit_flag, memory_order_relaxed)))
             break;
         if (likely(c->jit != NULL) && (!c->trace || c->trace_jit)) {
             int64_t done = x86_jit_run(c, budget - n);
@@ -2389,6 +2403,10 @@ static int64_t x86_run(void *opaque, int64_t budget)
 static bool x86_halted(void *opaque)
 {
     x86_cpu *c = opaque;
+    if (c->init_req || c->sipi_req >= 0)
+        return false; /* x86_run atende o INIT/SIPI */
+    if (c->wait_sipi)
+        return true;
     return c->halted && !((c->intr_line && (c->eflags & EFL_IF)) || c->nmi_pending);
 }
 
@@ -2514,9 +2532,69 @@ void *x86_cpu_new(mvm_vm *vm, bool lm)
     /* modo SMP: com mais de uma CPU (ou forcado para testes) os acessos seguem a ordem do
      * x86 e as instrucoes LOCK sao atomicas de verdade na memoria do host */
     c->smp = vm->cfg.cpus > 1 || getenv("MVM_SMP_FORCE") != NULL;
+    c->exit_flag = &vm->cpu_exit;
+    c->ncpus = 1;
+    c->sipi_req = -1;
     x86_reset(c);
     c->jit = x86_jit_new(c);
     return c;
+}
+
+void x86_set_cpu_index(void *opaque, int index, unsigned ncpus)
+{
+    x86_cpu *c = opaque;
+    c->index = index;
+    c->apic_id = (unsigned)index;
+    c->ncpus = ncpus;
+    c->exit_flag = vm_cpu_exit_flag(c->vm, index);
+    if (index > 0) { /* CPU extra: espera o INIT/SIPI da BSP */
+        c->wait_sipi = true;
+        c->halted = true;
+    }
+}
+
+void x86_request_init(void *opaque)
+{
+    x86_cpu *c = opaque;
+    atomic_store(&c->init_req, 1);
+    vm_cpu_kick(c->vm, c->index);
+}
+
+void x86_request_sipi(void *opaque, int vector)
+{
+    x86_cpu *c = opaque;
+    atomic_store(&c->sipi_req, vector & 0xff);
+    vm_cpu_kick(c->vm, c->index);
+}
+
+void x86_request_nmi(void *opaque)
+{
+    x86_cpu *c = opaque;
+    c->nmi_pending = true;
+    vm_cpu_kick(c->vm, c->index);
+}
+
+/* INIT/SIPI pendentes (thread da propria CPU): o INIT zera a CPU e a deixa esperando o
+ * SIPI; o SIPI so vale nesse estado e comeca em modo real em vetor:0000 */
+static void x86_startup_ipis(x86_cpu *c)
+{
+    if (atomic_exchange(&c->init_req, 0)) {
+        if (c->index == 0) /* INIT na BSP: so a interrupcao some (o BIOS reinicia pela porta) */
+            return;
+        x86_reset(c);
+        c->wait_sipi = true;
+        c->halted = true;
+        /* um SIPI ja pendente chegou depois deste INIT (o remetente manda em ordem): vale */
+    }
+    int v = atomic_exchange(&c->sipi_req, -1);
+    if (v >= 0 && c->wait_sipi) {
+        c->wait_sipi = false;
+        c->halted = false;
+        c->seg[S_CS].sel = (uint16_t)(v << 8);
+        c->seg[S_CS].base = (uint64_t)v << 12;
+        c->rip = 0;
+        update_mode(c);
+    }
 }
 
 void x86_set_intr(void *opaque, int level)
@@ -2525,8 +2603,8 @@ void x86_set_intr(void *opaque, int level)
     __atomic_store_n(&c->intr_line, level, __ATOMIC_RELEASE);
     if (!level)
         return;
-    if (!vm_on_cpu_thread(c->vm)) { /* outra thread (E/S): a CPU sai da fatia e olha a linha */
-        vm_cpu_signal(c->vm);
+    if (!vm_is_cpu_thread(c->vm, c->index)) { /* outra thread (E/S, outra CPU): a CPU sai da fatia */
+        vm_cpu_kick(c->vm, c->index);
         return;
     }
     /* interrupcao gerada pela propria CPU no meio de um bloco do JIT (TPR baixado, EOI,

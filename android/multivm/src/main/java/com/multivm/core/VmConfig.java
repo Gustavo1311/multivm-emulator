@@ -13,6 +13,7 @@ public final class VmConfig {
 
     final Architecture arch;
     final int ramMb;
+    final int cpus;
     final String kernel, initrd, cmdline, dtb, firmware, vgaBios, bootOrder;
     final List<DiskImage> disks;
     final int fbWidth, fbHeight;
@@ -77,6 +78,7 @@ public final class VmConfig {
     private VmConfig(Builder b) {
         arch = b.arch;
         ramMb = b.ramMb;
+        cpus = b.cpus;
         kernel = b.kernel;
         initrd = b.initrd;
         cmdline = b.cmdline;
@@ -104,6 +106,7 @@ public final class VmConfig {
 
     public Architecture getArchitecture() { return arch; }
     public int getRamMb() { return ramMb; }
+    public int getCpus() { return cpus; }
     public String getKernel() { return kernel; }
     public String getInitrd() { return initrd; }
     public String getCmdline() { return cmdline; }
@@ -120,6 +123,7 @@ public final class VmConfig {
     public static final class Builder {
         private final Architecture arch;
         private int ramMb = 256;
+        private int cpus = 1;
         private String kernel, initrd, cmdline, dtb, firmware, vgaBios, bootOrder;
         private final List<DiskImage> disks = new ArrayList<>();
         private int fbWidth, fbHeight;
@@ -161,6 +165,8 @@ public final class VmConfig {
 
         /** Memoria do convidado em MiB (4..3072). */
         public Builder ramMb(int mb) { this.ramMb = mb; return this; }
+        /** processadores (so x86; 1 a 8) */
+        public Builder cpus(int n) { this.cpus = n; return this; }
 
         /** Kernel Linux (bzImage, zImage, Image, Image.gz, EFI zboot) ou binario ELF/raw. */
         public Builder kernel(String path) { this.kernel = path; return this; }

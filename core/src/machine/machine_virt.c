@@ -346,10 +346,10 @@ static int virt_init(mvm_vm *vm, char *err, size_t errlen)
 
     arm_hooks hooks = {.opaque = m, .timer_irq = timer_irq};
     if (m->is64) {
-        vm->cpu = arm64_cpu_new(vm, &hooks);
+        vm_add_cpu(vm, arm64_cpu_new(vm, &hooks));
         vm->cpu_ops = &arm64_cpu_ops;
     } else {
-        vm->cpu = arm32_cpu_new(vm, &hooks);
+        vm_add_cpu(vm, arm32_cpu_new(vm, &hooks));
         vm->cpu_ops = &arm32_cpu_ops;
     }
     m->ref.is64 = m->is64;

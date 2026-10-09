@@ -12,6 +12,7 @@
 typedef struct {
     uint32_t pci_hole_start; /* inicio da janela de memoria PCI (0x80000000 ou 0xC0000000) */
     uint8_t ioapic_id;
+    uint8_t ncpus;          /* processadores (APIC ID = 0..ncpus-1) */
     uint32_t hpet_block_id; /* 0 = sem HPET */
     uint8_t floppies;       /* bit 0 = A:, bit 1 = B: (0 = sem controlador de disquete) */
 } acpi_config;

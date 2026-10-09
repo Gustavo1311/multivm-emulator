@@ -66,7 +66,7 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
     private static final int REQ_MIC = 200;
     private boolean micAsked;
     /* relogio, resolucao, parametros do kernel e opcoes ARM */
-    private Spinner rtcMode, fbRes;
+    private Spinner rtcMode, fbRes, cpus;
     private EditText rtcDate, rawAddr;
     private TextView archHelp, dtbName, ramHelp;
     private View dtbGroup;
@@ -137,6 +137,8 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
         fbEnable.setOnCheckedChangeListener((b, c) -> updateFb());
 
         rtcMode = findViewById(R.id.rtcMode);
+        cpus = findViewById(R.id.cpus);
+        cpus.setAdapter(spinnerAdapter(VmSettings.CPU_NAMES));
         rtcDate = findViewById(R.id.rtcDate);
         fbRes = findViewById(R.id.fbRes);
         rawAddr = findViewById(R.id.rawAddr);
@@ -280,6 +282,7 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
 
     private void updateMode() {
         boolean x86 = isX86();
+        findViewById(R.id.cpuBox).setVisibility(x86 ? View.VISIBLE : View.GONE); /* varios processadores: so x86 */
         modeBios.setEnabled(x86);
         if (!x86 && modeBios.isChecked()) modeKernel.setChecked(true);
         boolean b = bios();
@@ -344,6 +347,7 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
         fbRes.setSelection(ri >= 0 ? ri : AppSettings.RESOLUTIONS.length);
         updateFb();
         rtcMode.setSelection(settings.rtc);
+        cpus.setSelection(Math.max(0, Math.min(VmSettings.CPU_MAX, settings.cpus) - 1));
         rtcDate.setText(settings.rtcDate);
         rtcDate.setVisibility(settings.rtc == VmSettings.RTC_FIXED ? View.VISIBLE : View.GONE);
         rawAddr.setText(settings.rawAddr);
@@ -404,6 +408,7 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
         settings.sound = selectedSound();
         settings.nic = selectedNic();
         settings.rtc = Math.max(0, rtcMode.getSelectedItemPosition());
+        settings.cpus = Math.max(0, cpus.getSelectedItemPosition()) + 1;
         settings.rtcDate = rtcDate.getText().toString().trim();
         settings.rawAddr = rawAddr.getText().toString().trim();
         settings.dtb = dtb;

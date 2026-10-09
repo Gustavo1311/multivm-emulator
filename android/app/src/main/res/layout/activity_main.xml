@@ -175,6 +175,29 @@
                     android:textSize="12sp"
                     android:visibility="gone" />
 
+                <LinearLayout
+                    android:id="@+id/cpuBox"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical">
+
+                    <TextView
+                        style="@style/Label"
+                        android:text="Processadores" />
+
+                    <Spinner
+                        android:id="@+id/cpus"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="Mais de um processador acelera o Linux quando há várias tarefas ao mesmo tempo (boot, desktop). Use no máximo os núcleos rápidos do celular (normalmente 2 a 4). Cada processador a mais deixa cada um cerca de 20% mais lento, então para um programa só, 1 é melhor. Sistemas instalados com 1 processador (como o Windows XP) continuam usando 1."
+                        android:textColor="@color/text2"
+                        android:textSize="12sp" />
+                </LinearLayout>
+
                 <TextView
                     style="@style/Label"
                     android:text="Relógio (RTC)" />

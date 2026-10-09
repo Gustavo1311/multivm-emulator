@@ -92,6 +92,8 @@ final class VmLauncher {
             throw new IllegalArgumentException("memória inválida");
         }
         VmConfig.Builder b = VmConfig.builder(arch).ramMb(mb);
+        if (arch == Architecture.X86_64 || arch == Architecture.I386)
+            b.cpus(Math.max(1, Math.min(VmSettings.CPU_MAX, s.cpus)));
         boolean x86 = AppFiles.isX86(arch);
         boolean bios = x86 && s.bios;
         boolean useSata = bios && s.sata;

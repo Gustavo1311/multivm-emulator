@@ -7,6 +7,7 @@
  */
 #include "apic.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 
 #define APIC_BASE_ADDR 0xfee00000ULL
@@ -24,8 +25,19 @@
 
 #define BUS_NS_PER_TICK 1 /* barramento do APIC a 1 GHz */
 
+struct apic_bus {
+    mvm_vm *vm;
+    pthread_mutex_t lock; /* todos os LAPICs e o IOAPIC (reentrante; depois da bql, antes dos timers) */
+    lapic *l[MVM_MAX_CPUS];
+    int n;
+    unsigned rr; /* rodizio da entrega de menor prioridade */
+    void (*startup)(void *cpu, int kind, int vector);
+};
+
 struct lapic {
     mvm_vm *vm;
+    apic_bus *bus;
+    int index;
     void *cpu;
     void (*set_intr)(void *cpu, int level);
     i8259 *pic;
@@ -46,13 +58,16 @@ struct lapic {
 
 struct ioapic {
     mvm_vm *vm;
-    lapic *lapic;
+    apic_bus *bus;
     uint8_t sel, id;
     uint64_t redir[IOAPIC_PINS];
     uint32_t level; /* nivel atual de cada entrada */
 };
 
 /* ------------------------------------------------------------ LAPIC */
+
+static void bus_lock(apic_bus *b) { if (b) pthread_mutex_lock(&b->lock); }
+static void bus_unlock(apic_bus *b) { if (b) pthread_mutex_unlock(&b->lock); }
 
 static int highest(const uint32_t *v)
 {
@@ -115,18 +130,47 @@ static void accept_irq(lapic *a, int vector, bool level)
     lapic_update(a);
 }
 
-void lapic_deliver(lapic *a, int vector, bool level)
+static void lapic_deliver_locked(lapic *a, int vector, bool level)
 {
     if (!sw_enabled(a))
         return;
     accept_irq(a, vector & 0xff, level);
 }
 
+void lapic_deliver(lapic *a, int vector, bool level)
+{
+    bus_lock(a->bus);
+    lapic_deliver_locked(a, vector, level);
+    bus_unlock(a->bus);
+}
+
 void lapic_pic_intr(void *opaque, int level)
 {
     lapic *a = opaque;
+    bus_lock(a->bus);
     a->pic_level = level != 0;
     lapic_update(a);
+    bus_unlock(a->bus);
+}
+
+/* reconhecimento pela CPU: so as interrupcoes do APIC usam a trava do barramento; o
+ * 8259 (ExtINT) precisa da bql, tomada antes (ordem bql -> APIC) */
+int lapic_intr_ack(lapic *a)
+{
+    bus_lock(a->bus);
+    int v = apic_pending_vector(a);
+    if (v >= 0 || !(a->pic_level && accept_pic(a))) {
+        v = lapic_ack(a);
+        bus_unlock(a->bus);
+        return v;
+    }
+    bus_unlock(a->bus);
+    vm_bql_lock(a->vm);
+    bus_lock(a->bus);
+    v = lapic_ack(a);
+    bus_unlock(a->bus);
+    vm_bql_unlock(a->vm);
+    return v;
 }
 
 int lapic_ack(lapic *a)
@@ -199,9 +243,17 @@ static void timer_arm(lapic *a)
     timer_mod(a->vm, &a->timer, next);
 }
 
+static void timer_cb_locked(lapic *a);
 static void timer_cb(void *opaque)
 {
     lapic *a = opaque;
+    bus_lock(a->bus);
+    timer_cb_locked(a);
+    bus_unlock(a->bus);
+}
+
+static void timer_cb_locked(lapic *a)
+{
     uint32_t l = a->lvt[LVT_TIMER];
     if (!(l & LVT_MASKED) && sw_enabled(a))
         accept_irq(a, (int)(l & 0xff), false);
@@ -210,6 +262,8 @@ static void timer_cb(void *opaque)
         timer_arm(a);
     }
 }
+
+static void lapic_init_reset(lapic *a);
 
 /* o destino (modo fisico ou logico) inclui esta CPU? */
 static bool dest_match(const lapic *a, uint8_t dest, bool logical)
@@ -223,21 +277,80 @@ static bool dest_match(const lapic *a, uint8_t dest, bool logical)
     return ((dest >> 4) == 0xf || (dest >> 4) == (ldr >> 4)) && (dest & ldr & 0x0f) != 0;
 }
 
+/* entrega a um conjunto de destino: fixa (todos) ou menor prioridade (um so) */
+static void deliver_to(apic_bus *b, lapic *self, int mode, int vector, bool level, uint8_t dest, bool logical,
+                       int shorthand)
+{
+    lapic *t[MVM_MAX_CPUS];
+    int nt = 0;
+    int n = b ? b->n : 1;
+    for (int i = 0; i < n; i++) {
+        lapic *x = b ? b->l[i] : self;
+        bool m;
+        switch (shorthand) {
+        case 1: m = x == self; break;               /* proprio */
+        case 2: m = true; break;                     /* todos incluindo o proprio */
+        case 3: m = x != self; break;                /* todos exceto o proprio */
+        default: m = n == 1 || dest_match(x, dest, logical); break; /* uma CPU: como antes */
+        }
+        if (m)
+            t[nt++] = x;
+    }
+    if (!nt)
+        return;
+    switch (mode) {
+    case 0: /* fixa */
+        for (int i = 0; i < nt; i++)
+            lapic_deliver_locked(t[i], vector, level);
+        break;
+    case 1: { /* menor prioridade: a de menor PPR (rodizio no empate) */
+        int best = -1, bp = 0x100;
+        unsigned start = b ? b->rr++ : 0;
+        for (int k = 0; k < nt; k++) {
+            lapic *x = t[(start + (unsigned)k) % (unsigned)nt];
+            if (!sw_enabled(x))
+                continue;
+            int p = ppr(x);
+            if (p < bp) {
+                bp = p;
+                best = (int)((start + (unsigned)k) % (unsigned)nt);
+            }
+        }
+        if (best >= 0)
+            lapic_deliver_locked(t[best], vector, level);
+        break;
+    }
+    case 4: /* NMI */
+        for (int i = 0; i < nt; i++)
+            if (b && b->startup)
+                b->startup(t[i]->cpu, APIC_STARTUP_NMI, 0);
+        break;
+    case 5: /* INIT (o "INIT level de-assert" nao faz nada) */
+        if (!level && b && b->startup)
+            for (int i = 0; i < nt; i++)
+                if (t[i] != self || shorthand == 1 || shorthand == 2) {
+                    lapic_init_reset(t[i]);
+                    b->startup(t[i]->cpu, APIC_STARTUP_INIT, 0);
+                }
+        break;
+    case 6: /* SIPI (Startup) */
+        for (int i = 0; i < nt; i++)
+            if (t[i] != self && b && b->startup)
+                b->startup(t[i]->cpu, APIC_STARTUP_SIPI, vector);
+        break;
+    default:
+        break;
+    }
+}
+
 static void send_ipi(lapic *a)
 {
     uint32_t lo = a->icr_lo;
     int mode = (lo >> 8) & 7, shorthand = (lo >> 18) & 3;
     uint8_t dest = (uint8_t)(a->icr_hi >> 24);
-    bool self;
-    switch (shorthand) {
-    case 1: case 2: self = true; break;   /* proprio / todos incluindo o proprio */
-    case 3: self = false; break;          /* todos exceto o proprio: nao ha outras CPUs */
-    default: self = dest_match(a, dest, (lo >> 11) & 1); break;
-    }
-    /* fixo (0) ou menor prioridade (1); INIT/SIPI/NMI/SMI so fariam sentido com outras CPUs */
-    if (!self || (mode != 0 && mode != 1))
-        return;
-    accept_irq(a, (int)(lo & 0xff), false);
+    /* INIT com nivel "de-assert" (bit 14 = 0 e gatilho por nivel): ignorado */
+    bool deassert = mode == 5 && !((lo >> 14) & 1) && ((lo >> 15) & 1);
+    deliver_to(a->bus, a, mode, (int)(lo & 0xff), deassert, dest, (lo >> 11) & 1, shorthand);
 }
 
 static uint32_t lapic_reg_read(lapic *a, unsigned reg)
@@ -319,7 +432,9 @@ static void lapic_reg_write(lapic *a, unsigned reg, uint32_t v)
 static uint64_t lapic_mmio_read(void *opaque, uint64_t off, unsigned size)
 {
     lapic *a = opaque;
+    bus_lock(a->bus);
     uint32_t v = lapic_reg_read(a, (unsigned)(off >> 4) & 0xff);
+    bus_unlock(a->bus);
     unsigned sh = 8 * (unsigned)(off & 3);
     v >>= sh;
     return size >= 4 ? v : v & ((1u << (8 * size)) - 1);
@@ -331,16 +446,87 @@ static void lapic_mmio_write(void *opaque, uint64_t off, uint64_t v, unsigned si
     if (off & 0xf)
         return; /* apenas acessos alinhados de 32 bits tem efeito */
     (void)size;
+    bus_lock(a->bus);
     lapic_reg_write(a, (unsigned)(off >> 4) & 0xff, (uint32_t)v);
+    bus_unlock(a->bus);
 }
 
 const mvm_io_ops lapic_mmio_ops = {lapic_mmio_read, lapic_mmio_write};
 
-void lapic_reset(lapic *a)
+/* a janela 0xFEE00000 mostra o LAPIC da CPU que acessa */
+static lapic *bus_cur(apic_bus *b)
+{
+    int i = vm_cpu_index(b->vm);
+    return b->l[i >= 0 && i < b->n ? i : 0];
+}
+static uint64_t bus_mmio_read(void *opaque, uint64_t off, unsigned size) { return lapic_mmio_read(bus_cur(opaque), off, size); }
+static void bus_mmio_write(void *opaque, uint64_t off, uint64_t v, unsigned size) { lapic_mmio_write(bus_cur(opaque), off, v, size); }
+const mvm_io_ops apic_bus_mmio_ops = {bus_mmio_read, bus_mmio_write};
+
+apic_bus *apic_bus_new(mvm_vm *vm, void (*startup)(void *cpu, int kind, int vector))
+{
+    apic_bus *b = calloc(1, sizeof(*b));
+    b->vm = vm;
+    b->startup = startup;
+    pthread_mutexattr_t ma;
+    pthread_mutexattr_init(&ma);
+    pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&b->lock, &ma);
+    pthread_mutexattr_destroy(&ma);
+    return b;
+}
+
+void apic_bus_add(apic_bus *b, lapic *a)
+{
+    if (b->n >= MVM_MAX_CPUS)
+        return;
+    a->bus = b;
+    a->index = b->n;
+    b->l[b->n++] = a;
+    lapic_reset(a);
+}
+
+lapic *apic_bus_get(apic_bus *b, int index) { return index >= 0 && index < b->n ? b->l[index] : NULL; }
+
+void apic_bus_free(apic_bus *b)
+{
+    if (!b)
+        return;
+    pthread_mutex_destroy(&b->lock);
+    free(b);
+}
+
+/* INIT vindo de outra CPU: estado de power-up, mantendo o ID e a base */
+static void lapic_init_reset(lapic *a)
 {
     timer_del(a->vm, &a->timer);
-    a->base = APIC_BASE_ADDR | MSR_ENABLE | MSR_BSP;
-    a->id = 0;
+    a->tpr = 0;
+    a->ldr = 0;
+    a->dfr = 0xffffffffu;
+    a->svr = 0xff;
+    a->esr = a->icr_lo = a->icr_hi = 0;
+    for (int i = 0; i < LVT_N; i++)
+        a->lvt[i] = LVT_MASKED;
+    memset(a->irr, 0, sizeof(a->irr));
+    memset(a->isr, 0, sizeof(a->isr));
+    memset(a->tmr, 0, sizeof(a->tmr));
+    a->initial = a->divide_cfg = 0;
+    lapic_update(a);
+}
+
+static void lapic_reset_locked(lapic *a);
+void lapic_reset(lapic *a)
+{
+    bus_lock(a->bus);
+    lapic_reset_locked(a);
+    bus_unlock(a->bus);
+}
+
+static void lapic_reset_locked(lapic *a)
+{
+    timer_del(a->vm, &a->timer);
+    a->base = APIC_BASE_ADDR | MSR_ENABLE | (a->index == 0 ? MSR_BSP : 0);
+    a->id = (uint8_t)a->index;
     a->tpr = 0;
     a->ldr = 0;
     a->dfr = 0xffffffffu;
@@ -349,7 +535,8 @@ void lapic_reset(lapic *a)
     for (int i = 0; i < LVT_N; i++)
         a->lvt[i] = LVT_MASKED;
     /* como no QEMU: LINT0 da BSP ja em ExtINT, para o 8259 funcionar com o APIC ligado */
-    a->lvt[LVT_LINT0] = 0x700;
+    if (a->index == 0)
+        a->lvt[LVT_LINT0] = 0x700;
     memset(a->irr, 0, sizeof(a->irr));
     memset(a->isr, 0, sizeof(a->isr));
     memset(a->tmr, 0, sizeof(a->tmr));
@@ -387,9 +574,17 @@ void lapic_debug_dump(lapic *a)
 
 uint64_t lapic_get_base(void *opaque) { return ((lapic *)opaque)->base; }
 
+static void lapic_set_base_locked(lapic *a, uint64_t v);
 void lapic_set_base(void *opaque, uint64_t v)
 {
     lapic *a = opaque;
+    bus_lock(a->bus);
+    lapic_set_base_locked(a, v);
+    bus_unlock(a->bus);
+}
+
+static void lapic_set_base_locked(lapic *a, uint64_t v)
+{
     /* a relocacao da janela MMIO nao e suportada: so os bits de controle mudam */
     a->base = (a->base & ~(MSR_ENABLE)) | (v & MSR_ENABLE);
     if (!(a->base & MSR_ENABLE)) {
@@ -405,8 +600,10 @@ uint8_t lapic_get_tpr(void *opaque) { return ((lapic *)opaque)->tpr; }
 void lapic_set_tpr(void *opaque, uint8_t tpr)
 {
     lapic *a = opaque;
+    bus_lock(a->bus);
     a->tpr = tpr;
     lapic_update(a);
+    bus_unlock(a->bus);
 }
 
 void lapic_set_pic(lapic *a, i8259 *pic) { a->pic = pic; }
@@ -435,16 +632,24 @@ static void ioapic_service(ioapic *io, int pin)
         io->redir[pin] |= RED_RIRR;
     }
     int mode = (int)((r >> 8) & 7);
-    if (mode == 0 || mode == 1)
-        lapic_deliver(io->lapic, (int)(r & 0xff), level);
+    if (mode == 0 || mode == 1) /* fixa ou menor prioridade, pelo destino (bits 56-63) */
+        deliver_to(io->bus, io->bus->l[0], mode, (int)(r & 0xff), level, (uint8_t)(r >> 56), (r >> 11) & 1, 0);
     /* NMI/SMI/INIT/ExtINT pelo IOAPIC nao sao usados pelos sistemas alvo */
 }
 
+static void ioapic_set_irq_locked(ioapic *io, int pin, int level);
 void ioapic_set_irq(void *opaque, int pin, int level)
 {
     ioapic *io = opaque;
     if (pin < 0 || pin >= IOAPIC_PINS)
         return;
+    bus_lock(io->bus);
+    ioapic_set_irq_locked(io, pin, level);
+    bus_unlock(io->bus);
+}
+
+static void ioapic_set_irq_locked(ioapic *io, int pin, int level)
+{
     uint32_t bit = 1u << pin;
     bool was = io->level & bit;
     if (level)
@@ -507,35 +712,43 @@ static uint64_t ioapic_mmio_read(void *opaque, uint64_t off, unsigned size)
 {
     ioapic *io = opaque;
     (void)size;
-    if (off == 0x00) return io->sel;
-    if (off == 0x10) return ioapic_reg_read(io);
-    return 0;
+    uint64_t v = 0;
+    bus_lock(io->bus);
+    if (off == 0x00) v = io->sel;
+    else if (off == 0x10) v = ioapic_reg_read(io);
+    bus_unlock(io->bus);
+    return v;
 }
 
 static void ioapic_mmio_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
 {
     ioapic *io = opaque;
     (void)size;
+    bus_lock(io->bus);
     if (off == 0x00) io->sel = (uint8_t)v;
     else if (off == 0x10) ioapic_reg_write(io, (uint32_t)v);
+    bus_unlock(io->bus);
 }
 
 const mvm_io_ops ioapic_mmio_ops = {ioapic_mmio_read, ioapic_mmio_write};
 
 void ioapic_reset(ioapic *io)
 {
+    bus_lock(io->bus);
     io->sel = 0;
     io->id = 0; /* o SeaBIOS atribui o ID (normalmente o numero de CPUs) */
     for (int i = 0; i < IOAPIC_PINS; i++)
         io->redir[i] = RED_MASKED;
+    bus_unlock(io->bus);
 }
 
-ioapic *ioapic_new(mvm_vm *vm, lapic *a)
+ioapic *ioapic_new(mvm_vm *vm, apic_bus *b)
 {
     ioapic *io = calloc(1, sizeof(*io));
     io->vm = vm;
-    io->lapic = a;
-    lapic_set_eoi_cb(a, ioapic_eoi, io);
+    io->bus = b;
+    for (int i = 0; i < b->n; i++) /* EOI de nivel em qualquer CPU volta ao IOAPIC */
+        lapic_set_eoi_cb(b->l[i], ioapic_eoi, io);
     ioapic_reset(io);
     return io;
 }
