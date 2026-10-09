@@ -197,6 +197,36 @@ def gen():
             bits, suf, regs = 32, "l", R32
         cc = rnd.choice(["o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "p", "np", "l", "ge", "le", "g"])
         return ["cmov%s%s %s, %s" % (cc, suf, pick(regs) if rnd.random() < 0.6 else mem(bits // 8), pick(regs))], 0, pre
+    if kind == "cmpcmov":
+        # condicao vinda de uma operacao no mesmo bloco (flags preguicosos conhecidos pelo JIT)
+        bits2, suf2, regs2 = rnd.choice([s for s in SIZES if s[0] in (16, 32, 64)])
+        op = rnd.choice(["cmp", "sub", "add", "test", "and", "xor", "or"])
+        src = rnd.choice([pick(regs2), "$%d" % rnd.randrange(-200, 200)]) if op != "test" else pick(regs2)
+        cc = rnd.choice(["o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "p", "np", "l", "ge", "le", "g"])
+        out = ["%s%s %s, %s" % (op, suf2, src, pick(regs2)), "cmov%s%s %s, %s" % (cc, suf2, pick(regs2), pick(regs2))]
+        if rnd.random() < 0.5:
+            out.append("set%s %s" % (rnd.choice(["e", "b", "l", "a", "g", "s"]), pick(R8)))
+        return out, ALL, pre
+    if kind == "alu2":
+        # ALU com imediato seguida de outra que sobrescreve os flags (flags da 1a mortos no JIT)
+        op = rnd.choice(["add", "sub", "and", "or", "xor"])
+        bits2, suf2, regs2 = rnd.choice([s for s in SIZES if s[0] in (32, 64)])
+        r = pick(regs2)
+        v = rnd.choice([rnd.randrange(0, 4096), -rnd.randrange(1, 4096), rnd.randrange(0, 1 << 24) & ~0xfff,
+                        (1 << rnd.randrange(1, 31)) - 1, ((1 << rnd.randrange(1, 31)) - 1) << rnd.randrange(0, 8),
+                        0x55555555, 0x0f0f0f0f, -256, 0x7fffffff, -0x80000000, rnd.getrandbits(32)])
+        v = ((v + (1 << 31)) & 0xffffffff) - (1 << 31)  # faixa do imediato de 32 bits
+        first = "%s%s $%d, %s" % (op, suf2, v, r)
+        rr = rnd.random()
+        if rr < 0.2:
+            first = "%s%s $%d, %s" % (op, suf2, v, "%eax" if bits2 == 32 else "%rax")
+        elif rr < 0.55:
+            first = "%s%s %s, %s" % (op, suf2, pick(regs2), pick(regs2))
+        elif rr < 0.75:
+            first = "%s%s %s, %s" % (op, suf2, mem(bits2 // 8), pick(regs2))
+        after = rnd.choice(["add%s %s, %s" % (suf2, pick(regs2), pick(regs2)), "cmp%s %s, %s" % (suf2, pick(regs2), pick(regs2)),
+                            "test%s %s, %s" % (suf2, pick(regs2), pick(regs2))])
+        return [first, after], ALL, pre
     if kind == "set":
         cc = rnd.choice(["o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "p", "np", "l", "ge", "le", "g"])
         return ["set%s %s" % (cc, pick(R8) if rnd.random() < 0.6 else mem(1))], 0, pre
@@ -310,7 +340,15 @@ def gen():
         m = ALL if op in ("scas", "cmps") else 0
         return ["%s%s%s" % (rep, op, s)] + post, m, pre
     if kind == "misc":
-        c = rnd.choice(["xlat", "leave_like", "enter_like", "neg_adc"])
+        c = rnd.choice(["xlat", "leave_like", "enter_like", "neg_adc"] + (["branch66"] * 2 if MODE == 64 else []))
+        if c == "branch66":
+            # desvios proximos com prefixo 66 (como o "66 66 48 e8" do TLS da glibc): no modo de
+            # 64 bits a Intel ignora o 66; rcx = erro no endereco de retorno, rbx = erro na pilha
+            call = rnd.choice([".byte 0x66, 0x66, 0x48, 0xe8; .long 0", ".byte 0x66, 0x48, 0xe8; .long 0"])
+            br = rnd.choice(["", ".byte 0x66, 0xeb, 0x00", ".byte 0x66, 0xe9; .long 0", ".byte 0x66, 0x0f, 0x84; .long 0"])
+            return ["mov %rsp, %rax", call, "91: pop %rcx", "lea 91b(%rip), %rbx", "sub %rbx, %rcx",
+                    br, "lea 92f(%rip), %rbx", "push %rbx", ".byte 0x66, 0x48, 0xc3", "92: mov %rsp, %rbx",
+                    "sub %rax, %rbx", "mov $0, %eax"], 0, []
         if c == "xlat":
             bx = "rbx" if MODE == 64 else "ebx"
             return ["xlat"], 0, ["lea buf, %%%s" % bx]
@@ -369,6 +407,9 @@ def gen():
         if op in ("pmovmskb", "movmskps", "movmskpd"):
             return ["%s %s, %s" % (op, a, "%" + rnd.choice(R32))], 0, pre
         if op in ("ucomisd", "comiss"):
+            if rnd.random() < 0.5:  # SETcc logo depois: condicao avaliada pelo JIT a partir dos flags
+                cc = rnd.choice(["b", "ae", "e", "ne", "be", "a", "p", "np", "s", "ns", "o", "no", "l", "ge", "le", "g"])
+                return ["%s %s, %s" % (op, a, b), "set%s %%cl" % cc], ALL, pre
             return ["%s %s, %s" % (op, a, b)], ALL, pre
         if op == "cvttsd2si":
             return ["cvttsd2si %s, %s" % (a, "%" + rnd.choice(R32))], 0, pre

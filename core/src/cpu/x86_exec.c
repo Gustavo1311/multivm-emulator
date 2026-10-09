@@ -255,8 +255,15 @@ static uint64_t shld(x86_cpu *c, uint64_t dst, uint64_t src, unsigned cnt, int s
 static inline int stack_osz(x86_cpu *c, x86_dec *d)
 {
     if (c->code64)
-        return d->opsize_prefix ? 2 : 8;
+        return d->opsize_prefix && !REXW(d) ? 2 : 8;
     return d->osz;
+}
+
+/* Desvios proximos (jmp/call/ret/jcc/loop): no modo de 64 bits a Intel fixa o tamanho em
+ * 64 bits e ignora o prefixo 66 (a glibc usa "66 66 48 e8" no call __tls_get_addr do TLS). */
+static inline int branch_osz(x86_cpu *c, int sz)
+{
+    return c->code64 ? 8 : sz;
 }
 
 static inline void jmp_to(x86_cpu *c, int bsz, uint64_t t)
@@ -892,7 +899,7 @@ static void exec_0f(x86_cpu *c, x86_dec *d)
     }
     case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87:
     case 0x88: case 0x89: case 0x8a: case 0x8b: case 0x8c: case 0x8d: case 0x8e: case 0x8f: {
-        int bsz = c->code64 ? (d->opsize_prefix ? 2 : 8) : sz;
+        int bsz = branch_osz(c, sz);
         uint64_t disp = bsz == 2 ? (uint64_t)(int64_t)(int16_t)fetch16(c) : (uint64_t)(int64_t)(int32_t)x86_fetch32(c);
         if (x86_cond(c, op & 15)) jmp_to(c, bsz, c->rip + disp);
         return;
@@ -1290,7 +1297,7 @@ void x86_exec_one(x86_cpu *c)
     case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x77:
     case 0x78: case 0x79: case 0x7a: case 0x7b: case 0x7c: case 0x7d: case 0x7e: case 0x7f: {
         uint64_t disp = (uint64_t)(int64_t)(int8_t)x86_fetch8(c);
-        if (x86_cond(c, b & 15)) jmp_to(c, c->code64 ? (d->opsize_prefix ? 2 : 8) : sz, c->rip + disp);
+        if (x86_cond(c, b & 15)) jmp_to(c, branch_osz(c, sz), c->rip + disp);
         return;
     }
     case 0x80: case 0x81: case 0x82: case 0x83: {
@@ -1465,7 +1472,7 @@ void x86_exec_one(x86_cpu *c)
         return;
     }
     case 0xc2: case 0xc3: {
-        int s = stack_osz(c, d);
+        int s = branch_osz(c, stack_osz(c, d));
         uint16_t imm = b == 0xc2 ? fetch16(c) : 0;
         uint64_t t = x86_pop(c, s);
         if (imm) {
@@ -1578,12 +1585,12 @@ void x86_exec_one(x86_cpu *c)
         bool take = cnt != 0;
         if (b == 0xe0) take = take && !(x86_arith_flags(c) & EFL_ZF);
         if (b == 0xe1) take = take && (x86_arith_flags(c) & EFL_ZF);
-        if (take) jmp_to(c, c->code64 ? (d->opsize_prefix ? 2 : 8) : sz, c->rip + disp);
+        if (take) jmp_to(c, branch_osz(c, sz), c->rip + disp);
         return;
     }
     case 0xe3: {
         uint64_t disp = (uint64_t)(int64_t)(int8_t)x86_fetch8(c);
-        if (!get_areg(c, d, R_CX)) jmp_to(c, c->code64 ? (d->opsize_prefix ? 2 : 8) : sz, c->rip + disp);
+        if (!get_areg(c, d, R_CX)) jmp_to(c, branch_osz(c, sz), c->rip + disp);
         return;
     }
     case 0xe4: case 0xe5: {
@@ -1609,14 +1616,14 @@ void x86_exec_one(x86_cpu *c)
         return;
     }
     case 0xe8: {
-        int bsz = c->code64 ? (d->opsize_prefix ? 2 : 8) : sz;
+        int bsz = branch_osz(c, sz);
         uint64_t disp = fetch_imm(c, bsz == 2 ? 2 : 4);
         x86_push(c, c->rip, bsz);
         jmp_to(c, bsz, c->rip + disp);
         return;
     }
     case 0xe9: {
-        int bsz = c->code64 ? (d->opsize_prefix ? 2 : 8) : sz;
+        int bsz = branch_osz(c, sz);
         uint64_t disp = fetch_imm(c, bsz == 2 ? 2 : 4);
         jmp_to(c, bsz, c->rip + disp);
         return;
@@ -1630,7 +1637,7 @@ void x86_exec_one(x86_cpu *c)
     }
     case 0xeb: {
         uint64_t disp = (uint64_t)(int64_t)(int8_t)x86_fetch8(c);
-        jmp_to(c, c->code64 ? (d->opsize_prefix ? 2 : 8) : sz, c->rip + disp);
+        jmp_to(c, branch_osz(c, sz), c->rip + disp);
         return;
     }
     case 0xf1: x86_sw_interrupt(c, EXC_DB, c->rip); return;
@@ -1673,7 +1680,7 @@ void x86_exec_one(x86_cpu *c)
         if (b == 0xfe) x86_ud(c);
         switch (r) {
         case 2: { /* CALL near */
-            int bsz = c->code64 ? (d->opsize_prefix ? 2 : 8) : sz;
+            int bsz = branch_osz(c, sz);
             uint64_t t = x86_rm_read(c, d, bsz);
             x86_push(c, c->rip, bsz);
             jmp_to(c, bsz, t);
@@ -1688,7 +1695,7 @@ void x86_exec_one(x86_cpu *c)
             return;
         }
         case 4: {
-            int bsz = c->code64 ? (d->opsize_prefix ? 2 : 8) : sz;
+            int bsz = branch_osz(c, sz);
             jmp_to(c, bsz, x86_rm_read(c, d, bsz));
             return;
         }

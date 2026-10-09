@@ -192,11 +192,17 @@ static void load_env(x86_cpu *c, uint64_t lin, int osz)
 
 void x87_exec(x86_cpu *c, x86_dec *d, int op)
 {
+    x87_exec_at(c, d, op, d->mem ? x86_ea_lin(c, d) : 0);
+}
+
+/* lin: endereco linear do operando de memoria (o JIT ja o calculou); usa de d so
+ * modrm/reg/rm/mem/osz */
+void x87_exec_at(x86_cpu *c, x86_dec *d, int op, uint64_t lin)
+{
     unsigned reg = d->reg & 7;
     c->fop = (uint16_t)(((op & 7) << 8) | d->modrm);
     c->fip = c->cur_rip;
     if (d->mem) {
-        uint64_t lin = x86_ea_lin(c, d);
         c->fdp = lin;
         switch (op) {
         case 0xd8: case 0xda: case 0xdc: case 0xde: {

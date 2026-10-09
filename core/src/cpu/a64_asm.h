@@ -154,6 +154,49 @@ static inline void a64_and_bitmask(a64 *a, int rd, int rn, uint32_t n_immr_imms)
 {
     a64_put(a, 0x92000000u | (n_immr_imms << 10) | ((uint32_t)rn << 5) | (uint32_t)rd);
 }
+/* logica com imediato codificado (opc: 0=AND 1=ORR 2=EOR 3=ANDS) */
+static inline void a64_logic_imm(a64 *a, int sf, int opc, int rd, int rn, uint32_t n_immr_imms)
+{
+    a64_put(a, (sf ? 0x80000000u : 0) | ((uint32_t)opc << 29) | 0x12000000u | (n_immr_imms << 10) | ((uint32_t)rn << 5) |
+                   (uint32_t)rd);
+}
+/* codifica v como imediato logico do AArch64 (N:immr:imms); false se nao tiver a forma
+ * de um bloco de uns repetido e rotacionado. sf = 0: so os 32 bits baixos. */
+static inline bool a64_encode_bitmask(uint64_t v, int sf, uint32_t *enc)
+{
+    if (!sf)
+        v = (v & 0xffffffffULL) | (v << 32);
+    if (v == 0 || v == ~0ULL)
+        return false;
+    unsigned size = 64;
+    while (size > 2) { /* menor periodo que repete o padrao */
+        unsigned h = size / 2;
+        uint64_t m = (1ULL << h) - 1;
+        if ((v & m) != ((v >> h) & m))
+            break;
+        size = h;
+    }
+    uint64_t mask = size == 64 ? ~0ULL : (1ULL << size) - 1;
+    uint64_t e = v & mask;
+    /* rotaciona para a direita ate o bloco de uns ficar no fundo (forma 0..01..1) */
+    unsigned rot = 0;
+    uint64_t r = e;
+    for (; rot < size; rot++) {
+        r = rot ? ((e >> rot) | (e << (size - rot))) & mask : e;
+        if (!(r & (r + 1)))
+            break;
+    }
+    if (rot == size)
+        return false;
+    unsigned ones = (unsigned)__builtin_popcountll(r);
+    unsigned immr = (size - rot) % size;
+    unsigned imms = ((~(size * 2 - 1)) & 0x3f) | (ones - 1);
+    unsigned n = size == 64 ? 1 : 0;
+    if (!sf && n)
+        return false;
+    *enc = (n << 12) | (immr << 6) | (imms & 0x3f);
+    return true;
+}
 #define A64_MASK_PAGE_HI ((1u << 12) | (52u << 6) | 51u) /* ~0xfff */
 #define A64_MASK_PAGE_LO ((1u << 12) | (0u << 6) | 11u)  /* 0xfff */
 

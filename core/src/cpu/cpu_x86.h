@@ -192,7 +192,7 @@ typedef struct x86_cpu {
     /* depuracao: rastro circular de instrucoes (MVM_X86_TRACE=n) */
     struct x86_trace { uint64_t rip, rsp, fl, rax; uint16_t cs; uint8_t bytes[6]; } *trace;
     unsigned trace_n, trace_pos;
-    bool trace_dumped;
+    bool trace_dumped, trace_jit;
     uint64_t brk;        /* MVM_X86_BREAK: grava RAM e registradores ao chegar neste RIP (tambem com JIT) */
     uint64_t trace_stop; /* MVM_X86_TRACE_STOP: grava o rastro ao chegar neste RIP */
     int64_t trace_countdown; /* > 0: grava o rastro apos tantas instrucoes */
@@ -339,6 +339,7 @@ void x86_set_arith_flags(x86_cpu *c, uint64_t fl);
 
 /* x87 (x86_fpu.c) */
 void x87_exec(x86_cpu *c, x86_dec *d, int op);
+void x87_exec_at(x86_cpu *c, x86_dec *d, int op, uint64_t lin);
 void x87_reset(x86_cpu *c);
 void x87_fxsave_regs(x86_cpu *c, uint8_t *buf);  /* area de 128 bytes (st0-7) + cabecalho */
 void x87_fxrstor_regs(x86_cpu *c, const uint8_t *buf);

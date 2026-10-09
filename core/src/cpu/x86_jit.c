@@ -6,7 +6,8 @@
  * bloco e sao executadas pelo interpretador, que continua sendo a referencia.
  *
  * Convencoes do codigo gerado:
- *   x19 = x86_cpu *, x25 = &c->tlb[user][0]; x20-x24 temporarios preservados
+ *   x19 = x86_cpu *, x25 = &c->tlb[user][0], x29 = orcamento (c->jit_budget);
+ *   x20-x24 temporarios preservados
  *   entre chamadas a funcoes auxiliares; x0-x16 temporarios.
  *   Os registradores do convidado ficam em c->r[] (memoria), os flags no mesmo
  *   formato preguicoso do interpretador (cc_op/cc_size/cc_dst/cc_src1/cc_src2),
@@ -47,6 +48,7 @@
 #define RT 24
 #define RTLB 25
 #define RJC 26 /* &j->jc[0] */
+#define RBUD 29 /* orcamento de instrucoes (c->jit_budget fica em memoria so nas chamadas e saidas) */
 #define JC_SIZE 16384 /* entradas do cache de saltos (potencia de 2; mascara em emit_exit_lookup) */
 
 typedef struct jit_block jit_block;
@@ -80,9 +82,16 @@ struct x86_jit {
     uint8_t *bits;
     uint64_t *chunks; /* por pagina: trechos de 64 bytes com codigo traduzido */
     uint64_t n_trans, n_inval, n_flush, n_chain, n_enter, exit_why[8], ret_interp, ret_budget, ret_nomode, ret_nopage;
+    uint64_t nochain[8]; /* estatistica: por que uma saida encadeavel nao foi encadeada */
     unsigned max_insns;     /* MVM_JIT_MAXINSN (depuracao) */
     uint8_t skip[0x200];    /* MVM_JIT_SKIP=op,op,... opcodes deixados ao interpretador */
     bool stats;             /* MVM_JIT_STATS=1 */
+    unsigned n_interp_log;
+#define COLD_MAX 32768
+#define COLD_FIX 1024
+    uint32_t cold[COLD_MAX];
+    struct { uint32_t *site; unsigned coff; } m2c[COLD_FIX]; /* desvio do bloco -> caminho lento */
+    struct { unsigned coff; uint32_t *target; } c2m[COLD_FIX]; /* volta do caminho lento -> bloco */
     unsigned off;           /* MVM_JIT_OFF: bits que desligam otimizacoes (depuracao) */
     /* cache de saltos: RIP -> codigo do bloco (desvios indiretos e entre paginas) */
     /* RIP -> codigo; phys = pagina fisica do bloco, conferida contra o TLB de execucao
@@ -371,7 +380,8 @@ static bool decode(x86_cpu *c, const uint8_t *p, int max, uint64_t rip, jinsn *i
     switch (k) {
     case IMM8: case REL8: isz = 1; break;
     case IMM16: isz = 2; break;
-    case IMMZ: case RELZ: isz = in->osz == 2 ? 2 : 4; break;
+    case IMMZ: isz = in->osz == 2 ? 2 : 4; break;
+    case RELZ: isz = in->osz == 2 && !c->code64 ? 2 : 4; break; /* 64 bits: o 66 e ignorado */
     case IMMV: isz = in->osz; break;
     case MOFFS: isz = in->asz; break;
     default: break;
@@ -394,7 +404,7 @@ static bool decode(x86_cpu *c, const uint8_t *p, int max, uint64_t rip, jinsn *i
     in->next = rip + (uint64_t)i;
     if (!c->code64)
         in->next = (uint32_t)in->next;
-    if ((k == REL8 || k == RELZ) && in->osz == 2)
+    if ((k == REL8 || k == RELZ) && in->osz == 2 && !c->code64)
         return false; /* desvios de 16 bits: interpretador */
     if (in->riprel)
         in->disp += (int64_t)in->next;
@@ -403,13 +413,16 @@ static bool decode(x86_cpu *c, const uint8_t *p, int max, uint64_t rip, jinsn *i
 
 /* ------------------------------------------------------------ geracao */
 
+/* x->flags_op: cc_op = CC_NONE e os flags aritmeticos ja estao em c->eflags (COMISS/UCOMISD) */
+#define JF_EFL 0x40
+
 typedef struct {
     struct x86_jit *j;
     x86_cpu *c;
     a64 a;
     jit_block *b;
     int nexit;
-    int flags_op;   /* operacao preguicosa (CC_*) gravada neste bloco, 0 = desconhecida */
+    int flags_op;   /* operacao preguicosa (CC_*) gravada neste bloco, 0 = desconhecida, JF_EFL = em c->eflags */
     bool stored;    /* a instrucao atual escreveu na memoria */
     bool dead;      /* os flags desta instrucao sao sobrescritos antes de serem lidos */
     uint64_t csbase, page_lin;  /* base do CS e pagina linear do bloco */
@@ -425,7 +438,13 @@ typedef struct {
     uint16_t rc_dirty;      /* bit por registrador do convidado: valor so no host */
     int nocache;            /* > 0: trecho condicional, nao aloca slots (acesso direto a memoria) */
     int slowpath;           /* > 0: chamada em caminho condicional (recarrega o cache depois) */
+    bool rip_pending;       /* a instrucao atual pode gerar excecao: grava cur_rip antes de chamar C */
+    int64_t ccop_mem;       /* valor (cc_op | cc_size << 32) ja gravado em c->cc_op neste bloco, -1 = ?? */
+    uint64_t pending_rip;
     bool rc_on;
+    /* caminhos lentos fora da linha: emitidos em j->cold e copiados para o fim do bloco */
+    unsigned ncold, nm2c, nc2m;
+    uint32_t *hot_p, *hot_end;
 } jctx;
 
 /* registradores do host usados pelo cache (x0-x3 sao argumentos, x9-x17 temporarios) */
@@ -444,8 +463,15 @@ static void rc_reload(jctx *x);
 static void emit_call(jctx *x, const void *fn)
 {
     rc_writeback(x);
+    if (x->rip_pending) { /* so as funcoes em C geram excecoes: o caminho rapido nao grava cur_rip */
+        a64_mov_imm(&x->a, 9, x->pending_rip);
+        a64_str(&x->a, 8, 9, RC, OFF(cur_rip));
+    }
     a64_mov_imm(&x->a, 16, (uint64_t)(uintptr_t)fn);
+    a64_str(&x->a, 8, RBUD, RC, OFF(jit_budget));
     a64_blr(&x->a, 16);
+    a64_ldr(&x->a, 8, RBUD, RC, OFF(jit_budget)); /* x86_set_intr pode ter zerado o orcamento */
+    x->ccop_mem = -1; /* a funcao pode ter mudado cc_op */
     if (x->slowpath || x->nocache) {
         rc_reload(x); /* caminho condicional: o estado de compilacao nao pode mudar */
     } else { /* chamada incondicional: esvazia o cache (recarrega sob demanda) */
@@ -455,10 +481,16 @@ static void emit_call(jctx *x, const void *fn)
     }
 }
 
+/* a instrucao pode gerar excecao: cur_rip e gravado por emit_call (so nos caminhos que chamam C) */
 static void set_cur_rip(jctx *x, jinsn *in)
 {
-    a64_mov_imm(&x->a, 9, in->rip);
-    a64_str(&x->a, 8, 9, RC, OFF(cur_rip));
+    if (x->j->off & 256) { /* MVM_JIT_OFF=256: grava sempre, como antes */
+        a64_mov_imm(&x->a, 9, in->rip);
+        a64_str(&x->a, 8, 9, RC, OFF(cur_rip));
+        return;
+    }
+    x->rip_pending = true;
+    x->pending_rip = in->rip;
 }
 
 static void rc_reset(jctx *x)
@@ -604,6 +636,11 @@ static void add_const(jctx *x, int rd, int rn, int64_t v)
         a64_add_imm(a, rd, rn, (uint32_t)v);
     } else if (v < 0 && v > -4096) {
         a64_sub_imm(a, rd, rn, (uint32_t)-v);
+    } else if (v > -0x1000000 && v < 0x1000000 && !(x->j->off & 16384)) { /* 2 instrucoes (imediato << 12 + resto) */
+        uint64_t m = (uint64_t)(v < 0 ? -v : v);
+        a64_addsub_imm(a, 1, v < 0, 0, rd, rn, (uint32_t)(m >> 12), 1);
+        if (m & 0xfff)
+            a64_addsub_imm(a, 1, v < 0, 0, rd, rd, (uint32_t)(m & 0xfff), 0);
     } else {
         a64_mov_imm(a, 9, (uint64_t)v);
         a64_add(a, rd, rn, 9);
@@ -614,25 +651,37 @@ static void add_const(jctx *x, int rd, int rn, int64_t v)
 static void emit_ea(jctx *x, jinsn *in)
 {
     a64 *a = &x->a;
-    bool have = false;
+    bool direct = !(x->j->off & 16384);
+    /* base e indice direto dos registradores do cache (sem copiar antes) */
+    int hb = -1, hi = -1;
     if (in->base >= 0) {
-        ld_greg(x, REA, in->base, 8, true);
-        have = true;
+        hb = direct ? rc_get(x, in->base, true) : -1;
+        if (hb < 0) {
+            ld_greg(x, REA, in->base, 8, true);
+            hb = REA;
+        }
     }
     if (in->index >= 0) {
-        ld_greg(x, 10, in->index, 8, true);
-        if (have)
-            a64_addsub_reg(a, 1, 0, 0, REA, REA, 10, in->scale);
-        else if (in->scale)
-            a64_lsl_imm(a, REA, 10, in->scale);
-        else
-            a64_mov(a, 1, REA, 10);
-        have = true;
+        hi = direct ? rc_get(x, in->index, true) : -1;
+        if (hi < 0) {
+            ld_greg(x, 10, in->index, 8, true);
+            hi = 10;
+        }
     }
-    if (!have)
-        a64_mov_imm(a, REA, (uint64_t)in->disp);
-    else
+    if (hb >= 0 && hi >= 0) {
+        a64_addsub_reg(a, 1, 0, 0, REA, hb, hi, in->scale);
         add_const(x, REA, REA, in->disp);
+    } else if (hb >= 0) {
+        add_const(x, REA, hb, in->disp);
+    } else if (hi >= 0) {
+        if (in->scale)
+            a64_lsl_imm(a, REA, hi, in->scale);
+        else
+            a64_mov(a, 1, REA, hi);
+        add_const(x, REA, REA, in->disp);
+    } else {
+        a64_mov_imm(a, REA, (uint64_t)in->disp);
+    }
     if (in->asz == 4)
         a64_mov(a, 0, REA, REA);
     if (!x->code64 || in->ea_seg == S_FS || in->ea_seg == S_GS) {
@@ -654,18 +703,92 @@ static void emit_tlb(jctx *x, int addr, int size, uint32_t tag_off, uint32_t **s
     a64_addsub_reg(a, 1, 0, 0, 9, 9, 9, 2);      /* idx * 5 */
     a64_addsub_reg(a, 1, 0, 0, 9, RTLB, 9, 3);   /* base + idx * 40 */
     a64_ldr(a, 8, 10, 9, tag_off);
-    a64_and_bitmask(a, 11, addr, A64_MASK_PAGE_HI);
-    a64_cmp(a, 1, 10, 11);
-    *slow1 = a64_here(a);
-    a64_bcond(a, A_NE, a64_here(a));
     *slow2 = NULL;
-    if (size > 1) {
-        a64_and_bitmask(a, 11, addr, A64_MASK_PAGE_LO);
-        a64_addsub_imm(a, 1, 1, 1, XZR, 11, (uint32_t)(0x1000 - size), 0);
-        *slow2 = a64_here(a);
-        a64_bcond(a, A_HI, a64_here(a));
+    if (size > 1 && !(x->j->off & 512)) {
+        /* pagina do ULTIMO byte: se o acesso cruza a pagina ela difere da etiqueta (que e a
+         * pagina do primeiro byte, ja que o indice vem dele) e vai para o caminho lento */
+        a64_add_imm(a, 11, addr, (uint32_t)(size - 1));
+        a64_and_bitmask(a, 11, 11, A64_MASK_PAGE_HI);
+        a64_cmp(a, 1, 10, 11);
+        *slow1 = a64_here(a);
+        a64_bcond(a, A_NE, a64_here(a));
+    } else {
+        a64_and_bitmask(a, 11, addr, A64_MASK_PAGE_HI);
+        a64_cmp(a, 1, 10, 11);
+        *slow1 = a64_here(a);
+        a64_bcond(a, A_NE, a64_here(a));
+        if (size > 1) {
+            a64_and_bitmask(a, 11, addr, A64_MASK_PAGE_LO);
+            a64_addsub_imm(a, 1, 1, 1, XZR, 11, (uint32_t)(0x1000 - size), 0);
+            *slow2 = a64_here(a);
+            a64_bcond(a, A_HI, a64_here(a));
+        }
     }
     a64_ldr(a, 8, 10, 9, (uint32_t)offsetof(x86_tlbe, addend));
+}
+
+/* Caminho lento fora da linha: os desvios s1/s2 do caminho rapido vao para um trecho
+ * emitido em j->cold (copiado para depois do fim do bloco), que volta para 'done'. O
+ * caminho rapido fica sem o salto por cima da chamada. */
+static bool cold_begin(jctx *x, uint32_t *s1, uint32_t *s2)
+{
+    struct x86_jit *j = x->j;
+    if ((j->off & 32768) || x->nm2c + 2 > COLD_FIX || x->nc2m + 1 > COLD_FIX || x->ncold + 256 > COLD_MAX)
+        return false;
+    j->m2c[x->nm2c].site = s1;
+    j->m2c[x->nm2c++].coff = x->ncold;
+    if (s2) {
+        j->m2c[x->nm2c].site = s2;
+        j->m2c[x->nm2c++].coff = x->ncold;
+    }
+    x->hot_p = x->a.p;
+    x->hot_end = x->a.end;
+    x->a.p = j->cold + x->ncold;
+    x->a.end = j->cold + COLD_MAX;
+    return true;
+}
+
+static void cold_end(jctx *x, uint32_t *done)
+{
+    struct x86_jit *j = x->j;
+    j->c2m[x->nc2m].coff = (unsigned)(x->a.p - j->cold);
+    j->c2m[x->nc2m++].target = done;
+    a64_b(&x->a, x->a.p); /* corrigido na copia */
+    x->ncold = (unsigned)(x->a.p - j->cold);
+    x->a.p = x->hot_p;
+    x->a.end = x->hot_end;
+}
+
+/* fim de um trecho fora da linha que termina numa saida do bloco (ultima instrucao:
+ * B para o stub de saida, corrigido na copia) */
+static void cold_end_exit(jctx *x)
+{
+    struct x86_jit *j = x->j;
+    j->c2m[x->nc2m].coff = (unsigned)(x->a.p - j->cold) - 1;
+    j->c2m[x->nc2m++].target = j->exit_stub;
+    x->ncold = (unsigned)(x->a.p - j->cold);
+    x->a.p = x->hot_p;
+    x->a.end = x->hot_end;
+}
+
+/* copia os caminhos lentos para a posicao atual e corrige os desvios */
+static void cold_flush(jctx *x)
+{
+    struct x86_jit *j = x->j;
+    a64 *a = &x->a;
+    if (!x->ncold)
+        return;
+    if (a->p + x->ncold > a->end) {
+        a->overflow = true;
+        return;
+    }
+    uint32_t *base = a->p;
+    memcpy(base, j->cold, x->ncold * sizeof(uint32_t));
+    a->p += x->ncold;
+    for (unsigned i = 0; i < x->nm2c; i++)
+        a64_patch(j->m2c[i].site, base + j->m2c[i].coff);
+    for (unsigned i = 0; i < x->nc2m; i++)
+        a64_patch(base + j->c2m[i].coff, j->c2m[i].target);
 }
 
 /* dst = memoria[REA] (size bytes, estendido com zero) */
@@ -675,6 +798,19 @@ static void emit_load(jctx *x, int dst, int size)
     uint32_t *s1, *s2;
     emit_tlb(x, REA, size, (uint32_t)offsetof(x86_tlbe, tag_r), &s1, &s2);
     a64_ldr_reg(a, size, dst, 10, REA);
+    if (cold_begin(x, s1, s2)) {
+        uint32_t *done = x->hot_p;
+        a64_mov(a, 1, 0, RC);
+        a64_mov(a, 1, 1, REA);
+        a64_mov_imm(a, 2, (uint64_t)size);
+        x->slowpath++;
+        emit_call(x, (const void *)jit_rd);
+        x->slowpath--;
+        if (dst != 0)
+            a64_mov(a, 1, dst, 0);
+        cold_end(x, done);
+        return;
+    }
     uint32_t *jdone = a64_here(a);
     a64_b(a, a64_here(a));
     uint32_t *slow = a64_here(a);
@@ -701,6 +837,20 @@ static void emit_store(jctx *x, int src, int size, uint64_t next_rip)
     uint32_t *s1, *s2;
     emit_tlb(x, REA, size, (uint32_t)offsetof(x86_tlbe, tag_w), &s1, &s2);
     a64_str_reg(a, size, src, 10, REA);
+    if (cold_begin(x, s1, s2)) {
+        uint32_t *done = x->hot_p;
+        a64_mov(a, 1, 0, RC);
+        a64_mov(a, 1, 1, REA);
+        a64_mov(a, 1, 2, src);
+        a64_mov_imm(a, 3, (uint64_t)size);
+        x->slowpath++;
+        emit_call(x, (const void *)jit_wr);
+        x->slowpath--;
+        cold_end(x, done);
+        (void)next_rip;
+        x->stored = true; /* verifica codigo automodificavel ao fim da instrucao */
+        return;
+    }
     uint32_t *jdone = a64_here(a);
     a64_b(a, a64_here(a));
     uint32_t *slow = a64_here(a);
@@ -727,13 +877,36 @@ static void emit_lazy(jctx *x, int op, int size, int dst, int s1, int s2)
         x->flags_op = 0;
         return;
     }
-    a64_mov_imm(a, 9, (uint64_t)(uint32_t)op | ((uint64_t)(uint32_t)size << 32));
-    a64_str(a, 8, 9, RC, OFF(cc_op));
+    int64_t v = (int64_t)((uint64_t)(uint32_t)op | ((uint64_t)(uint32_t)size << 32));
+    if (v != x->ccop_mem || (x->j->off & 1024)) { /* mesma operacao ja gravada neste bloco: nao regrava */
+        a64_mov_imm(a, 9, (uint64_t)v);
+        a64_str(a, 8, 9, RC, OFF(cc_op));
+        x->ccop_mem = v;
+    }
     a64_str(a, 8, dst, RC, OFF(cc_dst));
-    a64_str(a, 8, s1, RC, OFF(cc_src1));
-    a64_str(a, 8, s2, RC, OFF(cc_src2));
+    if (op != CC_LOGIC || (x->j->off & 1024)) { /* LOGIC so usa o resultado */
+        a64_str(a, 8, s1, RC, OFF(cc_src1));
+        a64_str(a, 8, s2, RC, OFF(cc_src2));
+    }
     x->flags_op = op;
     x->flags_size = size;
+}
+
+/* x87 ja decodificado pelo JIT: info = modrm | (opcode & 7) << 8 | osz << 16; lin = endereco */
+static void jit_x87(x86_cpu *c, uint64_t info, uint64_t lin)
+{
+    if (c->cr0 & (CR0_EM | CR0_TS))
+        x86_exception(c, EXC_NM, 0, 0);
+    x86_dec d;
+    memset(&d, 0, sizeof(d));
+    d.modrm = (uint8_t)info;
+    d.mod = d.modrm >> 6;
+    d.reg = (d.modrm >> 3) & 7;
+    d.rm = d.modrm & 7;
+    d.mem = d.mod != 3;
+    d.osz = (int)((info >> 16) & 0xff);
+    d.seg = -1;
+    x87_exec_at(c, &d, 0xd8 + (int)((info >> 8) & 7), lin);
 }
 
 void x86_exec_one(x86_cpu *c);
@@ -793,6 +966,15 @@ static int emit_cond(jctx *x, int cc)
         return neg ? (r ^ 1) : r;
     }
     if (x->j->off & 1)
+        goto helper;
+    if (x->flags_op == JF_EFL && t <= 5) { /* OF, CF, ZF, CF|ZF, SF, PF direto de eflags */
+        static const uint32_t bits[6] = {EFL_OF, EFL_CF, EFL_ZF, EFL_CF | EFL_ZF, EFL_SF, EFL_PF};
+        a64_ldr(a, 8, 0, RC, OFF(eflags));
+        a64_mov_imm(a, 1, bits[t]);
+        a64_tst(a, 1, 0, 1);
+        return neg ? A_EQ : A_NE;
+    }
+    if (x->flags_op == JF_EFL)
         goto helper;
     if (x->flags_op && (t == 2 || t == 4)) {
         /* ZF/SF vem sempre do resultado (cc_dst), qualquer que seja a operacao */
@@ -1019,6 +1201,10 @@ static bool emit_cf_inline(jctx *x, int dst)
     if (x->j->off & 64)
         return false;
     switch (x->flags_op) {
+    case JF_EFL:
+        a64_ldr(a, 8, dst, RC, OFF(eflags));
+        a64_and_bitmask(a, dst, dst, (1u << 12) | 0u); /* & 1 (CF) */
+        return true;
     case CC_LOGIC:
         a64_mov_imm(a, dst, 0);
         return true;
@@ -1087,6 +1273,121 @@ static void emit_alu(jctx *x, int op, int size)
         break;
     default: a64_sub(a, RR, RA, RB); emit_lazy(x, CC_SUB, size, RR, RA, RB); break;
     }
+}
+
+/* ADD/SUB/AND/OR/XOR registrador, imediato (32/64 bits) direto no registrador do cache,
+ * com as formas de imediato do AArch64: 1 instrucao em vez de copia + constante + copia.
+ * ADD/SUB so com os flags mortos; as logicas guardam o resultado para os flags. */
+static bool emit_alu_imm_reg(jctx *x, int idx, int aop, int s, int64_t imm)
+{
+    a64 *a = &x->a;
+    if ((x->j->off & 16384) || (s != 4 && s != 8))
+        return false;
+    int sf = s == 8;
+    uint64_t v = sf ? (uint64_t)imm : (uint64_t)(uint32_t)imm;
+    uint32_t enc = 0;
+    int kind; /* 0 = add/sub imm12, 1 = logica */
+    int sub = 0, opc = 0;
+    uint32_t imm12 = 0;
+    int sh = 0;
+    if (aop == 0 || aop == 5) {
+        if (!x->dead)
+            return false;
+        int64_t sv = sf ? imm : (int64_t)(int32_t)imm;
+        sub = aop == 5;
+        if (sv < 0) { /* soma de negativo = subtracao */
+            sv = -sv;
+            sub = !sub;
+        }
+        if (sv < 0x1000) {
+            imm12 = (uint32_t)sv;
+        } else if (!(sv & 0xfff) && sv < 0x1000000) {
+            imm12 = (uint32_t)(sv >> 12);
+            sh = 1;
+        } else {
+            return false;
+        }
+        kind = 0;
+    } else if (aop == 1 || aop == 4 || aop == 6) {
+        opc = aop == 4 ? 0 : aop == 1 ? 1 : 2;
+        if (!a64_encode_bitmask(v, sf, &enc))
+            return false;
+        kind = 1;
+    } else {
+        return false;
+    }
+    int h = rc_get(x, idx, true);
+    if (h < 0)
+        return false;
+    if (kind == 0)
+        a64_addsub_imm(a, sf, sub, 0, h, h, imm12, sh);
+    else
+        a64_logic_imm(a, sf, opc, h, h, enc);
+    x->rc_dirty |= (uint16_t)(1u << idx);
+    if (kind == 1)
+        emit_lazy(x, CC_LOGIC, s, h, XZR, XZR);
+    else
+        x->flags_op = 0; /* flags mortos */
+    return true;
+}
+
+/* ADD/SUB/AND/OR/XOR/CMP de 32/64 bits com o destino (registrador do convidado dst) e a
+ * fonte (registrador do convidado src_idx, ou ja em src_host) nos registradores do cache.
+ * Flags mortos: 1 instrucao no proprio registrador. Os flags preguicosos aceitam as fontes
+ * com lixo acima do tamanho (quem os le mascara pelo tamanho). */
+static bool emit_alu_rr(jctx *x, int aop, int s, int dst, int src_idx, int src_host)
+{
+    a64 *a = &x->a;
+    if (aop == 2 || aop == 3 || (s != 4 && s != 8))
+        return false;
+    int hs = src_host >= 0 ? src_host : rc_get(x, src_idx, true);
+    if (hs < 0)
+        return false;
+    int hd = rc_get(x, dst, true);
+    if (hd < 0)
+        return false;
+    int sf = s == 8;
+    bool logic = aop == 1 || aop == 4 || aop == 6;
+    if (x->dead) {
+        x->flags_op = 0;
+        if (aop == 7)
+            return true; /* CMP com flags mortos: nada */
+    }
+    int rd = x->dead ? hd : RR;
+    switch (aop) {
+    case 0: a64_addsub_reg(a, sf, 0, 0, rd, hd, hs, 0); break;
+    case 5: case 7: a64_addsub_reg(a, sf, 1, 0, rd, hd, hs, 0); break;
+    case 4: a64_logic(a, sf, 0, 0, rd, hd, hs); break;
+    case 1: a64_logic(a, sf, 1, 0, rd, hd, hs); break;
+    default: a64_logic(a, sf, 2, 0, rd, hd, hs); break;
+    }
+    if (!x->dead) {
+        emit_lazy(x, logic ? CC_LOGIC : aop == 0 ? CC_ADD : CC_SUB, s, RR, logic ? XZR : hd, logic ? XZR : hs);
+        if (aop == 7)
+            return true;
+        a64_mov(a, sf, hd, RR);
+    }
+    x->rc_dirty |= (uint16_t)(1u << dst);
+    return true;
+}
+
+/* MOV registrador, registrador (32/64 bits) entre os registradores do cache: 1 instrucao */
+static bool mov_reg_reg(jctx *x, int dst, int src, int s)
+{
+    int hs = rc_get(x, src, true);
+    if (hs < 0)
+        return false;
+    int hd = rc_get(x, dst, false);
+    if (hd < 0)
+        return false;
+    if (s == 8) {
+        if (hd != hs)
+            a64_mov(&x->a, 1, hd, hs);
+    } else {
+        a64_mov(&x->a, 0, hd, hs); /* 32 bits zera a parte alta, como no x86 */
+    }
+    x->rc_dirty |= (uint16_t)(1u << dst);
+    return true;
 }
 
 /* push de RT (tamanho sz) */
@@ -1648,6 +1949,390 @@ static bool emit_vec(jctx *x, jinsn *in)
     return true;
 }
 
+/* ---- SSE de ponto flutuante, embaralhamentos e conversoes em NEON ----
+ * O Linux (glibc/musl, GTK, cairo, OpenSSL) usa muito PSHUFD, PSRLDQ, PSHUFB, PALIGNR e
+ * aritmetica SSE escalar; antes cada uma ia ao interpretador. Resultados NaN, conversoes
+ * fora da faixa e comparacoes nao ordenadas vao ao interpretador, que emula exatamente a
+ * propagacao de NaN e o "inteiro indefinido" do x86. */
+enum { S2_NONE, S2_PSHUF, S2_BSHIFT, S2_PSHUFB, S2_PALIGNR, S2_MOVLH, S2_SHUFP, S2_UNPCKP, S2_FARITH, S2_COMIS,
+       S2_PMOVMSKB, S2_CVTSI2F, S2_CVTTF2SI, S2_CVTF2F, S2_CVTDQ2PS };
+
+static int simd2_kind(const jinsn *in)
+{
+    int op = in->op;
+    int pfx = in->rep ? 3 : in->repne ? 2 : in->p66 ? 1 : 0;
+    if (op == 0x200) /* PSHUFB mm/xmm */
+        return pfx <= 1 ? S2_PSHUFB : S2_NONE;
+    if (op == 0x30f) /* PALIGNR */
+        return pfx <= 1 ? S2_PALIGNR : S2_NONE;
+    if ((op & 0xf00) != 0x100)
+        return S2_NONE;
+    switch (op & 0xff) {
+    case 0x70: return S2_PSHUF;
+    case 0x73: return pfx == 1 && !in->mem && ((in->reg & 7) == 3 || (in->reg & 7) == 7) ? S2_BSHIFT : S2_NONE;
+    case 0x12: case 0x16: return pfx == 0 || (pfx == 1 && in->mem) ? S2_MOVLH : S2_NONE;
+    case 0x13: case 0x17: return pfx <= 1 && in->mem ? S2_MOVLH : S2_NONE;
+    case 0xc6: return pfx <= 1 ? S2_SHUFP : S2_NONE;
+    case 0x14: case 0x15: return pfx <= 1 ? S2_UNPCKP : S2_NONE;
+    case 0x51: case 0x58: case 0x59: case 0x5c: case 0x5d: case 0x5e: case 0x5f: return S2_FARITH;
+    case 0x2e: case 0x2f: return pfx <= 1 ? S2_COMIS : S2_NONE;
+    case 0xd7: return pfx <= 1 && !in->mem ? S2_PMOVMSKB : S2_NONE;
+    case 0x2a: return pfx >= 2 ? S2_CVTSI2F : S2_NONE;
+    case 0x2c: return pfx >= 2 ? S2_CVTTF2SI : S2_NONE;
+    case 0x5a: return pfx >= 2 ? S2_CVTF2F : S2_NONE;
+    case 0x5b: return pfx == 0 ? S2_CVTDQ2PS : S2_NONE;
+    default: return S2_NONE;
+    }
+}
+
+/* LDR/STR St/Dt, [x12] (registrador XMM em memoria) e [x10, REA] (memoria do convidado) */
+static void fp_ld_x12(a64 *a, int vt, int sz) { a64_put(a, (sz == 4 ? 0xBD400000u : 0xFD400000u) | (12u << 5) | (uint32_t)vt); }
+static void fp_st_x12(a64 *a, int vt, int sz) { a64_put(a, (sz == 4 ? 0xBD000000u : 0xFD000000u) | (12u << 5) | (uint32_t)vt); }
+static void fp_ld_mem(a64 *a, int vt, int sz)
+{
+    a64_put(a, (sz == 4 ? 0xBC606800u : 0xFC606800u) | ((uint32_t)REA << 16) | (10u << 5) | (uint32_t)vt);
+}
+/* INS Vd.T[i], Vn.T[j] (es = bytes do elemento) */
+static void a64_ins(a64 *a, int vd, int i, int vn, int j, int es)
+{
+    int lg = es == 1 ? 0 : es == 2 ? 1 : es == 4 ? 2 : 3;
+    uint32_t imm5 = ((uint32_t)i << (lg + 1)) | (1u << lg), imm4 = (uint32_t)j << lg;
+    a64_put(a, 0x6E000400u | (imm5 << 16) | (imm4 << 11) | ((uint32_t)vn << 5) | (uint32_t)vd);
+}
+static void v_zero(a64 *a, int vd) { a64_v3(a, 0x6E201C00u, vd, vd, vd); }       /* eor .16b */
+static void v_mov(a64 *a, int vd, int vn) { a64_v3(a, 0x4EA01C00u, vd, vn, vn); } /* orr .16b */
+static void v_ext(a64 *a, int vd, int vn, int vm, int n) { a64_put(a, 0x6E000000u | ((uint32_t)vm << 16) | ((uint32_t)n << 11) | ((uint32_t)vn << 5) | (uint32_t)vd); }
+
+volatile long x86_jit_s2_off; /* depuracao (CLI "jits2 N"): bit k desliga o tipo S2_k */
+
+static bool emit_simd2(jctx *x, jinsn *in)
+{
+    int k = simd2_kind(in);
+    if (k == S2_NONE || OFF_M(7) + 8 > 32760 || ((x86_jit_s2_off >> k) & 1))
+        return false;
+    a64 *a = &x->a;
+    int op = in->op & 0xff, pfx = in->rep ? 3 : in->repne ? 2 : in->p66 ? 1 : 0;
+    bool q = pfx == 1 || k == S2_FARITH || k == S2_COMIS || k == S2_MOVLH || k == S2_SHUFP || k == S2_UNPCKP ||
+             k == S2_CVTSI2F || k == S2_CVTTF2SI || k == S2_CVTF2F || k == S2_CVTDQ2PS ||
+             (k == S2_PSHUF && pfx >= 2);
+    int rg = in->reg, rm = in->rm;
+    if (!q) { /* MMX */
+        rg &= 7;
+        rm &= 7;
+    }
+    bool mem = in->mem;
+    int imm = (int)(in->imm & 0xff);
+    uint32_t *slow[8];
+    int ns = 0;
+    a64_ldr(a, 8, 9, RC, OFF(cr0));
+    a64_and_bitmask(a, 9, 9, (1u << 12) | (62u << 6) | 1u); /* TS | EM */
+    slow[ns++] = a64_here(a);
+    a64_cbnz(a, 1, 9, a64_here(a));
+    x->nocache++;
+    uint32_t *s1, *s2;
+#define S2_TLB(n, tag)                                                                         \
+    do {                                                                                       \
+        emit_ea(x, in);                                                                        \
+        emit_tlb(x, REA, n, (uint32_t)offsetof(x86_tlbe, tag), &s1, &s2);                      \
+        slow[ns++] = s1;                                                                       \
+        if (s2)                                                                                \
+            slow[ns++] = s2;                                                                   \
+    } while (0)
+    /* fonte vetorial completa (16 ou 8 bytes) em v1 */
+#define S2_SRC()                                                                               \
+    do {                                                                                       \
+        if (mem) {                                                                             \
+            S2_TLB(q ? 16 : 8, tag_r);                                                         \
+            if (q)                                                                             \
+                a64_ldr_q_reg(a, 1, 10, REA);                                                  \
+            else                                                                               \
+                fp_ld_mem(a, 1, 8);                                                            \
+        } else {                                                                               \
+            vec_ld(x, 1, rm, q);                                                               \
+        }                                                                                      \
+    } while (0)
+    /* fonte escalar (sz bytes) em v1 */
+#define S2_SRCS(sz)                                                                            \
+    do {                                                                                       \
+        if (mem) {                                                                             \
+            S2_TLB(sz, tag_r);                                                                 \
+            fp_ld_mem(a, 1, sz);                                                               \
+        } else {                                                                               \
+            xmm_addr(x, rm);                                                                   \
+            fp_ld_x12(a, 1, sz);                                                               \
+        }                                                                                      \
+    } while (0)
+#define S2_SLOW_IF(cond)                                                                       \
+    do {                                                                                       \
+        slow[ns++] = a64_here(a);                                                              \
+        a64_bcond(a, cond, a64_here(a));                                                       \
+    } while (0)
+    bool sets_flags = false;
+    switch (k) {
+    case S2_PSHUF:
+        S2_SRC();
+        if (pfx == 1 || pfx == 0) { /* PSHUFD (dwords) / PSHUFW (words do MMX) */
+            int es = pfx == 1 ? 4 : 2;
+            for (int i = 0; i < 4; i++)
+                a64_ins(a, 0, i, 1, (imm >> (2 * i)) & 3, es);
+        } else { /* PSHUFLW (F2) / PSHUFHW (F3): so 4 words, o resto copiado */
+            int base = pfx == 2 ? 0 : 4;
+            v_mov(a, 0, 1);
+            for (int i = 0; i < 4; i++)
+                a64_ins(a, 0, base + i, 1, base + ((imm >> (2 * i)) & 3), 2);
+        }
+        vec_st(x, 0, rg, q);
+        break;
+    case S2_BSHIFT: /* PSRLDQ (/3) e PSLLDQ (/7) em bytes; destino em r/m */
+        vec_ld(x, 1, rm, true);
+        v_zero(a, 2);
+        if (imm > 15)
+            v_zero(a, 0);
+        else if (imm == 0)
+            v_mov(a, 0, 1);
+        else if ((in->reg & 7) == 3)
+            v_ext(a, 0, 1, 2, imm);
+        else
+            v_ext(a, 0, 2, 1, 16 - imm);
+        vec_st(x, 0, rm, true);
+        break;
+    case S2_PSHUFB: /* indice com bit 7 = 0; TBL da 0 para indices fora da tabela */
+        S2_SRC();
+        vec_ld(x, 0, rg, q);
+        if (q) {
+            a64_put(a, 0x4F04E400u | (0x0Fu << 5) | 2u); /* movi v2.16b, #0x8f */
+            a64_v3(a, 0x4E201C00u, 2, 1, 2);              /* and v2.16b, v1, v2 */
+            a64_put(a, 0x4E000000u | (2u << 16) | (0u << 5) | 3u); /* tbl v3.16b, {v0.16b}, v2.16b */
+        } else {
+            a64_put(a, 0x0F04E400u | (0x07u << 5) | 2u);  /* movi v2.8b, #0x87 */
+            a64_v3(a, 0x0E201C00u, 2, 1, 2);
+            a64_put(a, 0x0E000000u | (2u << 16) | (0u << 5) | 3u); /* tbl v3.8b, {v0.16b}, v2.8b */
+        }
+        vec_st(x, 3, rg, q);
+        break;
+    case S2_PALIGNR: /* (dst:src) >> imm bytes */
+        S2_SRC();
+        vec_ld(x, 0, rg, q);
+        v_zero(a, 2);
+        if (q) {
+            if (imm < 16)
+                v_ext(a, 3, 1, 0, imm);
+            else if (imm < 32)
+                v_ext(a, 3, 0, 2, imm - 16);
+            else
+                v_zero(a, 3);
+        } else {
+            a64_ins(a, 1, 1, 0, 0, 8); /* v1 = src (baixo) : dst (alto) */
+            if (imm < 16)
+                v_ext(a, 3, 1, 2, imm);
+            else
+                v_zero(a, 3);
+        }
+        vec_st(x, 3, rg, q);
+        break;
+    case S2_MOVLH: {
+        bool hi = op == 0x16 || op == 0x17;
+        if (op == 0x13 || op == 0x17) { /* MOVLPS/MOVHPS m64, xmm (valor em x12) */
+            a64_ldr(a, 8, 12, RC, OFF_X(rg) + (hi ? 8 : 0));
+            S2_TLB(8, tag_w);
+            a64_str_reg(a, 8, 12, 10, REA);
+            x->stored = true;
+        } else {
+            if (mem) {
+                S2_TLB(8, tag_r);
+                a64_ldr_reg(a, 8, 11, 10, REA);
+            } else { /* MOVHLPS (12) / MOVLHPS (16) */
+                a64_ldr(a, 8, 11, RC, OFF_X(rm) + (hi ? 0 : 8));
+            }
+            a64_str(a, 8, 11, RC, OFF_X(rg) + (hi ? 8 : 0));
+        }
+        break;
+    }
+    case S2_SHUFP:
+        S2_SRC();
+        vec_ld(x, 0, rg, true);
+        if (pfx == 0) {
+            a64_ins(a, 2, 0, 0, imm & 3, 4);
+            a64_ins(a, 2, 1, 0, (imm >> 2) & 3, 4);
+            a64_ins(a, 2, 2, 1, (imm >> 4) & 3, 4);
+            a64_ins(a, 2, 3, 1, (imm >> 6) & 3, 4);
+        } else {
+            a64_ins(a, 2, 0, 0, imm & 1, 8);
+            a64_ins(a, 2, 1, 1, (imm >> 1) & 1, 8);
+        }
+        vec_st(x, 2, rg, true);
+        break;
+    case S2_UNPCKP: { /* ZIP1/ZIP2 .4S (ps) ou .2D (pd) */
+        S2_SRC();
+        vec_ld(x, 0, rg, true);
+        uint32_t zip = (op == 0x14 ? 0x4E803800u : 0x4E807800u) | (pfx == 1 ? (1u << 22) : 0);
+        a64_v3(a, zip, 2, 0, 1);
+        vec_st(x, 2, rg, true);
+        break;
+    }
+    case S2_FARITH: {
+        bool dbl = pfx == 1 || pfx == 2, scalar = pfx >= 2;
+        int sz = dbl ? 8 : 4;
+        bool minmax = op == 0x5d || op == 0x5f;
+        uint32_t dbit = dbl ? (1u << 22) : 0;
+        if (scalar) {
+            S2_SRCS(sz);
+            xmm_addr(x, rg);
+            fp_ld_x12(a, 0, sz);
+            if (minmax) {
+                /* MIN: a < b ? a : b; MAX: a > b ? a : b (NaN ou iguais: b) */
+                if (op == 0x5d)
+                    a64_v3(a, 0x7EA0E400u | dbit, 3, 1, 0);
+                else
+                    a64_v3(a, 0x7EA0E400u | dbit, 3, 0, 1);
+                a64_v3(a, 0x2E601C00u, 3, 0, 1); /* bsl v3.8b */
+                fp_st_x12(a, 3, sz);
+                break;
+            }
+            uint32_t base;
+            switch (op) {
+            case 0x58: base = 0x1E202800u; break;
+            case 0x59: base = 0x1E200800u; break;
+            case 0x5c: base = 0x1E203800u; break;
+            case 0x5e: base = 0x1E201800u; break;
+            default: base = 0x1E21C000u; break; /* sqrt */
+            }
+            if (op == 0x51)
+                a64_put(a, base | dbit | (1u << 5) | 2u);
+            else
+                a64_v3(a, base | dbit, 2, 0, 1);
+            a64_put(a, 0x1E202000u | dbit | (2u << 16) | (2u << 5)); /* fcmp v2, v2: NaN -> interpretador */
+            S2_SLOW_IF(A_VS);
+            fp_st_x12(a, 2, sz);
+            break;
+        }
+        S2_SRC();
+        vec_ld(x, 0, rg, true);
+        if (minmax) {
+            if (op == 0x5d)
+                a64_v3(a, 0x6EA0E400u | dbit, 3, 1, 0);
+            else
+                a64_v3(a, 0x6EA0E400u | dbit, 3, 0, 1);
+            a64_v3(a, 0x6E601C00u, 3, 0, 1); /* bsl v3.16b */
+            vec_st(x, 3, rg, true);
+            break;
+        }
+        switch (op) {
+        case 0x58: a64_v3(a, 0x4E20D400u | dbit, 2, 0, 1); break;
+        case 0x59: a64_v3(a, 0x6E20DC00u | dbit, 2, 0, 1); break;
+        case 0x5c: a64_v3(a, 0x4EA0D400u | dbit, 2, 0, 1); break;
+        case 0x5e: a64_v3(a, 0x6E20FC00u | dbit, 2, 0, 1); break;
+        default: a64_put(a, 0x6EA1F800u | dbit | (1u << 5) | 2u); break; /* fsqrt */
+        }
+        /* algum elemento NaN -> interpretador */
+        a64_v3(a, 0x4E20E400u | dbit, 3, 2, 2); /* fcmeq v3, v2, v2 */
+        a64_put(a, 0x6EB1A800u | (3u << 5) | 3u); /* uminv s3, v3.4s */
+        a64_put(a, 0x1E260000u | (3u << 5) | 9u);  /* fmov w9, s3 */
+        slow[ns++] = a64_here(a);
+        a64_cbz(a, 0, 9, a64_here(a));
+        vec_st(x, 2, rg, true);
+        break;
+    }
+    case S2_COMIS: {
+        int sz = pfx ? 8 : 4;
+        uint32_t dbit = pfx ? (1u << 22) : 0;
+        S2_SRCS(sz);
+        xmm_addr(x, rg);
+        fp_ld_x12(a, 0, sz);
+        a64_put(a, 0x1E202000u | dbit | (1u << 16) | (0u << 5)); /* fcmp v0, v1 */
+        S2_SLOW_IF(A_VS);                                        /* nao ordenado: interpretador */
+        a64_cset(a, 9, A_MI);                                    /* CF = a < b */
+        a64_cset(a, 10, A_EQ);                                   /* ZF = a == b */
+        a64_logic_sh(a, 1, 1, 9, 9, 10, 0, 6);                   /* orr x9, x9, x10, lsl #6 */
+        a64_ldr(a, 8, 10, RC, OFF(eflags));
+        a64_mov_imm(a, 11, ~(uint64_t)EFL_ARITH);
+        a64_logic(a, 1, 0, 0, 10, 10, 11);                       /* and */
+        a64_logic(a, 1, 1, 0, 10, 10, 9);                        /* orr */
+        a64_str(a, 8, 10, RC, OFF(eflags));
+        a64_str(a, 8, XZR, RC, OFF(cc_op));                      /* CC_NONE */
+        x->ccop_mem = -1; /* so no caminho rapido */
+        sets_flags = true;
+        break;
+    }
+    case S2_PMOVMSKB: /* bit 7 de cada byte -> registrador */
+        vec_ld(x, 1, rm, q);
+        a64_put(a, 0x6F090400u | (1u << 5) | 1u); /* ushr v1.16b, v1.16b, #7 */
+        a64_put(a, 0x6F191400u | (1u << 5) | 1u); /* usra v1.8h, v1.8h, #7 */
+        a64_put(a, 0x6F321400u | (1u << 5) | 1u); /* usra v1.4s, v1.4s, #14 */
+        a64_put(a, 0x6F641400u | (1u << 5) | 1u); /* usra v1.2d, v1.2d, #28 */
+        a64_put(a, 0x0E013C00u | (1u << 5) | 9u); /* umov w9, v1.b[0] */
+        if (q) {
+            a64_put(a, 0x0E113C00u | (1u << 5) | 10u); /* umov w10, v1.b[8] */
+            a64_logic_sh(a, 0, 1, 9, 9, 10, 0, 8);
+        }
+        st_greg(x, 9, in->reg, 4, true);
+        break;
+    case S2_CVTSI2F: { /* CVTSI2SS/SD xmm, r/m32/64 */
+        int isz = (in->rex & 8) ? 8 : 4;
+        if (mem) {
+            S2_TLB(isz, tag_r);
+            a64_ldr_reg(a, isz, 11, 10, REA);
+        } else {
+            ld_greg(x, 11, rm, isz, true);
+        }
+        uint32_t cv = (isz == 8 ? 0x9E220000u : 0x1E220000u) | (pfx == 2 ? (1u << 22) : 0);
+        a64_put(a, cv | (11u << 5) | 2u); /* scvtf */
+        xmm_addr(x, rg);
+        fp_st_x12(a, 2, pfx == 2 ? 8 : 4);
+        break;
+    }
+    case S2_CVTTF2SI: { /* CVTTSS2SI/CVTTSD2SI r32/64, xmm/m */
+        int sz = pfx == 2 ? 8 : 4, isz = (in->rex & 8) ? 8 : 4;
+        uint32_t dbit = pfx == 2 ? (1u << 22) : 0;
+        S2_SRCS(sz);
+        a64_put(a, 0x1E202000u | dbit | (1u << 16) | (1u << 5)); /* fcmp v1, v1 */
+        S2_SLOW_IF(A_VS);
+        a64_put(a, (isz == 8 ? 0x9E380000u : 0x1E380000u) | dbit | (1u << 5) | 9u); /* fcvtzs */
+        /* saturou (fora da faixa): o x86 da 0x80..0; o interpretador resolve */
+        a64_mov_imm(a, 10, isz == 8 ? 0x7fffffffffffffffULL : 0x7fffffffULL);
+        a64_cmp(a, isz == 8, 9, 10);
+        S2_SLOW_IF(A_EQ);
+        a64_mov_imm(a, 10, isz == 8 ? 0x8000000000000000ULL : 0x80000000ULL);
+        a64_cmp(a, isz == 8, 9, 10);
+        S2_SLOW_IF(A_EQ);
+        st_greg(x, 9, in->reg, isz, true);
+        break;
+    }
+    case S2_CVTF2F: /* CVTSS2SD (F3) / CVTSD2SS (F2) */
+        S2_SRCS(pfx == 3 ? 4 : 8);
+        a64_put(a, (pfx == 3 ? 0x1E22C000u : 0x1E624000u) | (1u << 5) | 2u);
+        xmm_addr(x, rg);
+        fp_st_x12(a, 2, pfx == 3 ? 8 : 4);
+        break;
+    case S2_CVTDQ2PS:
+        S2_SRC();
+        a64_put(a, 0x4E21D800u | (1u << 5) | 2u); /* scvtf v2.4s, v1.4s */
+        vec_st(x, 2, rg, true);
+        break;
+    }
+#undef S2_SLOW_IF
+#undef S2_SRCS
+#undef S2_SRC
+#undef S2_TLB
+    x->nocache--;
+    uint32_t *jdone = a64_here(a);
+    a64_b(a, a64_here(a));
+    for (int i = 0; i < ns; i++)
+        a64_patch(slow[i], a64_here(a));
+    int fop = x->flags_op, fsz = x->flags_size;
+    x->slowpath++;
+    emit_icall(x, in);
+    x->slowpath--;
+    a64_patch(jdone, a64_here(a));
+    if (sets_flags) {
+        x->flags_op = JF_EFL; /* nos dois caminhos: CC_NONE e flags em c->eflags */
+    } else {
+        x->flags_op = fop;
+        x->flags_size = fsz;
+    }
+    return true;
+}
+
 /* ---- instrucoes "icall" feitas em codigo nativo ---- */
 
 /* CF = cf, demais flags aritmeticos preservados */
@@ -1890,6 +2575,7 @@ static bool emit_shift_native(jctx *x, jinsn *in, int s)
     a64_str(a, 8, 9, RC, OFF(cc_op));
     a64_str(a, 8, RR, RC, OFF(cc_dst));
     a64_str(a, 8, RT, RC, OFF(cc_aux));
+    x->ccop_mem = (int64_t)((uint64_t)CC_SZP | ((uint64_t)(uint32_t)s << 32));
     x->flags_op = CC_SZP;
     x->flags_size = s;
     return true;
@@ -1922,7 +2608,8 @@ static int emit_insn(jctx *x, jinsn *in)
     a64 *a = &x->a;
     int op = in->op, sz = op_size(in);
     bool rex = rexf(in);
-    if (in->icall && (emit_sse(x, in) || (!(x->j->off & 64) && emit_vec(x, in))))
+    if (in->icall && (emit_sse(x, in) || (!(x->j->off & 64) && emit_vec(x, in)) ||
+                      (!(x->j->off & 128) && emit_simd2(x, in))))
         return 1;
     if (in->icall) {
         int nk = native_icall_kind(in);
@@ -1943,6 +2630,23 @@ static int emit_insn(jctx *x, jinsn *in)
                 emit_bsf_bsr(x, in);
             return 1;
         }
+    }
+    if (in->icall && in->op >= 0xd8 && in->op <= 0xdf && !(x->j->off & 4096)) {
+        /* x87 sem passar pela decodificacao do interpretador */
+        set_cur_rip(x, in);
+        if (in->mem)
+            emit_ea(x, in);
+        uint64_t modrm = ((uint64_t)in->mod << 6) | ((uint64_t)(in->reg & 7) << 3) | (uint64_t)(in->rm & 7);
+        a64_mov(a, 1, 0, RC);
+        a64_mov_imm(a, 1, modrm | ((uint64_t)(in->op & 7) << 8) | ((uint64_t)in->osz << 16));
+        if (in->mem)
+            a64_mov(a, 1, 2, REA);
+        else
+            a64_mov_imm(a, 2, 0);
+        emit_call(x, (const void *)jit_x87);
+        x->stored = in->mem; /* FST/FSTP/FIST... podem escrever em codigo traduzido */
+        x->flags_op = 0;     /* FCOMI/FUCOMI mudam os flags */
+        return 1;
     }
     if (in->icall) {
         emit_icall(x, in);
@@ -1979,6 +2683,25 @@ static int emit_insn(jctx *x, jinsn *in)
             emit_adc_lazy(x, aop, s);
             return 1;
         }
+        if (form == 5 && aop != 7 && emit_alu_imm_reg(x, R_AX, aop, sz, in->imm))
+            return 1;
+        if (!(x->j->off & 16384) && form <= 3 && (form & 1) && sz >= 4) {
+            if (form == 1 && !in->mem && emit_alu_rr(x, aop, sz, in->rm, in->reg, -1))
+                return 1;
+            if (form == 3 && !in->mem && emit_alu_rr(x, aop, sz, in->reg, in->rm, -1))
+                return 1;
+            if (form == 3 && in->mem) { /* reg op= [mem]: a fonte vem da memoria em RB */
+                emit_ea(x, in);
+                emit_load(x, RB, sz);
+                if (emit_alu_rr(x, aop, sz, in->reg, -1, RB))
+                    return 1;
+                ld_greg(x, RA, in->reg, sz, rex);
+                emit_alu(x, aop, sz);
+                if (aop != 7)
+                    st_greg(x, RR, in->reg, sz, rex);
+                return 1;
+            }
+        }
         if (form == 4 || form == 5) {
             s = form == 4 ? 1 : sz;
             ld_greg(x, RA, R_AX, s, false);
@@ -2013,14 +2736,14 @@ static int emit_insn(jctx *x, jinsn *in)
     switch (op) {
     case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57: {
         int r = (op & 7) | ((in->rex & 1) << 3);
-        int s = x->code64 ? (in->p66 ? 2 : 8) : sz;
+        int s = x->code64 ? (in->p66 && !(in->rex & 8) ? 2 : 8) : sz;
         ld_greg(x, RT, r, s, rex);
         emit_push(x, in, RT, s);
         return 1;
     }
     case 0x58: case 0x59: case 0x5a: case 0x5b: case 0x5c: case 0x5d: case 0x5e: case 0x5f: {
         int r = (op & 7) | ((in->rex & 1) << 3);
-        int s = x->code64 ? (in->p66 ? 2 : 8) : sz;
+        int s = x->code64 ? (in->p66 && !(in->rex & 8) ? 2 : 8) : sz;
         emit_pop_load(x, RT, s);
         st_greg(x, RB, R_SP, 8, true);
         st_greg(x, RT, r, s, rex); /* POP RSP: o valor lido vence */
@@ -2032,7 +2755,7 @@ static int emit_insn(jctx *x, jinsn *in)
         st_greg(x, RA, in->reg, 8, rex);
         return 1;
     case 0x68: case 0x6a: {
-        int s = x->code64 ? (in->p66 ? 2 : 8) : sz;
+        int s = x->code64 ? (in->p66 && !(in->rex & 8) ? 2 : 8) : sz;
         a64_mov_imm(a, RT, (uint64_t)in->imm);
         emit_push(x, in, RT, s);
         return 1;
@@ -2061,6 +2784,8 @@ static int emit_insn(jctx *x, jinsn *in)
     case 0x80: case 0x81: case 0x83: {
         int aop = in->reg & 7;
         int s = op == 0x80 ? 1 : sz;
+        if (op != 0x80 && !in->mem && aop != 7 && emit_alu_imm_reg(x, in->rm, aop, s, in->imm))
+            return 1;
         load_rm(x, in, RA, s);
         a64_mov_imm(a, RB, (uint64_t)in->imm);
         if (aop == 2 || aop == 3)
@@ -2109,6 +2834,18 @@ static int emit_insn(jctx *x, jinsn *in)
     }
     case 0x88: case 0x89: {
         int s = op == 0x88 ? 1 : sz;
+        if (!(x->j->off & 16384) && s >= 4) { /* direto entre os registradores do cache */
+            if (in->mem) {
+                emit_ea(x, in);
+                int hs = rc_get(x, in->reg, true);
+                if (hs >= 0) {
+                    emit_store(x, hs, s, in->next);
+                    return 1;
+                }
+            } else if (mov_reg_reg(x, in->rm, in->reg, s)) {
+                return 1;
+            }
+        }
         ld_greg(x, RB, in->reg, s, rex);
         if (in->mem)
             emit_ea(x, in);
@@ -2117,6 +2854,22 @@ static int emit_insn(jctx *x, jinsn *in)
     }
     case 0x8a: case 0x8b: {
         int s = op == 0x8a ? 1 : sz;
+        if (!(x->j->off & 16384) && s >= 4) {
+            if (in->mem) {
+                emit_ea(x, in);
+                int hd = rc_get(x, in->reg, false);
+                if (hd >= 0) { /* carrega direto no registrador de destino */
+                    emit_load(x, hd, s);
+                    x->rc_dirty |= (uint16_t)(1u << in->reg);
+                    return 1;
+                }
+                emit_load(x, RA, s);
+                st_greg(x, RA, in->reg, s, rex);
+                return 1;
+            }
+            if (mov_reg_reg(x, in->reg, in->rm, s))
+                return 1;
+        }
         load_rm(x, in, RA, s);
         st_greg(x, RA, in->reg, s, rex);
         return 1;
@@ -2136,7 +2889,7 @@ static int emit_insn(jctx *x, jinsn *in)
         return 1;
     }
     case 0x8f: { /* POP r/m */
-        int s = x->code64 ? (in->p66 ? 2 : 8) : sz;
+        int s = x->code64 ? (in->p66 && !(in->rex & 8) ? 2 : 8) : sz;
         if (in->mem)
             return -1;
         emit_pop_load(x, RT, s);
@@ -2207,7 +2960,7 @@ static int emit_insn(jctx *x, jinsn *in)
         return 1;
     }
     case 0xc2: case 0xc3: { /* RET */
-        int s = x->code64 ? (in->p66 ? 2 : 8) : sz;
+        int s = x->code64 ? 8 : sz;
         emit_pop_load(x, RT, s);
         if (op == 0xc2)
             add_const(x, RB, RB, in->imm & 0xffff);
@@ -2228,7 +2981,7 @@ static int emit_insn(jctx *x, jinsn *in)
         return 1;
     }
     case 0xc9: { /* LEAVE: RSP = RBP; POP RBP */
-        int s = x->code64 ? (in->p66 ? 2 : 8) : sz;
+        int s = x->code64 ? (in->p66 && !(in->rex & 8) ? 2 : 8) : sz;
         ld_greg(x, RB, R_BP, 8, true);
         if (!x->code64)
             a64_mov(a, 0, RB, RB);
@@ -2297,6 +3050,7 @@ static int emit_insn(jctx *x, jinsn *in)
                 a64_str(a, 8, 9, RC, OFF(cc_op));
                 a64_str(a, 8, RR, RC, OFF(cc_dst));
                 a64_str(a, 8, 11, RC, OFF(cc_aux));
+                x->ccop_mem = (int64_t)((uint64_t)CC_SZP | ((uint64_t)(uint32_t)s << 32));
                 x->flags_op = CC_SZP;
                 x->flags_size = s;
             } else {
@@ -2352,7 +3106,7 @@ static int emit_insn(jctx *x, jinsn *in)
             return 0;
         }
         /* PUSH r/m */
-        int s2 = x->code64 ? (in->p66 ? 2 : 8) : sz;
+        int s2 = x->code64 ? (in->p66 && !(in->rex & 8) ? 2 : 8) : sz;
         load_rm(x, in, RT, s2);
         emit_push(x, in, RT, s2);
         return 1;
@@ -2362,10 +3116,17 @@ static int emit_insn(jctx *x, jinsn *in)
     }
     if (op >= 0x140 && op <= 0x14f) { /* CMOVcc */
         load_rm(x, in, RA, sz);
-        cond_to_x0(x, op & 15);
         ld_greg(x, RB, in->reg, sz, rex);
-        a64_cmp(a, 1, 0, XZR);
-        a64_csel(a, 1, RB, RA, RB, A_NE);
+        int cond = (x->j->off & 16384) ? COND_W0 : emit_cond(x, op & 15);
+        if (cond == COND_W0 || cond == A_AL || cond == COND_NEVER) {
+            if (x->j->off & 16384)
+                cond_to_x0(x, op & 15);
+            else if (cond != COND_W0)
+                a64_mov_imm(a, 0, cond == A_AL ? 1 : 0);
+            a64_cmp(a, 1, 0, XZR);
+            cond = A_NE;
+        }
+        a64_csel(a, 1, RB, RA, RB, cond); /* condicao direto dos flags do host */
         st_greg(x, RB, in->reg, sz, rex); /* 32 bits: zera a parte alta mesmo sem mover */
         return 1;
     }
@@ -2533,6 +3294,11 @@ static int flags_effect(const jinsn *in)
         int nk = native_icall_kind(in);
         if (sse_kind(in, NULL, NULL) != SSE_NONE || nk == 1)
             return 0;
+        int s2 = simd2_kind(in);
+        if (s2 == S2_COMIS)
+            return FX_WRITE; /* reescreve todos os flags aritmeticos */
+        if (s2 != S2_NONE)
+            return 0;
         if (nk == 3 || nk == 4)
             return FX_WRITE; /* CMPXCHG/XADD reescrevem todos os flags */
         return FX_READ | FX_WRITE;
@@ -2561,6 +3327,67 @@ static int flags_effect(const jinsn *in)
  * Gera o corpo do bloco. dead[i] (opcional) diz se os flags da instrucao i sao
  * mortos. Preenche ins/stored e devolve o numero de instrucoes traduzidas.
  */
+/* Instrucao que atravessa o fim da pagina: executada pelo interpretador dentro do bloco
+ * (ele busca os bytes da outra pagina a cada vez, entao o bloco nao depende dela). So
+ * instrucoes comuns, com prefixos e opcode nesta pagina: assim a classe da instrucao nao
+ * muda se a outra pagina mudar (no maximo o tamanho e os operandos; o RIP conferido
+ * depois da chamada cobre o tamanho). */
+static bool xpage_decode(jctx *x, const uint8_t *page, unsigned off, uint64_t rip, jinsn *in)
+{
+    x86_cpu *c = x->c;
+    unsigned avail = 0x1000 - off;
+    uint8_t buf[16];
+    if (avail >= 15 || (x->j->off & 8192))
+        return false;
+    memcpy(buf, page + off, avail);
+    uint64_t li = x->code64 ? rip : (uint32_t)(x->csbase + rip);
+    if (!x86_peek_code(c, (li & ~0xfffULL) + 0x1000, buf + avail, 15 - avail))
+        return false;
+    if (!decode(c, buf, 15, rip, in) || (unsigned)in->len <= avail)
+        return false;
+    /* cabecalho: prefixos, opcode e ModRM */
+    unsigned i = 0;
+    while (i < avail) {
+        uint8_t b = buf[i];
+        if (b == 0x66 || b == 0x67 || b == 0xf0 || b == 0xf2 || b == 0xf3 || b == 0x26 || b == 0x2e || b == 0x36 ||
+            b == 0x3e || b == 0x64 || b == 0x65 || (x->code64 && (b & 0xf0) == 0x40))
+            i++;
+        else
+            break;
+    }
+    int op = in->op;
+    i += op < 0x100 ? 1 : op < 0x200 ? 2 : 3;
+    /* o ModRM pode ficar na outra pagina, exceto no grupo FF (CALL/JMP far) */
+    if (op == 0xff)
+        i++;
+    if (i > avail)
+        return false;
+    if (op < 0x100) {
+        switch (op) {
+        case 0x07: case 0x17: case 0x1f: case 0x62: case 0x8e: case 0x9a: case 0x9d: case 0xc4: case 0xc5:
+        case 0xca: case 0xcb: case 0xcc: case 0xcd: case 0xce: case 0xcf: case 0xe4: case 0xe5: case 0xe6: case 0xe7:
+        case 0xea: case 0xec: case 0xed: case 0xee: case 0xef: case 0xf1: case 0xf4: case 0xfa: case 0xfb:
+        case 0x6c: case 0x6d: case 0x6e: case 0x6f:
+            return false;
+        case 0xff:
+            return (in->reg & 7) != 3 && (in->reg & 7) != 5 && (in->reg & 7) != 7;
+        default:
+            return true;
+        }
+    }
+    if (op >= 0x200)
+        return true; /* 0F 38 / 0F 3A: SSSE3/SSE4 */
+    int o = op & 0xff;
+    return (o >= 0x80 && o <= 0x8f) || (o >= 0x90 && o <= 0x9f) || (o >= 0x40 && o <= 0x4f) || o == 0xaf ||
+           o == 0xb6 || o == 0xb7 || o == 0xbe || o == 0xbf || o == 0xa3 || o == 0xab || o == 0xb3 || o == 0xbb ||
+           o == 0xba || o == 0xbc || o == 0xbd || o == 0xb8 || o == 0xc0 || o == 0xc1 || o == 0xb0 || o == 0xb1 ||
+           o == 0xa4 || o == 0xa5 || o == 0xac || o == 0xad || o == 0x1f || o == 0x0d || o == 0x18 ||
+           (o >= 0xc8 && o <= 0xcf) || (o >= 0x10 && o <= 0x17) || (o >= 0x28 && o <= 0x2f) ||
+           (o >= 0x50 && o <= 0x7f) || (o >= 0xc2 && o <= 0xc6) || o >= 0xd0;
+}
+
+char x86_jit_dis_path[256]; /* depuracao (CLI "jitdis ARQ") */
+
 static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const bool *dead, jinsn *ins, bool *stored,
                            bool *ended_out)
 {
@@ -2571,13 +3398,23 @@ static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const b
 
     /* prologo: orcamento de instrucoes (corrigido no fim). O bloco roda se ainda ha
      * orcamento, mesmo que ultrapasse um pouco o fim da fatia. */
-    a64_ldr(a, 8, 9, RC, OFF(jit_budget));
-    a64_addsub_imm(a, 1, 1, 1, XZR, 9, 0, 0);
-    uint32_t *blt = a64_here(a);
-    a64_bcond(a, A_LE, a64_here(a));
-    uint32_t *sub_at = a64_here(a);
-    a64_sub_imm(a, 9, 9, 0);
-    a64_str(a, 8, 9, RC, OFF(jit_budget));
+    uint32_t *blt, *sub_at;
+    if (j->off & 2048) { /* MVM_JIT_OFF=2048: orcamento so em memoria (como antes) */
+        a64_ldr(a, 8, 9, RC, OFF(jit_budget));
+        a64_addsub_imm(a, 1, 1, 1, XZR, 9, 0, 0);
+        blt = a64_here(a);
+        a64_bcond(a, A_LE, a64_here(a));
+        sub_at = a64_here(a);
+        a64_sub_imm(a, 9, 9, 0);
+        a64_str(a, 8, 9, RC, OFF(jit_budget));
+        a64_mov(a, 1, RBUD, 9);
+    } else {
+        a64_addsub_imm(a, 1, 1, 1, XZR, RBUD, 0, 0); /* cmp x29, #0 */
+        blt = a64_here(a);
+        a64_bcond(a, A_LE, a64_here(a));
+        sub_at = a64_here(a);
+        a64_sub_imm(a, RBUD, RBUD, 0);
+    }
 
     uint64_t rip = b->rip;
     unsigned n = 0;
@@ -2590,13 +3427,25 @@ static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const b
         jinsn in;
         if (unlikely(c->brk) && rip == c->brk) /* MVM_X86_BREAK: fica com o interpretador */
             break;
-        if (!decode(c, page + off, (int)(0x1000 - off), rip, &in) || j->skip[in.op & 0x1ff])
+        bool xpage = false;
+        if (!decode(c, page + off, (int)(0x1000 - off), rip, &in)) {
+            if (!xpage_decode(x, page, off, rip, &in))
+                break;
+            xpage = true;
+        }
+        if (j->skip[in.op & 0x1ff])
             break;
         uint32_t *save = a->p;
         jctx snap = *x; /* estado de compilacao (flags, saidas, cache de registradores) */
         x->stored = false;
         x->dead = dead ? dead[n] : false;
-        int r = emit_insn(x, &in);
+        x->rip_pending = false;
+        int r = 1;
+        if (xpage)
+            emit_icall(x, &in);
+        else
+            r = emit_insn(x, &in);
+        x->rip_pending = false;
         if (r < 0) { /* nao suportada: desfaz o que foi emitido */
             *x = snap;
             a->p = save;
@@ -2613,12 +3462,18 @@ static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const b
         }
         if (x->stored) {
             /* uma escrita pelo caminho lento invalidou codigo traduzido (talvez este
-             * bloco): sai depois da instrucao completa */
+             * bloco): sai depois da instrucao completa. A saida fica fora da linha. */
             a64_ldr(a, 4, 9, RC, OFF(jit_smc));
-            uint32_t *jok = a64_here(a);
-            a64_cbz(a, 0, 9, a64_here(a));
-            emit_exit_next(x, rip, false);
-            a64_patch(jok, a64_here(a));
+            uint32_t *jbad = a64_here(a);
+            a64_cbnz(a, 0, 9, a64_here(a));
+            if (cold_begin(x, jbad, NULL)) {
+                emit_exit_next(x, rip, false);
+                cold_end_exit(x);
+            } else {
+                *jbad ^= 1u << 24; /* CBNZ -> CBZ: pula a saida em linha */
+                emit_exit_next(x, rip, false);
+                a64_patch(jbad, a64_here(a));
+            }
         }
     }
     if (n && !ended)
@@ -2630,6 +3485,7 @@ static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const b
     a64_str(a, 8, 9, RC, OFF(rip));
     a64_str(a, 8, XZR, RC, OFF(jit_exit));
     a64_b(a, j->exit_stub);
+    cold_flush(x);
     *sub_at = (*sub_at & ~(0xfffu << 10)) | (n << 10);
     *ended_out = ended;
     return n;
@@ -2668,6 +3524,7 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
         x.a.end = j->code_end;
         rc_reset(&x);
         x.rc_on = !(j->off & 32);
+        x.ccop_mem = -1;
         memset(b->exit, 0, sizeof(b->exit));
         if (pass == 0) {
             n = emit_block(&x, page, j->max_insns, NULL, ins, stored, &ended);
@@ -2690,7 +3547,9 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
             unsigned n2 = emit_block(&x, page, n, dead, ins, stored, &ended);
             if (n2 != n) { /* nao deveria acontecer: refaz sem a otimizacao */
                 x.a.p = b->code;
+                x.ncold = x.nm2c = x.nc2m = 0;
                 rc_reset(&x);
+                x.ccop_mem = -1;
                 memset(b->exit, 0, sizeof(b->exit));
                 x.nexit = 0;
                 n = emit_block(&x, page, n, NULL, ins, stored, &ended);
@@ -2698,6 +3557,12 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
         }
     }
     if (n == 0) { /* primeira instrucao nao suportada: marca para o interpretador */
+        if (j->stats && c->cpl == 3 && j->n_interp_log < 40) {
+            j->n_interp_log++;
+            unsigned o = (unsigned)(lin & 0xfff);
+            LOGI("JIT: bloco interpretado em %llx (pagina+%03x): %02x %02x %02x %02x", (unsigned long long)lin, o, page[o],
+                 o < 0xfff ? page[o + 1] : 0, o < 0xffe ? page[o + 2] : 0, o < 0xffd ? page[o + 3] : 0);
+        }
         b->interp = true;
         b->code = NULL;
         return b;
@@ -2713,6 +3578,12 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
     static int dis_init;
     if (!dis_init++ && getenv("MVM_JIT_DISASM"))
         dis = fopen(getenv("MVM_JIT_DISASM"), "w");
+    if (unlikely(x86_jit_dis_path[0])) { /* CLI "jitdis ARQ": comeca a gravar com a VM rodando */
+        if (dis)
+            fclose(dis);
+        dis = fopen(x86_jit_dis_path, "w");
+        x86_jit_dis_path[0] = 0;
+    }
     if (dis) { /* MVM_JIT_DISASM=arquivo: "# rip ninsn" + palavras do codigo (objdump -b binary) */
         fprintf(dis, "# %llx %u %p\n", (unsigned long long)b->rip, n, (void *)b->code);
         for (uint32_t *w = b->code; w < j->pos; w++)
@@ -2729,10 +3600,21 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
     return b;
 }
 
+/* depuracao (CLI "jitoff N"): troca os bits de MVM_JIT_OFF com a VM rodando, para medir A/B */
+volatile long x86_jit_new_off = -1;
+
 int64_t x86_jit_run(x86_cpu *c, int64_t budget)
 {
     struct x86_jit *j = c->jit;
     if (!j)
+        return -1;
+    if (unlikely(x86_jit_new_off >= 0)) {
+        j->off = (unsigned)x86_jit_new_off;
+        x86_jit_new_off = -1;
+        x86_jit_flush(j);
+        LOGI("JIT: MVM_JIT_OFF=0x%x", j->off);
+    }
+    if (unlikely(j->off & 0x40000000u)) /* depuracao: so o interpretador */
         return -1;
     if (!mode_ok(c)) {
         j->ret_nomode++;
@@ -2766,6 +3648,16 @@ int64_t x86_jit_run(x86_cpu *c, int64_t budget)
         else
             j->ret_budget++;
         return -1;
+    }
+    if (j->stats && e) {
+        j->nochain[0]++;
+        if (j->n_flush != flushes) j->nochain[1]++;
+        else if (!e->blk->valid) j->nochain[2]++;
+        else if (e->target != c->rip) j->nochain[3]++;
+        else if (e->blk->mode != mode) j->nochain[4]++;
+        else if (e->blk->csbase != csbase) j->nochain[5]++;
+        else if ((e->blk->phys >> 12) != (phys >> 12)) j->nochain[6]++;
+        else j->nochain[7]++;
     }
     /* encadeia a saida anterior com este bloco (mesma pagina fisica, modo e CS) */
     if (e && j->n_flush == flushes && e->blk->valid && e->target == c->rip && e->blk->mode == mode &&
@@ -2833,8 +3725,10 @@ static void build_stubs(struct x86_jit *j)
     a64_mov(a, 1, RC, 0);
     a64_mov(a, 1, RTLB, 2);
     a64_mov(a, 1, RJC, 3);
+    a64_ldr(a, 8, RBUD, RC, OFF(jit_budget));
     a64_br(a, 1);
     j->exit_stub = a64_here(a);
+    a64_str(a, 8, RBUD, RC, OFF(jit_budget));
     a64_ldp(a, 19, 20, XSP, 16);
     a64_ldp(a, 21, 22, XSP, 32);
     a64_ldp(a, 23, 24, XSP, 48);
@@ -2881,6 +3775,8 @@ struct x86_jit *x86_jit_new(x86_cpu *c)
         j->max_insns = (unsigned)atoi(mi);
     if (getenv("MVM_JIT_OFF"))
         j->off = (unsigned)strtoul(getenv("MVM_JIT_OFF"), NULL, 0);
+    if (getenv("MVM_JIT_S2OFF")) /* depuracao: bit k desliga o tipo S2_k do SSE nativo */
+        x86_jit_s2_off = (long)strtoul(getenv("MVM_JIT_S2OFF"), NULL, 0);
     const char *sk = getenv("MVM_JIT_SKIP");
     for (const char *q = sk; q && *q;) {
         char *endp;
@@ -2999,6 +3895,10 @@ void x86_jit_stats(struct x86_jit *j)
     if (j && j->stats) {
         for (int k = 1; k < EX_N; k++)
             LOGI("JIT:   saidas por %s: %llu", ex_names[k], (unsigned long long)j->exit_why[k]);
+        LOGI("JIT:   saidas com registro %llu: flush %llu, invalido %llu, outro rip %llu, modo %llu, cs %llu, outra pagina %llu, encadeadas %llu",
+             (unsigned long long)j->nochain[0], (unsigned long long)j->nochain[1], (unsigned long long)j->nochain[2],
+             (unsigned long long)j->nochain[3], (unsigned long long)j->nochain[4], (unsigned long long)j->nochain[5],
+             (unsigned long long)j->nochain[6], (unsigned long long)j->nochain[7]);
         LOGI("JIT:   retornos ao interpretador: bloco interpretado %llu, orcamento %llu, modo %llu, sem pagina %llu",
              (unsigned long long)j->ret_interp, (unsigned long long)j->ret_budget, (unsigned long long)j->ret_nomode,
              (unsigned long long)j->ret_nopage);

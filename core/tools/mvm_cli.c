@@ -333,8 +333,25 @@ static void *control_thread(void *arg)
                         fputs("(tela fora do modo texto)\n", o);
                     fclose(o);
                 }
+            } else if (!strcmp(line, "icount")) { /* instrucoes executadas + tempo (MIPS de um trecho) */
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                fprintf(stderr, "[mvm-cli] icount %llu t=%.3f\n", (unsigned long long)mvm_instruction_count(g_vm),
+                        (double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
             } else if (!strcmp(line, "profreset")) { /* MVM_PROF: descarta as amostras ate aqui */
                 g_prof_n = 0;
+            } else if (!strncmp(line, "jitoff ", 7)) { /* depuracao: bits de MVM_JIT_OFF em tempo de execucao */
+                extern volatile long x86_jit_new_off;
+                x86_jit_new_off = strtol(line + 7, NULL, 0);
+            } else if (!strncmp(line, "jitdis ", 7)) { /* depuracao: grava o codigo dos blocos traduzidos daqui em diante */
+                extern char x86_jit_dis_path[256];
+                extern volatile long x86_jit_new_off;
+                snprintf(x86_jit_dis_path, sizeof(x86_jit_dis_path), "%s", line + 7);
+                x86_jit_new_off = 0; /* esvazia o cache para retraduzir */
+            } else if (!strncmp(line, "jits2 ", 6)) { /* depuracao: desliga tipos do SSE nativo (e esvazia o JIT) */
+                extern volatile long x86_jit_new_off, x86_jit_s2_off;
+                x86_jit_s2_off = strtol(line + 6, NULL, 0);
+                x86_jit_new_off = 0;
             } else if (!strncmp(line, "shot ", 5)) {
                 write_ppm(line + 5);
             } else if (!strncmp(line, "mouse ", 6)) { /* mouse DX DY [BOTOES] (relativo, PS/2) */
@@ -586,6 +603,7 @@ static void usage(void)
             "      --vnc [ADDR:]N    servidor VNC na porta 5900+N (padrao so 127.0.0.1; ex.: 0.0.0.0:1)\n"
             "      --vnc-password S  senha do VNC (ate 8 caracteres)\n"
             "      --ide             discos -d/-r no controlador IDE (padrao com --bios)\n"
+            "      --virtio          discos -d/-r em virtio-blk tambem com --bios (Linux; o SeaBIOS da boot por eles)\n"
             "      --boot ORDEM      ordem de boot com BIOS: c=disco d=CD a=disquete (ex.: dca)\n"
             "      --vgabios ARQ     ROM de video (padrao: vgabios-stdvga.bin ao lado da BIOS)\n"
             "      --text            imprime a tela em modo texto ao sair\n"
@@ -611,14 +629,14 @@ int main(int argc, char **argv)
 {
     mvm_config cfg;
     mvm_config_init(&cfg, MVM_ARCH_ARM64);
-    int arch = -1, ndisk = 0, use_ide = 0, use_sata = 0, dump_text = 0;
+    int arch = -1, ndisk = 0, use_ide = 0, use_sata = 0, use_virtio = 0, dump_text = 0;
     const char *fb_dump = NULL;
     static struct option opts[] = {
         {"arch", required_argument, 0, 'a'}, {"memory", required_argument, 0, 'm'},
         {"kernel", required_argument, 0, 'k'}, {"initrd", required_argument, 0, 'i'},
         {"cmdline", required_argument, 0, 'c'}, {"disk", required_argument, 0, 'd'},
         {"readonly", required_argument, 0, 'r'}, {"dtb", required_argument, 0, 1},
-        {"cdrom", required_argument, 0, 6}, {"ide", no_argument, 0, 7}, {"sata", no_argument, 0, 14}, {"no-reboot", no_argument, 0, 15}, {"rtc", required_argument, 0, 16}, {"boot", required_argument, 0, 8}, {"fda", required_argument, 0, 17}, {"fda-ro", required_argument, 0, 18},
+        {"cdrom", required_argument, 0, 6}, {"ide", no_argument, 0, 7}, {"sata", no_argument, 0, 14}, {"virtio", no_argument, 0, 40}, {"no-reboot", no_argument, 0, 15}, {"rtc", required_argument, 0, 16}, {"boot", required_argument, 0, 8}, {"fda", required_argument, 0, 17}, {"fda-ro", required_argument, 0, 18},
         {"net", required_argument, 0, 19}, {"hostfwd", required_argument, 0, 20}, {"dns", required_argument, 0, 21},
         {"audio", required_argument, 0, 22}, {"audio-wav", required_argument, 0, 23}, {"audio-in", required_argument, 0, 24},
         {"vnc", required_argument, 0, 25}, {"vnc-password", required_argument, 0, 26},
@@ -752,6 +770,7 @@ int main(int argc, char **argv)
                 cfg.audio.model = MVM_SND_AUTO;
             break;
         case 7: use_ide = 1; break;
+        case 40: use_virtio = 1; break;
         case 15: no_reboot = 1; break;
         case 16: {
             struct tm tm;
@@ -788,6 +807,10 @@ int main(int argc, char **argv)
         return 2;
     }
     cfg.arch = (mvm_arch)arch;
+    if (use_virtio)
+        for (int i = 0; i < ndisk; i++)
+            if (cfg.disks[i].type == MVM_DISK_AUTO)
+                cfg.disks[i].type = MVM_DISK_VIRTIO;
     if (use_ide)
         for (int i = 0; i < ndisk; i++)
             if (cfg.disks[i].type == MVM_DISK_AUTO)

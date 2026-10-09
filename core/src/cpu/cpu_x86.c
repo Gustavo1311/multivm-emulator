@@ -542,11 +542,21 @@ uint8_t x86_fetch8_slow(x86_cpu *c)
     c->ip_left = 0; /* o resto da instrucao tambem vai pelo caminho lento */
     uint64_t lin = c->code64 ? c->rip : (uint32_t)(c->seg[S_CS].base + c->rip);
     c->rip++;
-    if (!c->code64 && c->csz == 2)
+    if (!c->code64 && c->csz == 2) {
         c->rip &= 0xffff;
-    if (likely((lin & ~0xfffULL) == c->fetch_page))
-        return c->fetch_host[lin & 0xfff];
-    return fetch_slow(c, lin);
+        if (likely((lin & ~0xfffULL) == c->fetch_page))
+            return c->fetch_host[lin & 0xfff];
+        return fetch_slow(c, lin);
+    }
+    uint8_t v = likely((lin & ~0xfffULL) == c->fetch_page) ? c->fetch_host[lin & 0xfff] : fetch_slow(c, lin);
+    /* pagina resolvida (instrucao chamada pelo JIT, ou que comecou em outra pagina): os
+     * proximos bytes da mesma pagina voltam ao caminho rapido */
+    unsigned off = (unsigned)(lin & 0xfff) + 1;
+    if ((lin & ~0xfffULL) == c->fetch_page && off < 0x1000) {
+        c->ip_ptr = c->fetch_host + off;
+        c->ip_left = 0x1000 - off < 14 ? 0x1000 - off : 14;
+    }
+    return v;
 }
 
 uint32_t x86_fetch32_slow(x86_cpu *c)
@@ -1752,6 +1762,12 @@ static void trace_record(x86_cpu *c)
     uint8_t *p = (lin & ~0xfffULL) == c->fetch_page ? c->fetch_host + (lin & 0xfff) : NULL;
     for (int i = 0; i < 6; i++)
         t->bytes[i] = (p && (lin & 0xfff) + (uint64_t)i < 0x1000) ? p[i] : 0;
+    /* processo de usuario de 64 bits saltou para um endereco baixo: grava o rastro */
+    if (c->cpl == 3 && c->code64 && c->rip < 0x100000 && !c->trace_dumped) {
+        c->trace_dumped = true;
+        x86_debug_dump(c);
+        trace_dump(c, "salto de usuario para endereco baixo");
+    }
 }
 
 static void sample_dump(x86_cpu *c)
@@ -1769,8 +1785,8 @@ static void sample_dump(x86_cpu *c)
         x86_debug_symbolize(c, c->rip, sym, sizeof(sym));
         x86_guest_process(c, proc, sizeof(proc));
     }
-    LOGI("x86: amostra %04x:%llx cpl=%d if=%d hlt=%d [%s] %s irqs:%s", c->seg[S_CS].sel, (unsigned long long)c->rip,
-         c->cpl, !!(c->eflags & EFL_IF), c->halted, proc, sym, buf);
+    LOGI("x86: amostra %04x:%llx cpl=%d if=%d hlt=%d cr3=%llx [%s] %s irqs:%s", c->seg[S_CS].sel, (unsigned long long)c->rip,
+         c->cpl, !!(c->eflags & EFL_IF), c->halted, (unsigned long long)(c->cr3 & ~0xfffULL), proc, sym, buf);
 }
 
 /* nome do processo atual do Windows x64 (EPROCESS.ImageFileName, procurado por ser
@@ -1890,6 +1906,12 @@ static bool dbg_read(x86_cpu *c, uint64_t lin, void *out, size_t n)
         o[i] = *h;
     }
     return true;
+}
+
+/* le bytes de codigo sem gerar falta de pagina (o JIT so os usa para decodificar) */
+bool x86_peek_code(x86_cpu *c, uint64_t lin, void *out, size_t n)
+{
+    return dbg_read(c, lin, out, n);
 }
 
 /* MVM_DBG_DUMPDIR=dir: grava a imagem de cada modulo simbolizado (uma vez) em dir/NOME@BASE.bin */
@@ -2146,7 +2168,7 @@ static int64_t x86_run(void *opaque, int64_t budget)
         }
         if (unlikely(c->halted || atomic_load_explicit(&c->vm->cpu_exit, memory_order_relaxed)))
             break;
-        if (likely(c->jit != NULL) && !c->trace) {
+        if (likely(c->jit != NULL) && (!c->trace || c->trace_jit)) {
             int64_t done = x86_jit_run(c, budget - n);
             if (done > 0) {
                 n += done;
@@ -2323,6 +2345,8 @@ void *x86_cpu_new(mvm_vm *vm, bool lm)
     if (tr && atoi(tr) > 0) {
         c->trace_n = (unsigned)atoi(tr);
         c->trace = calloc(c->trace_n, sizeof(*c->trace));
+        /* MVM_X86_TRACE_JIT=1: o JIT continua ligado (so o que o interpretador executa entra no rastro) */
+        c->trace_jit = getenv("MVM_X86_TRACE_JIT") != NULL;
     }
     const char *ts = getenv("MVM_X86_TRACE_STOP");
     if (ts)

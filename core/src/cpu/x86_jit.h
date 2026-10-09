@@ -20,6 +20,7 @@ void x86_jit_note_interp(x86_cpu *c);
 void x86_jit_tlb_flushed(struct x86_jit *j);
 
 uint8_t *x86_code_host(x86_cpu *c, uint64_t lin, uint64_t *pa);
+bool x86_peek_code(x86_cpu *c, uint64_t lin, void *out, size_t n);
 uint64_t x86_read_slow(x86_cpu *c, uint64_t lin, unsigned size, int user);
 
 #endif
