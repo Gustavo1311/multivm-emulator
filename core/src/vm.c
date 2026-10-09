@@ -342,6 +342,9 @@ static void work_run(mvm_vm *vm)
     }
 }
 
+/* depuracao (teste de atomicidade): ponteiro do host para a RAM do convidado em gpa */
+void *vm_debug_ram_ptr(mvm_vm *vm, uint64_t gpa, uint64_t len) { return space_ram_ptr(&vm->mem, gpa, len, false); }
+
 /* depuracao (CLI "iothread 0|1"): liga/desliga a thread de E/S com a VM rodando */
 void vm_debug_iothread(mvm_vm *vm, int on)
 {

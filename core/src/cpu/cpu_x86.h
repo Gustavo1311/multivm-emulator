@@ -193,6 +193,14 @@ typedef struct x86_cpu {
     struct x86_trace { uint64_t rip, rsp, fl, rax; uint16_t cs; uint8_t bytes[6]; } *trace;
     unsigned trace_n, trace_pos;
     bool trace_dumped, trace_jit;
+    bool smp;            /* varias CPUs (ou MVM_SMP_FORCE): ordem TSO e LOCK atomico */
+    /* instrucao LOCK em execucao no modo SMP: a 1a leitura fixa o operando travado e a
+     * escrita nele vira compare-and-swap na memoria do host (lk_retry: outra CPU mudou o
+     * valor; a instrucao e desfeita e repetida) */
+    bool lk_on, lk_have, lk_retry, smp_nofence;
+    unsigned lk_size;
+    uint64_t lk_lin, lk_old;
+    uint8_t *lk_host;
     uint64_t brk;        /* MVM_X86_BREAK: grava RAM e registradores ao chegar neste RIP (tambem com JIT) */
     uint64_t trace_stop; /* MVM_X86_TRACE_STOP: grava o rastro ao chegar neste RIP */
     int64_t trace_countdown; /* > 0: grava o rastro apos tantas instrucoes */
@@ -215,8 +223,15 @@ void x86_probe_write(x86_cpu *c, uint64_t lin, unsigned size);
 
 static inline int x86_user(const x86_cpu *c) { return c->cpl == 3; }
 
+uint64_t x86_lk_read(x86_cpu *c, uint64_t lin, unsigned size);
+void x86_lk_write(x86_cpu *c, uint64_t lin, uint64_t v, unsigned size);
+uint8_t *x86_lk_host(x86_cpu *c, uint64_t lin, unsigned size);
+bool x86_cas128(uint8_t *p, uint64_t *lo, uint64_t *hi, uint64_t nlo, uint64_t nhi);
+
 static inline uint64_t x86_rd_lin(x86_cpu *c, uint64_t lin, unsigned size)
 {
+    if (unlikely(c->lk_on))
+        return x86_lk_read(c, lin, size);
     x86_tlbe *e = &c->tlb[x86_user(c)][(lin >> 12) & (X86_TLB_SIZE - 1)];
     if (likely(e->tag_r == (lin & ~0xfffULL)) && likely((lin & 0xfff) + size <= 0x1000))
         return ld_le((const uint8_t *)(e->addend + lin), size);
@@ -225,6 +240,10 @@ static inline uint64_t x86_rd_lin(x86_cpu *c, uint64_t lin, unsigned size)
 
 static inline void x86_wr_lin(x86_cpu *c, uint64_t lin, uint64_t v, unsigned size)
 {
+    if (unlikely(c->lk_on)) {
+        x86_lk_write(c, lin, v, size);
+        return;
+    }
     x86_tlbe *e = &c->tlb[x86_user(c)][(lin >> 12) & (X86_TLB_SIZE - 1)];
     if (likely(e->tag_w == (lin & ~0xfffULL)) && likely((lin & 0xfff) + size <= 0x1000)) {
         st_le((uint8_t *)(e->addend + lin), v, size);

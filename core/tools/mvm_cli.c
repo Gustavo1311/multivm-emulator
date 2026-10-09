@@ -333,6 +333,9 @@ static void *control_thread(void *arg)
                         fputs("(tela fora do modo texto)\n", o);
                     fclose(o);
                 }
+            } else if (!strncmp(line, "smp ", 4)) { /* depuracao: modo SMP (ordem TSO, LOCK atomico) 0/1 */
+                extern volatile long x86_jit_new_smp;
+                x86_jit_new_smp = atoi(line + 4) ? 1 : 0;
             } else if (!strncmp(line, "iothread ", 9)) { /* depuracao: thread de E/S ligada (1) ou nao (0) */
                 extern void vm_debug_iothread(mvm_vm *vm, int on);
                 vm_debug_iothread(g_vm, atoi(line + 9));
@@ -408,6 +411,46 @@ static void *control_thread(void *arg)
         }
         fclose(f);
     }
+    return NULL;
+}
+
+/* MVM_STRESS_ATOMIC=gpa:n (depuracao): uma thread do host faz o papel de outra CPU sobre a
+ * RAM do convidado em gpa: espera o convidado escrever 1 em [gpa+8], faz n incrementos
+ * atomicos em [gpa] e n entradas num spinlock [gpa+16] (CAS) incrementando [gpa+20] sem
+ * atomico, e escreve 1 em [gpa+12] no fim. */
+static void *stress_thread(void *arg)
+{
+    (void)arg;
+    extern void *vm_debug_ram_ptr(mvm_vm *vm, uint64_t gpa, uint64_t len);
+    const char *e = getenv("MVM_STRESS_ATOMIC");
+    uint64_t gpa = strtoull(e, NULL, 0);
+    const char *c = strchr(e, ':');
+    long n = c ? atol(c + 1) : 1000000;
+    uint32_t *p = NULL;
+    while (!p && !g_quit) {
+        p = vm_debug_ram_ptr(g_vm, gpa, 64);
+        if (!p) usleep(1000);
+    }
+    while (!g_quit && !__atomic_load_n(&p[2], __ATOMIC_ACQUIRE))
+        usleep(100);
+    for (long i = 0; i < n && !g_quit; i++) {
+        __atomic_fetch_add(&p[0], 1, __ATOMIC_SEQ_CST);
+        uint32_t z = 0;
+        while (!__atomic_compare_exchange_n(&p[4], &z, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            z = 0;
+        uint32_t v = *(volatile uint32_t *)&p[5]; /* secao critica sem atomico */
+        *(volatile uint32_t *)&p[5] = v + 1;
+        __atomic_store_n(&p[4], 0, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&p[3], 1, __ATOMIC_RELEASE);
+    /* fase 2 (ordem das leituras): grava dado [gpa+32] e depois marca [gpa+36] */
+    while (!g_quit && !__atomic_load_n(&p[6], __ATOMIC_ACQUIRE))
+        usleep(100);
+    for (uint32_t k = 1; k <= (uint32_t)n && !g_quit; k++) {
+        __atomic_store_n(&p[8], k, __ATOMIC_RELAXED);
+        __atomic_store_n(&p[9], k, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&p[10], 1, __ATOMIC_RELEASE);
     return NULL;
 }
 
@@ -886,6 +929,9 @@ int main(int argc, char **argv)
     pthread_t ctl_th;
     if (g_control)
         pthread_create(&ctl_th, NULL, control_thread, NULL);
+    pthread_t st_th;
+    if (getenv("MVM_STRESS_ATOMIC"))
+        pthread_create(&st_th, NULL, stress_thread, NULL);
 
     pthread_t vw_th;
     if (g_viewer)

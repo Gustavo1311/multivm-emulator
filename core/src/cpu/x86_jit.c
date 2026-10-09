@@ -32,6 +32,7 @@
 #if defined(__aarch64__)
 
 #include <sys/mman.h>
+#include <sys/auxv.h>
 
 #include "a64_asm.h"
 
@@ -87,6 +88,8 @@ struct x86_jit {
     uint8_t skip[0x200];    /* MVM_JIT_SKIP=op,op,... opcodes deixados ao interpretador */
     bool stats;             /* MVM_JIT_STATS=1 */
     unsigned n_interp_log;
+    bool smp;               /* varias CPUs (ou MVM_SMP_FORCE): ordem TSO e atomicos de verdade */
+    bool lrcpc;             /* host com LDAPR (ARMv8.3) */
     long off_gen;           /* geracao de x86_jit_new_off ja aplicada (CLI "jitoff") */
     struct jinsn_s *tr_ins; /* buffers do tradutor (por JIT: cada CPU traduz na sua thread) */
     bool *tr_stored, *tr_dead;
@@ -120,7 +123,7 @@ typedef struct {
     int osz, asz;
     uint8_t rex;
     int seg;                /* -1 = padrao */
-    bool rep, repne, p66;
+    bool rep, repne, p66, lock;
     bool modrm, mem;
     int mod, reg, rm;       /* reg/rm ja com REX */
     int base, index, scale; /* -1 = ausente */
@@ -256,7 +259,7 @@ static bool decode(x86_cpu *c, const uint8_t *p, int max, uint64_t rip, jinsn *i
         case 0x3e: in->seg = S_DS; in->rex = 0; i++; continue;
         case 0x64: in->seg = S_FS; in->rex = 0; i++; continue;
         case 0x65: in->seg = S_GS; in->rex = 0; i++; continue;
-        case 0xf0: in->rex = 0; i++; continue; /* LOCK: uma CPU so, nada a fazer */
+        case 0xf0: in->lock = true; in->rex = 0; i++; continue; /* LOCK: so importa no modo SMP */
         case 0xf2: in->repne = true; in->rep = false; in->rex = 0; i++; continue;
         case 0xf3: in->rep = true; in->repne = false; in->rex = 0; i++; continue;
         default: break;
@@ -695,8 +698,19 @@ static void emit_ea(jctx *x, jinsn *in)
     }
 }
 
-static uint64_t jit_rd(x86_cpu *c, uint64_t lin, uint64_t size) { return x86_read_slow(c, lin, (unsigned)size, x86_user(c)); }
-static void jit_wr(x86_cpu *c, uint64_t lin, uint64_t v, uint64_t size) { x86_write_slow(c, lin, v, (unsigned)size, x86_user(c)); }
+static uint64_t jit_rd(x86_cpu *c, uint64_t lin, uint64_t size)
+{
+    uint64_t v = x86_read_slow(c, lin, (unsigned)size, x86_user(c));
+    if (c->smp)
+        __atomic_thread_fence(__ATOMIC_ACQUIRE); /* ordem do x86 tambem no caminho lento */
+    return v;
+}
+static void jit_wr(x86_cpu *c, uint64_t lin, uint64_t v, uint64_t size)
+{
+    if (c->smp)
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    x86_write_slow(c, lin, v, (unsigned)size, x86_user(c));
+}
 
 /* x9 = &tlb[idx]; salta para 'slow' se a pagina nao bate (tag em 'tag_off') ou se o acesso cruza a pagina */
 static void emit_tlb(jctx *x, int addr, int size, uint32_t tag_off, uint32_t **slow1, uint32_t **slow2)
@@ -728,6 +742,103 @@ static void emit_tlb(jctx *x, int addr, int size, uint32_t tag_off, uint32_t **s
         }
     }
     a64_ldr(a, 8, 10, 9, (uint32_t)offsetof(x86_tlbe, addend));
+}
+
+/* Acesso a memoria do convidado em [x10 + REA] (x10 = soma do TLB). No modo SMP segue a
+ * ordem de memoria do x86 (TSO): leituras com acquire (LDAPR, ou LDAR sem LRCPC), escritas
+ * com release (STLR); vetores com DMB. Com uma CPU, LDR/STR comuns. */
+static bool cold_begin(jctx *x, uint32_t *s1, uint32_t *s2);
+static void cold_end(jctx *x, uint32_t *done);
+
+/* LDAPR/LDAR/STLR exigem alinhamento; o x86 aceita acesso desalinhado: confere e, se
+ * desalinhado, vai para um trecho fora da linha com LDR/STR comum e barreira */
+static uint32_t *g_align_check(jctx *x, int size)
+{
+    if (size == 1)
+        return NULL;
+    uint32_t enc = 0;
+    a64_encode_bitmask((uint64_t)(size - 1), 1, &enc);
+    a64_logic_imm(&x->a, 1, 3, XZR, 9, enc); /* tst x9, #size-1 */
+    uint32_t *br = a64_here(&x->a);
+    a64_bcond(&x->a, A_NE, a64_here(&x->a));
+    return br;
+}
+
+static void g_ld(jctx *x, int size, int rt)
+{
+    a64 *a = &x->a;
+    if (!x->j->smp || (x->j->off & 65536)) { /* 65536: depuracao, leituras sem ordem */
+        a64_ldr_reg(a, size, rt, 10, REA);
+        return;
+    }
+    a64_add(a, 9, 10, REA);
+    if (x->j->off & 32768) { /* sem trechos fora da linha: LDR + barreira sempre */
+        a64_ldr_reg(a, size, rt, 9, XZR);
+        a64_dmb(a, A64_DMB_ISHLD);
+        return;
+    }
+    uint32_t *br = g_align_check(x, size);
+    if (x->j->lrcpc)
+        a64_ldapr(a, size, rt, 9);
+    else
+        a64_ldar(a, size, rt, 9);
+    if (br && cold_begin(x, br, NULL)) {
+        uint32_t *done = x->hot_p;
+        a64_ldr_reg(a, size, rt, 9, XZR);
+        a64_dmb(a, A64_DMB_ISHLD);
+        cold_end(x, done);
+    } else if (br) { /* sem espaco fora da linha: o trecho desalinhado fica em linha */
+        uint32_t *jdone = a64_here(a);
+        a64_b(a, a64_here(a));
+        a64_patch(br, a64_here(a));
+        a64_ldr_reg(a, size, rt, 9, XZR);
+        a64_dmb(a, A64_DMB_ISHLD);
+        a64_patch(jdone, a64_here(a));
+    }
+}
+
+static void g_st(jctx *x, int size, int rt)
+{
+    a64 *a = &x->a;
+    if (!x->j->smp || (x->j->off & 131072)) { /* 131072: depuracao, escritas sem ordem */
+        a64_str_reg(a, size, rt, 10, REA);
+        return;
+    }
+    a64_add(a, 9, 10, REA);
+    if (x->j->off & 32768) {
+        a64_dmb(a, A64_DMB_ISH);
+        a64_str_reg(a, size, rt, 9, XZR);
+        return;
+    }
+    uint32_t *br = g_align_check(x, size);
+    a64_stlr(a, size, rt, 9);
+    if (br && cold_begin(x, br, NULL)) {
+        uint32_t *done = x->hot_p;
+        a64_dmb(a, A64_DMB_ISH);
+        a64_str_reg(a, size, rt, 9, XZR);
+        cold_end(x, done);
+    } else if (br) {
+        uint32_t *jdone = a64_here(a);
+        a64_b(a, a64_here(a));
+        a64_patch(br, a64_here(a));
+        a64_dmb(a, A64_DMB_ISH);
+        a64_str_reg(a, size, rt, 9, XZR);
+        a64_patch(jdone, a64_here(a));
+    }
+}
+
+static void g_ldq(jctx *x, int vt)
+{
+    a64_ldr_q_reg(&x->a, vt, 10, REA);
+    if (x->j->smp)
+        a64_dmb(&x->a, A64_DMB_ISHLD);
+}
+
+static void g_stq(jctx *x, int vt)
+{
+    if (x->j->smp)
+        a64_dmb(&x->a, A64_DMB_ISH); /* leituras e escritas anteriores antes desta escrita */
+    a64_str_q_reg(&x->a, vt, 10, REA);
 }
 
 /* Caminho lento fora da linha: os desvios s1/s2 do caminho rapido vao para um trecho
@@ -800,7 +911,7 @@ static void emit_load(jctx *x, int dst, int size)
     a64 *a = &x->a;
     uint32_t *s1, *s2;
     emit_tlb(x, REA, size, (uint32_t)offsetof(x86_tlbe, tag_r), &s1, &s2);
-    a64_ldr_reg(a, size, dst, 10, REA);
+    g_ld(x, size, dst);
     if (cold_begin(x, s1, s2)) {
         uint32_t *done = x->hot_p;
         a64_mov(a, 1, 0, RC);
@@ -839,7 +950,7 @@ static void emit_store(jctx *x, int src, int size, uint64_t next_rip)
     a64 *a = &x->a;
     uint32_t *s1, *s2;
     emit_tlb(x, REA, size, (uint32_t)offsetof(x86_tlbe, tag_w), &s1, &s2);
-    a64_str_reg(a, size, src, 10, REA);
+    g_st(x, size, src);
     if (cold_begin(x, s1, s2)) {
         uint32_t *done = x->hot_p;
         a64_mov(a, 1, 0, RC);
@@ -1617,7 +1728,7 @@ static bool emit_sse(jctx *x, jinsn *in)
     case SSE_V3:
         if (mem) {
             SSE_TLB(16, tag_r);
-            a64_ldr_q_reg(a, 1, 10, REA);
+            g_ldq(x, 1);
         } else {
             xmm_addr(x, rm);
             a64_ldr_q(a, 1, 12);
@@ -1638,7 +1749,7 @@ static bool emit_sse(jctx *x, jinsn *in)
         a64_ldr_q(a, 0, 12);
         if (mem) {
             SSE_TLB(16, tag_w);
-            a64_str_q_reg(a, 0, 10, REA);
+            g_stq(x, 0);
             x->stored = true;
         } else {
             xmm_addr(x, rm);
@@ -1649,7 +1760,7 @@ static bool emit_sse(jctx *x, jinsn *in)
     case SSE_MOVQ_LD: /* MOVQ xmm, xmm/m64 (zera a parte alta) */
         if (mem) {
             SSE_TLB(sz, tag_r);
-            a64_ldr_reg(a, sz, 11, 10, REA);
+            g_ld(x, sz, 11);
         } else {
             a64_ldr(a, sz, 11, RC, OFF_X(rm));
         }
@@ -1668,7 +1779,7 @@ static bool emit_sse(jctx *x, jinsn *in)
         a64_ldr(a, sz, 12, RC, OFF_X(rg));
         if (mem) {
             SSE_TLB(sz, tag_w);
-            a64_str_reg(a, sz, 12, 10, REA);
+            g_st(x, sz, 12);
             x->stored = true;
         } else {
             a64_str(a, sz, 12, RC, OFF_X(rm));
@@ -1679,7 +1790,7 @@ static bool emit_sse(jctx *x, jinsn *in)
     case SSE_MOVD_LD: /* MOVD/MOVQ xmm, r/m */
         if (mem) {
             SSE_TLB(sz, tag_r);
-            a64_ldr_reg(a, sz, 11, 10, REA);
+            g_ld(x, sz, 11);
         } else {
             ld_greg(x, 11, rm, sz, true);
         }
@@ -1690,7 +1801,7 @@ static bool emit_sse(jctx *x, jinsn *in)
         a64_ldr(a, sz, 12, RC, OFF_X(rg));
         if (mem) {
             SSE_TLB(sz, tag_w);
-            a64_str_reg(a, sz, 12, 10, REA);
+            g_st(x, sz, 12);
             x->stored = true;
         } else {
             st_greg(x, 12, rm, sz, true);
@@ -1837,7 +1948,7 @@ static bool emit_vec(jctx *x, jinsn *in)
         if (mem) {                                                                             \
             VEC_TLB(bytes, tag_r);                                                             \
             if (q)                                                                             \
-                a64_ldr_q_reg(a, 1, 10, REA);                                                  \
+                g_ldq(x, 1);                                                  \
             else                                                                               \
                 a64_put(a, 0xFC606800u | ((uint32_t)REA << 16) | (10u << 5) | 1u);            \
         } else {                                                                               \
@@ -1899,7 +2010,7 @@ static bool emit_vec(jctx *x, jinsn *in)
     case VK_MOVQ_LD: /* movq mm, mm/m64 */
         if (mem) {
             VEC_TLB(8, tag_r);
-            a64_ldr_reg(a, 8, 11, 10, REA);
+            g_ld(x, 8, 11);
         } else {
             a64_ldr(a, 8, 11, RC, OFF_M(rm));
         }
@@ -1909,7 +2020,7 @@ static bool emit_vec(jctx *x, jinsn *in)
         a64_ldr(a, 8, 12, RC, OFF_M(rg));
         if (mem) {
             VEC_TLB(8, tag_w);
-            a64_str_reg(a, 8, 12, 10, REA);
+            g_st(x, 8, 12);
             x->stored = true;
         } else {
             a64_str(a, 8, 12, RC, OFF_M(rm));
@@ -1918,7 +2029,7 @@ static bool emit_vec(jctx *x, jinsn *in)
     case VK_MOVD_LD: /* movd/movq mm, r/m */
         if (mem) {
             VEC_TLB(arg, tag_r);
-            a64_ldr_reg(a, arg, 11, 10, REA);
+            g_ld(x, arg, 11);
         } else {
             ld_greg(x, 11, rm, arg, true);
         }
@@ -1928,7 +2039,7 @@ static bool emit_vec(jctx *x, jinsn *in)
         a64_ldr(a, arg, 12, RC, OFF_M(rg));
         if (mem) {
             VEC_TLB(arg, tag_w);
-            a64_str_reg(a, arg, 12, 10, REA);
+            g_st(x, arg, 12);
             x->stored = true;
         } else {
             st_greg(x, 12, rm, arg, true);
@@ -2047,7 +2158,7 @@ static bool emit_simd2(jctx *x, jinsn *in)
         if (mem) {                                                                             \
             S2_TLB(q ? 16 : 8, tag_r);                                                         \
             if (q)                                                                             \
-                a64_ldr_q_reg(a, 1, 10, REA);                                                  \
+                g_ldq(x, 1);                                                  \
             else                                                                               \
                 fp_ld_mem(a, 1, 8);                                                            \
         } else {                                                                               \
@@ -2138,12 +2249,12 @@ static bool emit_simd2(jctx *x, jinsn *in)
         if (op == 0x13 || op == 0x17) { /* MOVLPS/MOVHPS m64, xmm (valor em x12) */
             a64_ldr(a, 8, 12, RC, OFF_X(rg) + (hi ? 8 : 0));
             S2_TLB(8, tag_w);
-            a64_str_reg(a, 8, 12, 10, REA);
+            g_st(x, 8, 12);
             x->stored = true;
         } else {
             if (mem) {
                 S2_TLB(8, tag_r);
-                a64_ldr_reg(a, 8, 11, 10, REA);
+                g_ld(x, 8, 11);
             } else { /* MOVHLPS (12) / MOVLHPS (16) */
                 a64_ldr(a, 8, 11, RC, OFF_X(rm) + (hi ? 0 : 8));
             }
@@ -2274,7 +2385,7 @@ static bool emit_simd2(jctx *x, jinsn *in)
         int isz = (in->rex & 8) ? 8 : 4;
         if (mem) {
             S2_TLB(isz, tag_r);
-            a64_ldr_reg(a, isz, 11, 10, REA);
+            g_ld(x, isz, 11);
         } else {
             ld_greg(x, 11, rm, isz, true);
         }
@@ -2611,6 +2722,11 @@ static int emit_insn(jctx *x, jinsn *in)
     a64 *a = &x->a;
     int op = in->op, sz = op_size(in);
     bool rex = rexf(in);
+    if (x->j->smp && in->mem && (in->lock || op == 0x86 || op == 0x87)) {
+        /* varias CPUs: LOCK (e XCHG com memoria) no interpretador, com compare-and-swap */
+        emit_icall(x, in);
+        return 1;
+    }
     if (in->icall && (emit_sse(x, in) || (!(x->j->off & 64) && emit_vec(x, in)) ||
                       (!(x->j->off & 128) && emit_simd2(x, in))))
         return 1;
@@ -3605,6 +3721,7 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
 
 /* depuracao (CLI "jitoff N"): troca os bits de MVM_JIT_OFF com a VM rodando, para medir A/B */
 volatile long x86_jit_new_off = -1;
+volatile long x86_jit_new_smp = -1; /* depuracao (CLI "smp 0|1"): troca o modo SMP com a VM rodando */
 volatile long x86_jit_off_gen; /* incrementado a cada "jitoff"/"jits2"/"jitdis" (cada CPU aplica) */
 
 int64_t x86_jit_run(x86_cpu *c, int64_t budget)
@@ -3612,9 +3729,15 @@ int64_t x86_jit_run(x86_cpu *c, int64_t budget)
     struct x86_jit *j = c->jit;
     if (!j)
         return -1;
+    if (unlikely(x86_jit_new_smp >= 0) && (x86_jit_new_smp != 0) != j->smp) {
+        j->smp = c->smp = x86_jit_new_smp != 0;
+        x86_jit_flush(j);
+        LOGI("JIT: modo SMP %s", j->smp ? "ligado" : "desligado");
+    }
     if (unlikely(j->off_gen != x86_jit_off_gen) && x86_jit_new_off >= 0) {
         j->off_gen = x86_jit_off_gen;
         j->off = (unsigned)x86_jit_new_off;
+        c->smp_nofence = (j->off & 262144) != 0;
         x86_jit_flush(j);
         LOGI("JIT: MVM_JIT_OFF=0x%x", j->off);
     }
@@ -3757,6 +3880,12 @@ struct x86_jit *x86_jit_new(x86_cpu *c)
     struct x86_jit *j = calloc(1, sizeof(*j));
     j->c = c;
     j->mem = c->mem;
+    j->smp = c->smp;
+#if defined(__aarch64__) && defined(__linux__)
+    j->lrcpc = (getauxval(AT_HWCAP) & (1UL << 15)) != 0; /* HWCAP_LRCPC */
+#endif
+    if (j->smp)
+        LOGI("JIT: modo SMP (ordem TSO%s)", j->lrcpc ? ", LDAPR" : ", LDAR");
     j->code = mem;
     j->code_end = (uint32_t *)((uint8_t *)mem + CODE_SIZE);
     jc_reset(j);

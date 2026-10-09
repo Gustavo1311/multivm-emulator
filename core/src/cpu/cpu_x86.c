@@ -288,6 +288,21 @@ static void phys_wr(x86_cpu *c, uint64_t pa, uint64_t v, unsigned size)
         space_write(c->mem, pa, v, size);
 }
 
+/* liga bits (A/D) numa entrada de tabela de paginas; no modo SMP com OR atomico, para nao
+ * desfazer uma mudanca que outra CPU tenha feito na entrada desde a leitura */
+static void phys_or(x86_cpu *c, uint64_t pa, uint64_t old, uint64_t bits, unsigned size)
+{
+    uint8_t *p = c->smp ? space_ram_ptr(c->mem, pa, size, true) : NULL;
+    if (p && !(pa & (size - 1))) {
+        if (size == 8)
+            __atomic_fetch_or((uint64_t *)p, bits, __ATOMIC_SEQ_CST);
+        else
+            __atomic_fetch_or((uint32_t *)p, (uint32_t)bits, __ATOMIC_SEQ_CST);
+        return;
+    }
+    phys_wr(c, pa, old | bits, size);
+}
+
 static _Noreturn void page_fault(x86_cpu *c, uint64_t lin, bool present, int acc, int user)
 {
     uint32_t err = (present ? 1 : 0) | (acc == 1 ? 2 : 0) | (user ? 4 : 0);
@@ -358,7 +373,7 @@ static uint64_t walk(x86_cpu *c, uint64_t lin, int acc, int user, int *perm_out)
                 break;
             }
             if (!(e & 0x20))
-                phys_wr(c, a, e | 0x20, 8);
+                phys_or(c, a, e, 0x20, 8);
             table = e & 0x000ffffffffff000ULL;
             shift -= 9;
         }
@@ -380,7 +395,7 @@ static uint64_t walk(x86_cpu *c, uint64_t lin, int acc, int user, int *perm_out)
             leaf = e;
         } else {
             if (!(e & 0x20))
-                phys_wr(c, a, e | 0x20, 8);
+                phys_or(c, a, e, 0x20, 8);
             uint64_t a2 = (e & 0x000ffffffffff000ULL) + ((lin >> 12) & 511) * 8;
             uint64_t e2 = phys_rd(c, a2, 8);
             if (!(e2 & 1))
@@ -407,7 +422,7 @@ static uint64_t walk(x86_cpu *c, uint64_t lin, int acc, int user, int *perm_out)
             leaf = e;
         } else {
             if (!(e & 0x20))
-                phys_wr(c, a, e | 0x20, 4);
+                phys_or(c, a, e, 0x20, 4);
             uint64_t a2 = (e & 0xfffff000u) + ((la >> 12) & 1023) * 4;
             uint32_t e2 = (uint32_t)phys_rd(c, a2, 4);
             if (!(e2 & 1))
@@ -431,7 +446,7 @@ static uint64_t walk(x86_cpu *c, uint64_t lin, int acc, int user, int *perm_out)
     if (acc == 1)
         upd |= 0x40;
     if (upd != leaf)
-        phys_wr(c, leaf_addr, upd, leaf_size);
+        phys_or(c, leaf_addr, leaf, upd & ~leaf, leaf_size);
     int perm = 1;
     bool can_w = pw || (!user && !wp);
     if (can_w && (upd & 0x40)) /* so cacheia escrita se o bit D ja estiver marcado */
@@ -1067,8 +1082,112 @@ static bool exc_has_err(int vec)
            vec == EXC_PF || vec == EXC_AC;
 }
 
+/* ------------------------------------------------------------ LOCK atomico (modo SMP) */
+
+/* Ponteiro do host para [lin, lin+size) pelo caminho rapido de escrita do TLB (RAM comum,
+ * sem codigo traduzido nem VRAM a marcar), alinhado ao tamanho; NULL se nao der (MMIO,
+ * desalinhado). Gera a falta de pagina como uma escrita (o LOCK exige permissao). */
+uint8_t *x86_lk_host(x86_cpu *c, uint64_t lin, unsigned size)
+{
+    x86_probe_write(c, lin, size);
+    if ((lin & (size - 1)) || (lin & 0xfff) + size > 0x1000)
+        return NULL;
+    x86_tlbe *e = &c->tlb[x86_user(c)][(lin >> 12) & (X86_TLB_SIZE - 1)];
+    if (e->tag_w != (lin & ~0xfffULL))
+        return NULL;
+    return (uint8_t *)(e->addend + lin);
+}
+
+static uint64_t atomic_ld_sz(uint8_t *h, unsigned size)
+{
+    switch (size) {
+    case 1: return __atomic_load_n(h, __ATOMIC_ACQUIRE);
+    case 2: return __atomic_load_n((uint16_t *)h, __ATOMIC_ACQUIRE);
+    case 4: return __atomic_load_n((uint32_t *)h, __ATOMIC_ACQUIRE);
+    default: return __atomic_load_n((uint64_t *)h, __ATOMIC_ACQUIRE);
+    }
+}
+
+static bool atomic_cas_sz(uint8_t *h, uint64_t old, uint64_t v, unsigned size)
+{
+    switch (size) {
+    case 1: { uint8_t o = (uint8_t)old; return __atomic_compare_exchange_n(h, &o, (uint8_t)v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
+    case 2: { uint16_t o = (uint16_t)old; return __atomic_compare_exchange_n((uint16_t *)h, &o, (uint16_t)v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
+    case 4: { uint32_t o = (uint32_t)old; return __atomic_compare_exchange_n((uint32_t *)h, &o, (uint32_t)v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
+    default: { uint64_t o = old; return __atomic_compare_exchange_n((uint64_t *)h, &o, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
+    }
+}
+
+/* 1a leitura numa instrucao LOCK: o operando travado (leitura atomica) */
+uint64_t x86_lk_read(x86_cpu *c, uint64_t lin, unsigned size)
+{
+    c->lk_on = false;
+    uint64_t v;
+    if (c->lk_have) { /* outra leitura: o mesmo operando devolve o valor ja lido */
+        v = lin == c->lk_lin && size == c->lk_size ? c->lk_old : x86_rd_lin(c, lin, size);
+        c->lk_on = true;
+        return v;
+    }
+    c->lk_have = true;
+    c->lk_lin = lin;
+    c->lk_size = size;
+    c->lk_host = size <= 8 ? x86_lk_host(c, lin, size) : NULL;
+    v = c->lk_host ? atomic_ld_sz(c->lk_host, size) : x86_rd_lin(c, lin, size); /* MMIO/desalinhado: sem garantia */
+    c->lk_old = v;
+    c->lk_on = true;
+    return v;
+}
+
+/* escrita numa instrucao LOCK: no operando travado vira compare-and-swap */
+void x86_lk_write(x86_cpu *c, uint64_t lin, uint64_t v, unsigned size)
+{
+    if (c->lk_have && c->lk_host && lin == c->lk_lin && size == c->lk_size) {
+        if (!atomic_cas_sz(c->lk_host, c->lk_old, v, size))
+            c->lk_retry = true; /* outra CPU mudou o valor: a instrucao sera repetida */
+        return;
+    }
+    c->lk_on = false;
+    x86_wr_lin(c, lin, v, size);
+    c->lk_on = true;
+}
+
+/* CMPXCHG16B atomico: compara [p] com (*lo,*hi) e grava (nlo,nhi); senao devolve o valor
+ * atual em (*lo,*hi). LDAXP/STLXP (ARMv8.0); a leitura so vale com o STLXP aceito. */
+bool x86_cas128(uint8_t *p, uint64_t *lo, uint64_t *hi, uint64_t nlo, uint64_t nhi)
+{
+#if defined(__aarch64__)
+    for (;;) {
+        uint64_t olo, ohi;
+        uint32_t fail;
+        __asm__ volatile("ldaxp %0, %1, [%2]" : "=&r"(olo), "=&r"(ohi) : "r"(p) : "memory");
+        bool eq = olo == *lo && ohi == *hi;
+        uint64_t wlo = eq ? nlo : olo, whi = eq ? nhi : ohi;
+        __asm__ volatile("stlxp %w0, %1, %2, [%3]" : "=&r"(fail) : "r"(wlo), "r"(whi), "r"(p) : "memory");
+        if (fail)
+            continue;
+        if (!eq) {
+            *lo = olo;
+            *hi = ohi;
+        }
+        return eq;
+    }
+#else
+    uint64_t *q = (uint64_t *)p;
+    bool eq = q[0] == *lo && q[1] == *hi;
+    if (eq) {
+        q[0] = nlo;
+        q[1] = nhi;
+    } else {
+        *lo = q[0];
+        *hi = q[1];
+    }
+    return eq;
+#endif
+}
+
 _Noreturn void x86_exception(x86_cpu *c, int vec, int has_err, uint32_t err)
 {
+    c->lk_on = false; /* excecao no meio de uma instrucao LOCK: acessos normais de novo */
     if (!(c->cr0 & CR0_PE))
         has_err = 0;
     if ((vec == EXC_UD || vec == EXC_GP) && (c->cr0 & CR0_PE)) {
@@ -2392,6 +2511,9 @@ void *x86_cpu_new(mvm_vm *vm, bool lm)
     const char *sm = getenv("MVM_X86_SAMPLE");
     if (sm && atoi(sm) > 0 && atoi(sm) < 40)
         c->sample_mask = (1ULL << atoi(sm)) - 1;
+    /* modo SMP: com mais de uma CPU (ou forcado para testes) os acessos seguem a ordem do
+     * x86 e as instrucoes LOCK sao atomicas de verdade na memoria do host */
+    c->smp = vm->cfg.cpus > 1 || getenv("MVM_SMP_FORCE") != NULL;
     x86_reset(c);
     c->jit = x86_jit_new(c);
     return c;

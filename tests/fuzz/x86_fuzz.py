@@ -197,6 +197,33 @@ def gen():
             bits, suf, regs = 32, "l", R32
         cc = rnd.choice(["o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "p", "np", "l", "ge", "le", "g"])
         return ["cmov%s%s %s, %s" % (cc, suf, pick(regs) if rnd.random() < 0.6 else mem(bits // 8), pick(regs))], 0, pre
+    if kind == "lock":
+        # operacoes travadas na memoria (no modo SMP viram compare-and-swap no host)
+        bits2, suf2, regs2 = rnd.choice(SIZES)
+        m = mem(bits2 // 8)
+        op = rnd.choice(["add", "sub", "and", "or", "xor", "adc", "sbb", "inc", "dec", "neg", "not",
+                         "xadd", "cmpxchg", "xchg", "bts", "btr", "btc"])
+        r = reg_no_high(regs2)
+        if op in ("inc", "dec", "neg", "not"):
+            line = "lock %s%s %s" % (op, suf2, m)
+        elif op in ("bts", "btr", "btc"):
+            if bits2 == 8:
+                bits2, suf2 = 16, "w"
+                m = mem(2)
+            line = "lock %s%s $%d, %s" % (op, suf2, rnd.randrange(0, bits2), m)
+        elif op == "xchg":
+            line = "xchg%s %s, %s" % (suf2, r, m)
+        elif op in ("xadd", "cmpxchg"):
+            line = "lock %s%s %s, %s" % (op, suf2, r, m)
+        else:
+            src = "$%d" % rnd.randrange(-128, 128) if rnd.random() < 0.5 else r
+            line = "lock %s%s %s, %s" % (op, suf2, src, m)
+        out = [line]
+        if MODE == 64 and rnd.random() < 0.15:
+            out = ["lock cmpxchg16b %d(%%r15)" % (rnd.randrange(0, 12) * 16)]
+        elif rnd.random() < 0.1:
+            out = ["lock cmpxchg8b %s" % mem(8)]
+        return out, ALL, pre
     if kind == "cmpcmov":
         # condicao vinda de uma operacao no mesmo bloco (flags preguicosos conhecidos pelo JIT)
         bits2, suf2, regs2 = rnd.choice([s for s in SIZES if s[0] in (16, 32, 64)])

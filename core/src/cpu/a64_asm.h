@@ -154,6 +154,25 @@ static inline void a64_and_bitmask(a64 *a, int rd, int rn, uint32_t n_immr_imms)
 {
     a64_put(a, 0x92000000u | (n_immr_imms << 10) | ((uint32_t)rn << 5) | (uint32_t)rd);
 }
+/* acessos ordenados (SMP): size em bytes (1/2/4/8); base em rn sem deslocamento */
+static inline uint32_t a64_size_bits(int size) { return size == 8 ? 3u : size == 4 ? 2u : size == 2 ? 1u : 0u; }
+static inline void a64_ldapr(a64 *a, int size, int rt, int rn) /* acquire RCpc (ARMv8.3 LRCPC) */
+{
+    a64_put(a, 0x38BFC000u | (a64_size_bits(size) << 30) | ((uint32_t)rn << 5) | (uint32_t)rt);
+}
+static inline void a64_ldar(a64 *a, int size, int rt, int rn) /* acquire (ARMv8.0) */
+{
+    a64_put(a, 0x08DFFC00u | (a64_size_bits(size) << 30) | ((uint32_t)rn << 5) | (uint32_t)rt);
+}
+static inline void a64_stlr(a64 *a, int size, int rt, int rn) /* release */
+{
+    a64_put(a, 0x089FFC00u | (a64_size_bits(size) << 30) | ((uint32_t)rn << 5) | (uint32_t)rt);
+}
+#define A64_DMB_ISHLD 0xD50339BFu
+#define A64_DMB_ISHST 0xD5033ABFu
+#define A64_DMB_ISH 0xD5033BBFu
+static inline void a64_dmb(a64 *a, uint32_t ins) { a64_put(a, ins); }
+
 /* logica com imediato codificado (opc: 0=AND 1=ORR 2=EOR 3=ANDS) */
 static inline void a64_logic_imm(a64 *a, int sf, int opc, int rd, int rn, uint32_t n_immr_imms)
 {

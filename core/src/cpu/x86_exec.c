@@ -1,5 +1,6 @@
 /* CPU x86: decodificacao e execucao de instrucoes (inteiras e de sistema). */
 #include "x86_priv.h"
+#include "x86_jit.h" /* x86_peek_code */
 
 /* ------------------------------------------------------ registradores */
 
@@ -1052,6 +1053,23 @@ static void exec_0f(x86_cpu *c, x86_dec *d)
         if (REXW(d)) {
             if (lin & 15)
                 x86_gp(c, 0); /* CMPXCHG16B exige alinhamento de 16 bytes */
+            if (c->lk_on) { /* LOCK CMPXCHG16B no modo SMP: 128 bits atomicos */
+                c->lk_on = false;
+                uint8_t *h = x86_lk_host(c, lin, 16);
+                if (h) {
+                    uint64_t lo = c->r[R_AX], hi = c->r[R_DX];
+                    if (x86_cas128(h, &lo, &hi, c->r[R_BX], c->r[R_CX])) {
+                        fl |= EFL_ZF;
+                    } else {
+                        c->r[R_AX] = lo;
+                        c->r[R_DX] = hi;
+                    }
+                    x86_set_arith_flags(c, fl);
+                    c->lk_on = true;
+                    return;
+                }
+                c->lk_on = true;
+            }
             x86_probe_write(c, lin, 16);
             uint64_t lo = x86_rd_lin(c, lin, 8), hi = x86_rd_lin(c, lin + 8, 8);
             if (lo == c->r[R_AX] && hi == c->r[R_DX]) {
@@ -1113,7 +1131,94 @@ void x86_decode_modrm(x86_cpu *c, x86_dec *d) { decode_modrm(c, d); }
 
 /* ------------------------------------------------------------ 1 byte */
 
+static void exec_one_raw(x86_cpu *c);
+
+/* instrucao em RIP e travada (prefixo LOCK, ou XCHG com memoria)? Espia os bytes pelo TLB
+ * de execucao (a falta de pagina, se houver, e a mesma que a busca da instrucao daria). */
+static bool insn_locked(x86_cpu *c)
+{
+    uint64_t lin = c->code64 ? c->rip : (uint32_t)(c->seg[S_CS].base + c->rip);
+    uint64_t pa;
+    const uint8_t *p = (lin & ~0xfffULL) == c->fetch_page ? c->fetch_host : x86_code_host(c, lin & ~0xfffULL, &pa);
+    if (!p)
+        return false; /* codigo fora da RAM (ROM/MMIO): sem LOCK que importe */
+    unsigned off = (unsigned)(lin & 0xfff);
+    bool lock = false;
+    for (int i = 0; i < 15; i++, off++) {
+        if (off == 0x1000) { /* a instrucao continua na pagina seguinte */
+            lin = (lin & ~0xfffULL) + 0x1000;
+            p = x86_code_host(c, lin, &pa);
+            if (!p)
+                return lock;
+            off = 0;
+        }
+        uint8_t x = p[off];
+        if (x == 0xf0) {
+            lock = true;
+            continue;
+        }
+        if (x == 0x66 || x == 0x67 || x == 0x26 || x == 0x2e || x == 0x36 || x == 0x3e || x == 0x64 || x == 0x65 ||
+            x == 0xf2 || x == 0xf3 || (c->code64 && (x & 0xf0) == 0x40))
+            continue;
+        if (lock)
+            return true;
+        if (x == 0x86 || x == 0x87) { /* XCHG com memoria: LOCK implicito */
+            if (++off == 0x1000) {
+                p = x86_code_host(c, (lin & ~0xfffULL) + 0x1000, &pa);
+                if (!p)
+                    return false;
+                off = 0;
+            }
+            return (p[off] >> 6) != 3;
+        }
+        return false;
+    }
+    return lock;
+}
+
+/* Modo SMP (varias CPUs): a instrucao interpretada fica entre barreiras completas (mais
+ * forte que a ordem do x86) e uma instrucao travada roda com o operando de memoria em
+ * compare-and-swap; se outra CPU mudar o valor no meio, o estado e restaurado e ela
+ * se repete. */
 void x86_exec_one(x86_cpu *c)
+{
+    if (likely(!c->smp)) {
+        exec_one_raw(c);
+        return;
+    }
+    if (!insn_locked(c)) {
+        if (c->smp_nofence) { /* depuracao (MVM_JIT_OFF 262144) */
+            exec_one_raw(c);
+            return;
+        }
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        exec_one_raw(c);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        return;
+    }
+    uint64_t r[16], rip = c->rip, fl = c->eflags, dst = c->cc_dst, s1 = c->cc_src1, s2 = c->cc_src2, aux = c->cc_aux;
+    int op = c->cc_op, size = c->cc_size;
+    memcpy(r, c->r, sizeof(r));
+    for (;;) {
+        c->lk_have = c->lk_retry = false;
+        c->lk_on = true;
+        exec_one_raw(c);
+        c->lk_on = false;
+        if (!c->lk_retry)
+            return;
+        memcpy(c->r, r, sizeof(r));
+        c->rip = rip;
+        c->eflags = fl;
+        c->cc_dst = dst;
+        c->cc_src1 = s1;
+        c->cc_src2 = s2;
+        c->cc_aux = aux;
+        c->cc_op = op;
+        c->cc_size = size;
+    }
+}
+
+static void exec_one_raw(x86_cpu *c)
 {
     x86_dec dd;
     x86_dec *d = &dd;
