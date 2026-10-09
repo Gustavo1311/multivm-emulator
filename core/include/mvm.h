@@ -118,6 +118,7 @@ typedef struct {
     int64_t rtc_base;         /* data inicial do RTC em segundos Unix (0 = relogio do host) */
     mvm_net_config net;
     mvm_audio_config audio;
+    uint32_t cpus;            /* processadores (0 = 1); por enquanto so 1 */
 } mvm_config;
 
 typedef struct {

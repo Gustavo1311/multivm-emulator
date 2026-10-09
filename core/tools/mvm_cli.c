@@ -333,6 +333,9 @@ static void *control_thread(void *arg)
                         fputs("(tela fora do modo texto)\n", o);
                     fclose(o);
                 }
+            } else if (!strncmp(line, "iothread ", 9)) { /* depuracao: thread de E/S ligada (1) ou nao (0) */
+                extern void vm_debug_iothread(mvm_vm *vm, int on);
+                vm_debug_iothread(g_vm, atoi(line + 9));
             } else if (!strcmp(line, "icount")) { /* instrucoes executadas + tempo (MIPS de um trecho) */
                 struct timespec ts;
                 clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -341,17 +344,20 @@ static void *control_thread(void *arg)
             } else if (!strcmp(line, "profreset")) { /* MVM_PROF: descarta as amostras ate aqui */
                 g_prof_n = 0;
             } else if (!strncmp(line, "jitoff ", 7)) { /* depuracao: bits de MVM_JIT_OFF em tempo de execucao */
-                extern volatile long x86_jit_new_off;
+                extern volatile long x86_jit_new_off, x86_jit_off_gen;
                 x86_jit_new_off = strtol(line + 7, NULL, 0);
+                x86_jit_off_gen++;
             } else if (!strncmp(line, "jitdis ", 7)) { /* depuracao: grava o codigo dos blocos traduzidos daqui em diante */
                 extern char x86_jit_dis_path[256];
-                extern volatile long x86_jit_new_off;
+                extern volatile long x86_jit_new_off, x86_jit_off_gen;
                 snprintf(x86_jit_dis_path, sizeof(x86_jit_dis_path), "%s", line + 7);
                 x86_jit_new_off = 0; /* esvazia o cache para retraduzir */
+                x86_jit_off_gen++;
             } else if (!strncmp(line, "jits2 ", 6)) { /* depuracao: desliga tipos do SSE nativo (e esvazia o JIT) */
-                extern volatile long x86_jit_new_off, x86_jit_s2_off;
+                extern volatile long x86_jit_new_off, x86_jit_s2_off, x86_jit_off_gen;
                 x86_jit_s2_off = strtol(line + 6, NULL, 0);
                 x86_jit_new_off = 0;
+                x86_jit_off_gen++;
             } else if (!strncmp(line, "shot ", 5)) {
                 write_ppm(line + 5);
             } else if (!strncmp(line, "mouse ", 6)) { /* mouse DX DY [BOTOES] (relativo, PS/2) */
@@ -604,6 +610,7 @@ static void usage(void)
             "      --vnc-password S  senha do VNC (ate 8 caracteres)\n"
             "      --ide             discos -d/-r no controlador IDE (padrao com --bios)\n"
             "      --virtio          discos -d/-r em virtio-blk tambem com --bios (Linux; o SeaBIOS da boot por eles)\n"
+            "      --smp N           processadores do convidado (por enquanto so 1)\n"
             "      --boot ORDEM      ordem de boot com BIOS: c=disco d=CD a=disquete (ex.: dca)\n"
             "      --vgabios ARQ     ROM de video (padrao: vgabios-stdvga.bin ao lado da BIOS)\n"
             "      --text            imprime a tela em modo texto ao sair\n"
@@ -636,7 +643,7 @@ int main(int argc, char **argv)
         {"kernel", required_argument, 0, 'k'}, {"initrd", required_argument, 0, 'i'},
         {"cmdline", required_argument, 0, 'c'}, {"disk", required_argument, 0, 'd'},
         {"readonly", required_argument, 0, 'r'}, {"dtb", required_argument, 0, 1},
-        {"cdrom", required_argument, 0, 6}, {"ide", no_argument, 0, 7}, {"sata", no_argument, 0, 14}, {"virtio", no_argument, 0, 40}, {"no-reboot", no_argument, 0, 15}, {"rtc", required_argument, 0, 16}, {"boot", required_argument, 0, 8}, {"fda", required_argument, 0, 17}, {"fda-ro", required_argument, 0, 18},
+        {"cdrom", required_argument, 0, 6}, {"ide", no_argument, 0, 7}, {"sata", no_argument, 0, 14}, {"virtio", no_argument, 0, 40}, {"smp", required_argument, 0, 41}, {"no-reboot", no_argument, 0, 15}, {"rtc", required_argument, 0, 16}, {"boot", required_argument, 0, 8}, {"fda", required_argument, 0, 17}, {"fda-ro", required_argument, 0, 18},
         {"net", required_argument, 0, 19}, {"hostfwd", required_argument, 0, 20}, {"dns", required_argument, 0, 21},
         {"audio", required_argument, 0, 22}, {"audio-wav", required_argument, 0, 23}, {"audio-in", required_argument, 0, 24},
         {"vnc", required_argument, 0, 25}, {"vnc-password", required_argument, 0, 26},
@@ -656,6 +663,7 @@ int main(int argc, char **argv)
             }
             break;
         case 'm': cfg.ram_mb = (uint32_t)atoi(optarg); break;
+        case 41: cfg.cpus = (uint32_t)atoi(optarg); break;
         case 'k': cfg.kernel = optarg; break;
         case 'i': cfg.initrd = optarg; break;
         case 'c': cfg.cmdline = optarg; break;

@@ -3,11 +3,44 @@
 
 #include <stdlib.h>
 
+static void tlb_flush_on_cpu(mvm_vm *vm, void *arg)
+{
+    (void)arg;
+    if (vm->cpu && vm->cpu_ops && vm->cpu_ops->tlb_flush)
+        vm->cpu_ops->tlb_flush(vm->cpu);
+}
+
 static void space_changed(mvm_space *s)
 {
     mvm_vm *vm = s->vm;
     if (vm && s == &vm->mem && vm->cpu && vm->cpu_ops && vm->cpu_ops->tlb_flush)
-        vm->cpu_ops->tlb_flush(vm->cpu);
+        vm_run_on_cpu(vm, tlb_flush_on_cpu, NULL); /* o TLB e da thread da CPU */
+}
+
+struct code_hit { mvm_space *s; uint64_t pa, len; };
+
+static void code_hit_on_cpu(mvm_vm *vm, void *arg)
+{
+    (void)vm;
+    struct code_hit *h = arg;
+    if (h->s->code_hook)
+        h->s->code_hook(h->s->code_opaque, h->pa, h->len);
+}
+
+/* escrita em pagina com codigo traduzido: o JIT e da thread da CPU; uma escrita de outra
+ * thread (DMA na thread de E/S) e invalidada antes da proxima fatia da CPU */
+void space_code_hit(mvm_space *s, uint64_t pa, uint64_t len)
+{
+    mvm_vm *vm = s->vm;
+    if (!vm || vm_on_cpu_thread(vm)) {
+        s->code_hook(s->code_opaque, pa, len);
+        return;
+    }
+    struct code_hit *h = malloc(sizeof(*h));
+    h->s = s;
+    h->pa = pa;
+    h->len = len;
+    vm_run_on_cpu(vm, code_hit_on_cpu, h);
 }
 
 static mvm_region *space_add(mvm_space *s, const mvm_region *nr)
@@ -45,7 +78,7 @@ mvm_region *space_add_io(mvm_space *s, uint64_t base, uint64_t size, const mvm_i
 
 mvm_region *space_find(mvm_space *s, uint64_t addr)
 {
-    mvm_region *r = &s->r[s->last];
+    mvm_region *r = &s->r[__atomic_load_n(&s->last, __ATOMIC_RELAXED)];
     if (s->n && addr - r->base < r->size)
         return r;
     int lo = 0, hi = s->n - 1;
@@ -57,7 +90,7 @@ mvm_region *space_find(mvm_space *s, uint64_t addr)
         else if (addr - r->base >= r->size)
             lo = mid + 1;
         else {
-            s->last = mid;
+            __atomic_store_n(&s->last, mid, __ATOMIC_RELAXED);
             return r;
         }
     }
@@ -81,7 +114,14 @@ uint64_t space_read(mvm_space *s, uint64_t addr, unsigned size)
             v |= space_read(s, addr + i, 1) << (8 * i);
         return v;
     }
-    return r->ops->read ? r->ops->read(r->opaque, off, size) : 0;
+    if (!r->ops->read)
+        return 0;
+    if (!s->vm)
+        return r->ops->read(r->opaque, off, size);
+    vm_bql_lock(s->vm);
+    uint64_t v = r->ops->read(r->opaque, off, size);
+    vm_bql_unlock(s->vm);
+    return v;
 }
 
 void space_write(mvm_space *s, uint64_t addr, uint64_t val, unsigned size)
@@ -107,8 +147,15 @@ void space_write(mvm_space *s, uint64_t addr, uint64_t val, unsigned size)
             space_write(s, addr + i, (val >> (8 * i)) & 0xff, 1);
         return;
     }
-    if (r->ops->write)
+    if (!r->ops->write)
+        return;
+    if (!s->vm) {
         r->ops->write(r->opaque, off, val, size);
+        return;
+    }
+    vm_bql_lock(s->vm);
+    r->ops->write(r->opaque, off, val, size);
+    vm_bql_unlock(s->vm);
 }
 
 uint8_t *space_ram_ptr(mvm_space *s, uint64_t addr, uint64_t len, bool write)

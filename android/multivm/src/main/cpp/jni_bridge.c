@@ -26,7 +26,8 @@ typedef struct {
     JavaVM *jvm;
     jobject listener;        /* ref global: com.multivm.core.NativeBridge$Callbacks */
     jmethodID on_serial;     /* void onSerial(byte[]) */
-    JNIEnv *run_env;         /* valido apenas durante nativeRun */
+    JNIEnv *run_env;         /* valido apenas durante nativeRun, na thread dele */
+    pthread_t run_thread;
     aaudio_out *audio;       /* saida/microfone pelo AAudio (NULL = sem som) */
 } vm_ctx;
 
@@ -260,16 +261,29 @@ static void serial_to_java(void *opaque, const uint8_t *data, size_t len)
 {
     vm_ctx *c = opaque;
     JNIEnv *env = c->run_env;
+    bool attached = false;
     if (!env || !c->listener || !c->on_serial)
         return;
+    if (!pthread_equal(pthread_self(), c->run_thread)) { /* outra thread da VM (E/S) */
+        if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            if ((*g_jvm)->AttachCurrentThread(g_jvm, (void *)&env, NULL) != JNI_OK)
+                return;
+            attached = true;
+        }
+    }
     jbyteArray arr = (*env)->NewByteArray(env, (jsize)len);
-    if (!arr)
+    if (!arr) {
+        if (attached)
+            (*g_jvm)->DetachCurrentThread(g_jvm);
         return;
+    }
     (*env)->SetByteArrayRegion(env, arr, 0, (jsize)len, (const jbyte *)data);
     (*env)->CallVoidMethod(env, c->listener, c->on_serial, arr);
     if ((*env)->ExceptionCheck(env))
         (*env)->ExceptionClear(env);
     (*env)->DeleteLocalRef(env, arr);
+    if (attached)
+        (*g_jvm)->DetachCurrentThread(g_jvm);
 }
 
 JNIEXPORT jint JNICALL JNI_FN(nativeRun)(JNIEnv *env, jclass cls, jlong h)
@@ -277,6 +291,7 @@ JNIEXPORT jint JNICALL JNI_FN(nativeRun)(JNIEnv *env, jclass cls, jlong h)
     (void)cls;
     vm_ctx *c = ctx_of(h);
     c->run_env = env;
+    c->run_thread = pthread_self();
     mvm_set_serial_output(c->vm, serial_to_java, c);
     int r = mvm_run(c->vm);
     mvm_set_serial_output(c->vm, NULL, NULL);

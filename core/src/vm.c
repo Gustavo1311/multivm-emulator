@@ -13,6 +13,13 @@ int64_t host_clock_ns(void);
 
 #define SLICE_INSNS 32768 /* timers e entrada sao tratados entre fatias */
 
+/* trabalho pedido por outra thread para a thread da CPU (vm_run_on_cpu) */
+struct vm_work {
+    void (*fn)(mvm_vm *vm, void *arg);
+    void *arg;
+    struct vm_work *next;
+};
+
 static const char *arch_names[] = {"i386", "x86_64", "arm", "arm64"};
 
 const char *mvm_arch_name(mvm_arch arch)
@@ -43,6 +50,7 @@ void mvm_config_init(mvm_config *cfg, mvm_arch arch)
     memset(cfg, 0, sizeof(*cfg));
     cfg->arch = arch;
     cfg->ram_mb = 256;
+    cfg->cpus = 1;
 }
 
 static char *dupstr(const char *s) { return s ? strdup(s) : NULL; }
@@ -95,6 +103,10 @@ mvm_vm *mvm_create(const mvm_config *cfg, char *err, size_t errlen)
         snprintf(err, errlen, "arquitetura invalida");
         return NULL;
     }
+    if (cfg->cpus > 1) {
+        snprintf(err, errlen, "varios processadores ainda nao sao suportados (em desenvolvimento)");
+        return NULL;
+    }
     if (cfg->ram_mb < 4 || cfg->ram_mb > 3072) {
         snprintf(err, errlen, "memoria invalida (%u MiB; 4..3072)", cfg->ram_mb);
         return NULL;
@@ -138,6 +150,14 @@ mvm_vm *mvm_create(const mvm_config *cfg, char *err, size_t errlen)
 
     vm->mem.vm = vm;
     vm->io.vm = vm;
+    pthread_mutexattr_t ma;
+    pthread_mutexattr_init(&ma);
+    pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&vm->bql, &ma); /* reentrante: callback de dispositivo -> dispatch */
+    pthread_mutexattr_destroy(&ma);
+    pthread_mutex_init(&vm->work_lock, NULL);
+    const char *iot = getenv("MVM_IOTHREAD");
+    vm->iothread = !(iot && *iot == '0');
     chr_init(&vm->serial);
     pthread_mutex_init(&vm->in_lock, NULL);
     pthread_mutex_init(&vm->fb_lock, NULL);
@@ -259,10 +279,85 @@ void mvm_destroy(mvm_vm *vm)
     pthread_mutex_destroy(&vm->in_lock);
     pthread_mutex_destroy(&vm->lock);
     pthread_cond_destroy(&vm->cond);
+    while (vm->work_head) { /* trabalho que sobrou de uma execucao interrompida */
+        struct vm_work *w = vm->work_head;
+        vm->work_head = w->next;
+        free(w->arg);
+        free(w);
+    }
+    pthread_mutex_destroy(&vm->work_lock);
+    pthread_mutex_destroy(&vm->bql);
     free(vm);
 }
 
-static void wait_until(mvm_vm *vm, int64_t host_deadline)
+/* ------------------------------------------------------------ threads */
+
+static _Thread_local mvm_vm *tls_cpu_vm; /* VM cuja CPU roda nesta thread */
+static void wait_flag(mvm_vm *vm, _Atomic int *flag, int64_t host_deadline);
+static void kick(mvm_vm *vm);
+
+void vm_bql_lock(mvm_vm *vm) { pthread_mutex_lock(&vm->bql); }
+void vm_bql_unlock(mvm_vm *vm) { pthread_mutex_unlock(&vm->bql); }
+
+bool vm_on_cpu_thread(mvm_vm *vm) { return tls_cpu_vm == vm || !atomic_load(&vm->running); }
+
+void vm_run_on_cpu(mvm_vm *vm, void (*fn)(mvm_vm *vm, void *arg), void *arg)
+{
+    if (vm_on_cpu_thread(vm)) {
+        fn(vm, arg);
+        free(arg);
+        return;
+    }
+    struct vm_work *w = malloc(sizeof(*w));
+    w->fn = fn;
+    w->arg = arg;
+    w->next = NULL;
+    pthread_mutex_lock(&vm->work_lock);
+    if (vm->work_tail)
+        vm->work_tail->next = w;
+    else
+        vm->work_head = w;
+    vm->work_tail = w;
+    atomic_store(&vm->work_pending, 1);
+    pthread_mutex_unlock(&vm->work_lock);
+    vm_kick(vm, true); /* a CPU sai da fatia e faz o trabalho antes de continuar */
+}
+
+/* thread da CPU (com a bql): executa o trabalho pedido por outras threads */
+static void work_run(mvm_vm *vm)
+{
+    if (!atomic_load(&vm->work_pending))
+        return;
+    pthread_mutex_lock(&vm->work_lock);
+    struct vm_work *w = vm->work_head;
+    vm->work_head = vm->work_tail = NULL;
+    atomic_store(&vm->work_pending, 0);
+    pthread_mutex_unlock(&vm->work_lock);
+    while (w) {
+        struct vm_work *n = w->next;
+        w->fn(vm, w->arg);
+        free(w->arg);
+        free(w);
+        w = n;
+    }
+}
+
+/* depuracao (CLI "iothread 0|1"): liga/desliga a thread de E/S com a VM rodando */
+void vm_debug_iothread(mvm_vm *vm, int on)
+{
+    atomic_store(&vm->io_active, on ? 1 : 0);
+    kick(vm);
+}
+
+void vm_cpu_signal(mvm_vm *vm)
+{
+    if (tls_cpu_vm != vm)
+        vm_kick(vm, true);
+}
+
+static void wait_until(mvm_vm *vm, int64_t host_deadline) { wait_flag(vm, &vm->kick, host_deadline); }
+
+static void wait_flag(mvm_vm *vm, _Atomic int *flag, int64_t host_deadline)
 {
     /* O relogio do host (host_clock_ns) pode nao ter a mesma base do CLOCK_MONOTONIC da
      * condicao (no AArch64 o contador generico continua contando com o aparelho
@@ -277,16 +372,18 @@ static void wait_until(mvm_vm *vm, int64_t host_deadline)
     int64_t abs_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec + delta;
     struct timespec ts = {.tv_sec = abs_ns / 1000000000LL, .tv_nsec = abs_ns % 1000000000LL};
     pthread_mutex_lock(&vm->lock);
-    if (!atomic_exchange(&vm->kick, 0))
+    if (!atomic_exchange(flag, 0))
         pthread_cond_timedwait(&vm->cond, &vm->lock, &ts);
-    atomic_store(&vm->kick, 0);
+    atomic_store(flag, 0);
     pthread_mutex_unlock(&vm->lock);
 }
 
+/* acorda a thread da CPU e a de E/S (cada uma consome a sua marca) */
 static void kick(mvm_vm *vm)
 {
     pthread_mutex_lock(&vm->lock);
     atomic_store(&vm->kick, 1);
+    atomic_store(&vm->io_kick, 1);
     pthread_cond_broadcast(&vm->cond);
     pthread_mutex_unlock(&vm->lock);
 }
@@ -550,10 +647,51 @@ int mvm_media_add_disk(mvm_vm *vm, const char *path, int fd, bool readonly, cons
 
 static int run_loop(mvm_vm *vm);
 
+/* thread de E/S: entrada, midia e polling de rede/serial (com a bql) */
+static void *io_loop(void *arg)
+{
+    mvm_vm *vm = arg;
+    while (!atomic_load(&vm->io_quit)) {
+        if (!atomic_load(&vm->io_active)) { /* desligada em tempo de execucao */
+            wait_flag(vm, &vm->io_kick, host_clock_ns() + 10000000LL);
+            continue;
+        }
+        vm_bql_lock(vm);
+        drain_input(vm);
+        if (vm->media_pending)
+            media_service(vm);
+        if (vm->machine->poll)
+            vm->machine->poll(vm);
+        vm_bql_unlock(vm);
+        /* com bytes ou quadros esperando espaco no dispositivo, sonda de novo logo */
+        bool busy = chr_has_input(&vm->serial) || (vm->net && net_rx_peek(vm->net));
+        wait_flag(vm, &vm->io_kick, host_clock_ns() + (busy ? 1000000LL : 10000000LL));
+    }
+    return NULL;
+}
+
 int mvm_run(mvm_vm *vm)
 {
     atomic_store(&vm->running, 1);
+    tls_cpu_vm = vm;
+    if (vm->iothread) {
+        atomic_store(&vm->io_quit, 0);
+        atomic_store(&vm->io_active, 1);
+        vm->io_started = pthread_create(&vm->io_thread, NULL, io_loop, vm) == 0;
+        if (!vm->io_started)
+            LOGW("sem thread de E/S: tudo na thread da CPU");
+    }
     int r = run_loop(vm);
+    if (vm->io_started) {
+        atomic_store(&vm->io_quit, 1);
+        kick(vm);
+        pthread_join(vm->io_thread, NULL);
+        vm->io_started = false;
+    }
+    vm_bql_lock(vm);
+    work_run(vm);
+    vm_bql_unlock(vm);
+    tls_cpu_vm = NULL;
     if (vm->fb_flush) /* a ultima imagem fica disponivel depois da execucao */
         vm->fb_flush(vm->fb_flush_opaque);
     atomic_store(&vm->running, 0);
@@ -568,46 +706,60 @@ static int run_loop(mvm_vm *vm)
 {
     vm->shutdown = 0;
     vm->fatal = 0;
+    int ret;
+    /* a CPU segura a bql fora da execucao do codigo do convidado */
+    vm_bql_lock(vm);
     for (;;) {
         if (atomic_load(&vm->stop_req)) {
             atomic_store(&vm->stop_req, 0);
-            return MVM_EXIT_STOPPED;
+            ret = MVM_EXIT_STOPPED;
+            break;
         }
         if (vm->shutdown) {
             if (vm->reboot_exit) {
                 LOGI("reinicio pedido pelo convidado: encerrando (sem reinicio)");
-                return MVM_EXIT_REBOOT;
+                ret = MVM_EXIT_REBOOT;
+                break;
             }
-            return MVM_EXIT_SHUTDOWN;
+            ret = MVM_EXIT_SHUTDOWN;
+            break;
         }
         if (vm->fatal) {
             if (vm->cpu_ops->dump)
                 vm->cpu_ops->dump(vm->cpu, stderr);
-            return MVM_EXIT_ERROR;
+            ret = MVM_EXIT_ERROR;
+            break;
         }
         atomic_store(&vm->cpu_exit, 0);
+        work_run(vm);
         if (atomic_exchange(&vm->reset_req, 0)) {
             LOGI("reiniciando a maquina");
             vm->machine->reset(vm);
         }
         if (atomic_load(&vm->pause_req)) {
-            vm->paused_at = host_clock_ns();
+            __atomic_store_n(&vm->paused_at, host_clock_ns(), __ATOMIC_RELAXED);
             while (atomic_load(&vm->pause_req) && !atomic_load(&vm->stop_req)) {
-                media_service(vm); /* troca de midia tambem com a VM pausada */
+                if (!vm->io_started || !atomic_load(&vm->io_active))
+                    media_service(vm); /* troca de midia tambem com a VM pausada */
+                work_run(vm);
                 if (vm->fb_flush && vm_fb_watched(vm, 500)) /* desenho adiado sem espectador */
                     vm->fb_flush(vm->fb_flush_opaque);
+                vm_bql_unlock(vm);
                 wait_until(vm, host_clock_ns() + 100000000LL);
+                vm_bql_lock(vm);
             }
-            vm->clock_offset += host_clock_ns() - vm->paused_at;
-            vm->paused_at = 0;
+            __atomic_fetch_add(&vm->clock_offset, host_clock_ns() - vm->paused_at, __ATOMIC_RELAXED);
+            __atomic_store_n(&vm->paused_at, 0, __ATOMIC_RELAXED);
             continue;
         }
 
-        drain_input(vm);
-        if (vm->media_pending)
-            media_service(vm);
-        if (vm->machine->poll)
-            vm->machine->poll(vm);
+        if (!vm->io_started || !atomic_load(&vm->io_active)) {
+            drain_input(vm);
+            if (vm->media_pending)
+                media_service(vm);
+            if (vm->machine->poll)
+                vm->machine->poll(vm);
+        }
         int64_t next = timers_run(vm);
 
         if (vm->cpu_ops->halted(vm->cpu)) {
@@ -615,15 +767,22 @@ static int run_loop(mvm_vm *vm)
             int64_t limit = now + 10000000LL; /* 10 ms: verifica entrada do console */
             if (next < limit)
                 limit = next;
-            if (limit > now)
+            if (limit > now) {
+                vm_bql_unlock(vm);
                 wait_until(vm, limit + vm->clock_offset);
+                vm_bql_lock(vm);
+            }
             /* ainda executa a CPU: ela sai do HLT se houver interrupcao */
         }
         if (atomic_load(&vm->cpu_exit))
             continue;
+        vm_bql_unlock(vm);
         int64_t n = vm->cpu_ops->run(vm->cpu, SLICE_INSNS);
+        vm_bql_lock(vm);
         atomic_fetch_add_explicit(&vm->insn_count, (uint64_t)n, memory_order_relaxed);
     }
+    vm_bql_unlock(vm);
+    return ret;
 }
 
 void mvm_request_stop(mvm_vm *vm)
@@ -842,4 +1001,4 @@ void mvm_pointer_event(mvm_vm *vm, int dx, int dy, int dz, uint32_t buttons)
 
 uint64_t mvm_instruction_count(mvm_vm *vm) { return atomic_load(&vm->insn_count); }
 
-int64_t mvm_clock_lag_ns(mvm_vm *vm) { return vm->clock_warp_ns; }
+int64_t mvm_clock_lag_ns(mvm_vm *vm) { return __atomic_load_n(&vm->clock_warp_ns, __ATOMIC_RELAXED); }

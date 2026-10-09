@@ -87,6 +87,9 @@ struct x86_jit {
     uint8_t skip[0x200];    /* MVM_JIT_SKIP=op,op,... opcodes deixados ao interpretador */
     bool stats;             /* MVM_JIT_STATS=1 */
     unsigned n_interp_log;
+    long off_gen;           /* geracao de x86_jit_new_off ja aplicada (CLI "jitoff") */
+    struct jinsn_s *tr_ins; /* buffers do tradutor (por JIT: cada CPU traduz na sua thread) */
+    bool *tr_stored, *tr_dead;
 #define COLD_MAX 32768
 #define COLD_FIX 1024
     uint32_t cold[COLD_MAX];
@@ -3506,8 +3509,8 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
     b->valid = true;
     b->code = j->pos;
 
-    static jinsn ins[BLOCK_MAX_INSNS];
-    static bool stored[BLOCK_MAX_INSNS], dead[BLOCK_MAX_INSNS];
+    jinsn *ins = (jinsn *)j->tr_ins; /* por JIT (cada CPU traduz na sua thread) */
+    bool *stored = j->tr_stored, *dead = j->tr_dead;
     jctx x;
     bool ended;
     unsigned n = 0;
@@ -3602,15 +3605,16 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
 
 /* depuracao (CLI "jitoff N"): troca os bits de MVM_JIT_OFF com a VM rodando, para medir A/B */
 volatile long x86_jit_new_off = -1;
+volatile long x86_jit_off_gen; /* incrementado a cada "jitoff"/"jits2"/"jitdis" (cada CPU aplica) */
 
 int64_t x86_jit_run(x86_cpu *c, int64_t budget)
 {
     struct x86_jit *j = c->jit;
     if (!j)
         return -1;
-    if (unlikely(x86_jit_new_off >= 0)) {
+    if (unlikely(j->off_gen != x86_jit_off_gen) && x86_jit_new_off >= 0) {
+        j->off_gen = x86_jit_off_gen;
         j->off = (unsigned)x86_jit_new_off;
-        x86_jit_new_off = -1;
         x86_jit_flush(j);
         LOGI("JIT: MVM_JIT_OFF=0x%x", j->off);
     }
@@ -3757,6 +3761,9 @@ struct x86_jit *x86_jit_new(x86_cpu *c)
     j->code_end = (uint32_t *)((uint8_t *)mem + CODE_SIZE);
     jc_reset(j);
     j->blocks = calloc(MAX_BLOCKS, sizeof(jit_block));
+    j->tr_ins = calloc(BLOCK_MAX_INSNS, sizeof(jinsn));
+    j->tr_stored = calloc(BLOCK_MAX_INSNS, sizeof(bool));
+    j->tr_dead = calloc(BLOCK_MAX_INSNS, sizeof(bool));
     j->npages = (c->vm->ram_size + 0xfff) >> 12;
     j->pages = calloc(j->npages, sizeof(jit_block *));
     j->bits = calloc((j->npages + 7) / 8 + 1, 1);
@@ -3801,6 +3808,9 @@ void x86_jit_free(struct x86_jit *j)
     }
     munmap(j->code, CODE_SIZE);
     free(j->blocks);
+    free(j->tr_ins);
+    free(j->tr_stored);
+    free(j->tr_dead);
     free(j->pages);
     free(j->bits);
     free(j->jc_cnt);

@@ -381,7 +381,12 @@ static int64_t host_ns(void) { return mono_ns(); }
  * Windows derruba o DWM se o QPC voltar. Por isso o tempo fica parado ate o valor ja
  * observado ser alcancado, em vez de andar para tras. */
 /* relogio sem a trava monotonica (so para o freio e a fila de timers) */
-static int64_t now_raw(mvm_vm *vm) { return (vm->paused_at ? vm->paused_at : host_ns()) - vm->clock_offset; }
+static int64_t now_raw(mvm_vm *vm)
+{
+    /* lido por varias threads; escrito so pela thread da CPU (pausa e freio) */
+    int64_t paused = __atomic_load_n(&vm->paused_at, __ATOMIC_RELAXED);
+    return (paused ? paused : host_ns()) - __atomic_load_n(&vm->clock_offset, __ATOMIC_RELAXED);
+}
 
 int64_t mvm_now(mvm_vm *vm)
 {
@@ -441,8 +446,8 @@ int64_t timers_run(mvm_vm *vm)
      * andam juntas mais devagar. E o mesmo mecanismo usado na pausa. */
     if (vm->timers && now - vm->timers->expire > TIMER_MAX_LATE_NS) {
         int64_t warp = now - vm->timers->expire - TIMER_MAX_LATE_NS;
-        vm->clock_offset += warp;
-        vm->clock_warp_ns += warp;
+        __atomic_fetch_add(&vm->clock_offset, warp, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&vm->clock_warp_ns, warp, __ATOMIC_RELAXED);
         now -= warp;
     }
     while (vm->timers && vm->timers->expire <= now) {

@@ -1650,9 +1650,11 @@ void arm32_set_irq(void *opaque, int line, int level)
 {
     a32_cpu *c = opaque;
     if (line == 0)
-        c->irq_line = level;
+        __atomic_store_n(&c->irq_line, level, __ATOMIC_RELEASE);
     else
-        c->fiq_line = level;
+        __atomic_store_n(&c->fiq_line, level, __ATOMIC_RELEASE);
+    if (level)
+        vm_cpu_signal(c->vm); /* vinda de outra thread: a CPU sai da fatia e olha a linha */
 }
 
 void arm32_set_entry(void *opaque, uint32_t pc, uint32_t r0, uint32_t r1, uint32_t r2)

@@ -141,6 +141,44 @@ static bool dbg_read(x86_cpu *c, uint64_t lin, void *out, size_t n);
 static void x86_guest_process(x86_cpu *c, char *out, size_t n);
 void x86_debug_dump(void *opaque);
 
+/* Chamadas diretas da CPU ao PIC/APIC: o estado deles e compartilhado com a thread de E/S
+ * (e, no futuro, com outras CPUs), entao passam pela trava global dos dispositivos. */
+static uint8_t apic_tpr_get(x86_cpu *c)
+{
+    vm_bql_lock(c->vm);
+    uint8_t v = c->apic_get_tpr(c->apic);
+    vm_bql_unlock(c->vm);
+    return v;
+}
+static void apic_tpr_set(x86_cpu *c, uint8_t v)
+{
+    vm_bql_lock(c->vm);
+    c->apic_set_tpr(c->apic, v);
+    vm_bql_unlock(c->vm);
+}
+static uint64_t apic_base_get(x86_cpu *c)
+{
+    vm_bql_lock(c->vm);
+    uint64_t v = c->apic_get_base(c->apic);
+    vm_bql_unlock(c->vm);
+    return v;
+}
+static void apic_base_set(x86_cpu *c, uint64_t v)
+{
+    vm_bql_lock(c->vm);
+    c->apic_set_base(c->apic, v);
+    vm_bql_unlock(c->vm);
+}
+static int intr_ack_locked(x86_cpu *c)
+{
+    if (!c->intr_ack)
+        return -1;
+    vm_bql_lock(c->vm);
+    int v = c->intr_ack(c->intr_opaque);
+    vm_bql_unlock(c->vm);
+    return v;
+}
+
 /* ------------------------------------------------------------ TLB/MMU */
 
 #define TLB_E(c, k) (&(c)->tlb[0][0] + (k)) /* k = (user << X86_TLB_BITS) | indice */
@@ -259,11 +297,11 @@ static _Noreturn void page_fault(x86_cpu *c, uint64_t lin, bool present, int acc
     if (pfdbg < 0)
         pfdbg = getenv("MVM_X86_PFDEBUG") != NULL; /* #PF com IRQL alto (Windows x64) */
     if (pfdbg && !user &&
-        ((c->code64 && c->apic && (c->apic_get_tpr(c->apic) >> 4) >= 2) || (!c->code64 && lin < 0x10000))) {
+        ((c->code64 && c->apic && (apic_tpr_get(c) >> 4) >= 2) || (!c->code64 && lin < 0x10000))) {
         /* falta de pagina com IRQL >= DISPATCH (Windows x64): quase sempre um bug */
         uint8_t *h = x86_host_ptr_nofault(c, c->cur_rip);
         LOGI("x86: #PF com IRQL %d em %llx: lin=%llx err=%x bytes %02x %02x %02x %02x %02x %02x",
-             c->apic ? (int)(c->apic_get_tpr(c->apic) >> 4) : -1, (unsigned long long)c->cur_rip, (unsigned long long)lin, err,
+             c->apic ? (int)(apic_tpr_get(c) >> 4) : -1, (unsigned long long)c->cur_rip, (unsigned long long)lin, err,
              h ? h[0] : 0, h ? h[1] : 0, h ? h[2] : 0, h ? h[3] : 0, h ? h[4] : 0, h ? h[5] : 0);
         x86_debug_dump(c);
         x86_ram_dump(c);
@@ -1301,7 +1339,7 @@ void x86_write_cr(x86_cpu *c, int n, uint64_t v)
     case 8:
         c->cr8 = v & 15;
         if (c->apic)
-            c->apic_set_tpr(c->apic, (uint8_t)((v & 15) << 4));
+            apic_tpr_set(c, (uint8_t)((v & 15) << 4));
         break;
     default: x86_ud(c);
     }
@@ -1314,7 +1352,7 @@ uint64_t x86_read_cr(x86_cpu *c, int n)
     case 2: return c->cr2;
     case 3: return c->cr3;
     case 4: return c->cr4;
-    case 8: return c->apic ? (uint64_t)(c->apic_get_tpr(c->apic) >> 4) : c->cr8;
+    case 8: return c->apic ? (uint64_t)(apic_tpr_get(c) >> 4) : c->cr8;
     default: x86_ud(c);
     }
 }
@@ -1465,7 +1503,7 @@ void x86_rdmsr(x86_cpu *c)
     case 0xc0000103: v = c->tsc_aux; break;
     case 0x1b:
         if (!c->apic) x86_gp(c, 0);
-        v = c->apic_get_base(c->apic);
+        v = apic_base_get(c);
         break;
     case 0x3b: v = c->tsc_adjust; break;
     case 0xfe: v = 0x508; break; /* MTRRcap: 8 variaveis, fixos, WC */
@@ -1531,7 +1569,7 @@ void x86_wrmsr(x86_cpu *c)
     case 0xc0000103: c->tsc_aux = v; break;
     case 0x1b:
         if (!c->apic) x86_gp(c, 0);
-        c->apic_set_base(c->apic, v);
+        apic_base_set(c, v);
         break;
     case 0x2ff: c->mtrr_def = v & 0xcff; break;
     case 0x200 ... 0x20f: c->mtrr_var[msr - 0x200] = v; break;
@@ -2154,7 +2192,7 @@ static int64_t x86_run(void *opaque, int64_t budget)
                 c->exc_depth = 0;
                 c->halted = false;
             } else if (c->eflags & EFL_IF) {
-                int vec = c->intr_ack ? c->intr_ack(c->intr_opaque) : -1;
+                int vec = intr_ack_locked(c);
                 if (vec >= 0) {
                     c->irq_hist[vec & 255]++;
                     c->exc_depth++;
@@ -2362,11 +2400,17 @@ void *x86_cpu_new(mvm_vm *vm, bool lm)
 void x86_set_intr(void *opaque, int level)
 {
     x86_cpu *c = opaque;
-    c->intr_line = level;
+    __atomic_store_n(&c->intr_line, level, __ATOMIC_RELEASE);
+    if (!level)
+        return;
+    if (!vm_on_cpu_thread(c->vm)) { /* outra thread (E/S): a CPU sai da fatia e olha a linha */
+        vm_cpu_signal(c->vm);
+        return;
+    }
     /* interrupcao gerada pela propria CPU no meio de um bloco do JIT (TPR baixado, EOI,
      * auto-IPI, porta de E/S): o proximo bloco sai para que ela seja entregue ja, como no
      * interpretador. O XP entrega APCs por auto-IPI e conta com isso. */
-    if (level && c->jit_budget > 0) {
+    if (c->jit_budget > 0) {
         c->jit_kick += c->jit_budget;
         c->jit_budget = 0;
     }

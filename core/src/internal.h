@@ -68,13 +68,14 @@ static inline bool space_is_code(const mvm_space *s, uint64_t pa)
 }
 
 /* avisa o JIT se [pa, pa+len) contem paginas com codigo traduzido */
+void space_code_hit(mvm_space *s, uint64_t pa, uint64_t len); /* space.c: chama o code_hook na CPU */
 static inline void space_code_check(mvm_space *s, uint64_t pa, uint64_t len)
 {
     if (!s->code_bits || !len)
         return;
     for (uint64_t p = pa & ~0xfffULL; p < pa + len; p += 0x1000)
         if (space_is_code(s, p))
-            s->code_hook(s->code_opaque, p > pa ? p : pa, (pa + len < p + 0x1000 ? pa + len : p + 0x1000) - (p > pa ? p : pa));
+            space_code_hit(s, p > pa ? p : pa, (pa + len < p + 0x1000 ? pa + len : p + 0x1000) - (p > pa ? p : pa));
 }
 
 static inline bool region_page_dirty(const mvm_region *r, uint64_t pa)
@@ -296,9 +297,37 @@ struct mvm_vm {
     int shutdown;               /* definido por dispositivos (desligamento do convidado) */
     int fatal;                  /* erro fatal da CPU */
     _Atomic uint64_t insn_count;
+
+    /* Threads: a CPU roda na thread de mvm_run (com os timers, entre as fatias); entrada,
+     * midia e polling de rede/serial rodam na thread de E/S. Estado de dispositivo so com
+     * a trava global (bql). MVM_IOTHREAD=0 volta a fazer tudo na thread da CPU. */
+    pthread_mutex_t bql;
+    bool iothread;
+    bool io_started;
+    _Atomic int io_active;      /* 0: a thread de E/S fica parada e a CPU faz o servico (depuracao) */
+    pthread_t io_thread;
+    _Atomic int io_quit;
+    _Atomic int io_kick;        /* acorda a thread de E/S */
+    /* trabalho pedido por outras threads que precisa rodar na thread da CPU */
+    pthread_mutex_t work_lock;
+    struct vm_work *work_head, *work_tail;
+    _Atomic int work_pending;
 };
 
 typedef struct mvm_vm mvm_vm;
+
+/* Trava global dos dispositivos (reentrante na mesma thread). A thread da CPU a segura
+ * fora da execucao do codigo do convidado; durante a execucao, so na dispatch de E/S e
+ * nas chamadas diretas da CPU a dispositivos (PIC/APIC, GIC, timers). */
+void vm_bql_lock(mvm_vm *vm);
+void vm_bql_unlock(mvm_vm *vm);
+/* esta thread pode mexer no estado privado da CPU (TLB, JIT)? Tambem true com a VM parada. */
+bool vm_on_cpu_thread(mvm_vm *vm);
+/* roda fn(arg) na thread da CPU: na hora, se possivel; senao antes da proxima fatia
+ * (arg alocado com malloc e liberado depois da chamada; NULL = sem argumento) */
+void vm_run_on_cpu(mvm_vm *vm, void (*fn)(mvm_vm *vm, void *arg), void *arg);
+/* linha de interrupcao mudou fora da thread da CPU: faz a CPU olhar para ela logo */
+void vm_cpu_signal(mvm_vm *vm);
 
 /* Chamado por dispositivos */
 void vm_request_shutdown(mvm_vm *vm);

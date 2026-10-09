@@ -40,7 +40,17 @@ uint64_t gt_cntpct(arm_gtimer *g)
 
 static uint64_t gt_count(arm_gtimer *g, int i) { return i == GT_VIRT ? gt_cntvct(g) : gt_cntpct(g); }
 
+static void gt_update_locked(arm_gtimer *g, int i);
+
+/* o timer mexe na fila de timers e no GIC (compartilhados com a thread de E/S) */
 void gt_update(arm_gtimer *g, int i)
+{
+    vm_bql_lock(g->vm);
+    gt_update_locked(g, i);
+    vm_bql_unlock(g->vm);
+}
+
+static void gt_update_locked(arm_gtimer *g, int i)
 {
     uint64_t count = gt_count(g, i);
     bool enable = g->ctl[i] & 1, imask = g->ctl[i] & 2;
