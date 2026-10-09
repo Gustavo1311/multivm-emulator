@@ -325,6 +325,7 @@ struct mvm_vm {
         struct vm_work *work_head, *work_tail;
         _Atomic int work_pending;
         _Atomic int exit_req; /* sair da fatia ja (a CPU 0 usa cpu_exit) */
+        _Atomic int in_run;   /* executando codigo do convidado (vm_run_on_cpu_sync espera ela sair) */
         _Atomic int wake;     /* acordar do HLT (a CPU 0 usa kick) */
         /* estatistica (MVM_SMP_STATS): ns executando, parada em HLT e esperando a bql */
         int64_t st_run, st_halt, st_bql;
@@ -349,6 +350,7 @@ static inline bool vm_on_cpu_thread(mvm_vm *vm) { return vm_is_cpu_thread(vm, 0)
 /* roda fn(arg) na thread da CPU idx: na hora, se possivel; senao antes da proxima fatia
  * (arg alocado com malloc e liberado depois da chamada; NULL = sem argumento) */
 void vm_run_on_cpu(mvm_vm *vm, int idx, void (*fn)(mvm_vm *vm, void *arg), void *arg);
+void vm_run_on_cpu_sync(mvm_vm *vm, int idx, void (*fn)(mvm_vm *vm, void *arg), void *arg);
 /* a CPU idx sai da fatia e acorda do HLT (interrupcao, trabalho, INIT/SIPI) */
 void vm_cpu_kick(mvm_vm *vm, int idx);
 static inline void vm_cpu_signal(mvm_vm *vm) { vm_cpu_kick(vm, 0); }

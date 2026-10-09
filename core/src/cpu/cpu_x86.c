@@ -140,6 +140,7 @@ static bool trace_stop_on_pf(void)
 static bool dbg_read(x86_cpu *c, uint64_t lin, void *out, size_t n);
 static void x86_guest_process(x86_cpu *c, char *out, size_t n);
 void x86_debug_dump(void *opaque);
+void x86_debug_bugcheck(void *cpu);
 
 /* Chamadas diretas da CPU ao PIC/APIC: o APIC tem trava propria (a do barramento) e o
  * reconhecimento so toma a bql quando a interrupcao vem do 8259 (lapic_intr_ack). */
@@ -275,19 +276,25 @@ static void phys_wr(x86_cpu *c, uint64_t pa, uint64_t v, unsigned size)
         space_write(c->mem, pa, v, size);
 }
 
-/* liga bits (A/D) numa entrada de tabela de paginas; no modo SMP com OR atomico, para nao
- * desfazer uma mudanca que outra CPU tenha feito na entrada desde a leitura */
-static void phys_or(x86_cpu *c, uint64_t pa, uint64_t old, uint64_t bits, unsigned size)
+/* liga bits (A/D) numa entrada de tabela de paginas. No modo SMP, como o hardware: so se
+ * a entrada ainda for a lida (compare-and-swap). Se outra CPU a mudou (o Windows guarda
+ * dados do software nas entradas nao presentes: transicao, arquivo de paginacao), um OR
+ * as corromperia; devolve false e o percurso recomeca. */
+static bool phys_or(x86_cpu *c, uint64_t pa, uint64_t old, uint64_t bits, unsigned size)
 {
     uint8_t *p = c->smp ? space_ram_ptr(c->mem, pa, size, true) : NULL;
     if (p && !(pa & (size - 1))) {
-        if (size == 8)
-            __atomic_fetch_or((uint64_t *)p, bits, __ATOMIC_SEQ_CST);
-        else
-            __atomic_fetch_or((uint32_t *)p, (uint32_t)bits, __ATOMIC_SEQ_CST);
-        return;
+        if (size == 8) {
+            uint64_t exp = old;
+            return __atomic_compare_exchange_n((uint64_t *)p, &exp, old | bits, false, __ATOMIC_SEQ_CST,
+                                               __ATOMIC_SEQ_CST);
+        }
+        uint32_t exp = (uint32_t)old;
+        return __atomic_compare_exchange_n((uint32_t *)p, &exp, (uint32_t)(old | bits), false, __ATOMIC_SEQ_CST,
+                                           __ATOMIC_SEQ_CST);
     }
     phys_wr(c, pa, old | bits, size);
+    return true;
 }
 
 static _Noreturn void page_fault(x86_cpu *c, uint64_t lin, bool present, int acc, int user)
@@ -330,6 +337,7 @@ static uint64_t walk(x86_cpu *c, uint64_t lin, int acc, int user, int *perm_out)
         return (c->efer & EFER_LMA ? lin : (uint32_t)lin) & c->a20_mask;
     }
     bool nxe = c->efer & EFER_NXE;
+retry:;
     int pw = 1, pu = 1, nx = 0;
     uint64_t pa, leaf_addr, leaf;
     unsigned leaf_size;
@@ -359,8 +367,8 @@ static uint64_t walk(x86_cpu *c, uint64_t lin, int acc, int user, int *perm_out)
                 leaf = e;
                 break;
             }
-            if (!(e & 0x20))
-                phys_or(c, a, e, 0x20, 8);
+            if (!(e & 0x20) && !phys_or(c, a, e, 0x20, 8))
+                goto retry;
             table = e & 0x000ffffffffff000ULL;
             shift -= 9;
         }
@@ -381,8 +389,8 @@ static uint64_t walk(x86_cpu *c, uint64_t lin, int acc, int user, int *perm_out)
             leaf_addr = a;
             leaf = e;
         } else {
-            if (!(e & 0x20))
-                phys_or(c, a, e, 0x20, 8);
+            if (!(e & 0x20) && !phys_or(c, a, e, 0x20, 8))
+                goto retry;
             uint64_t a2 = (e & 0x000ffffffffff000ULL) + ((lin >> 12) & 511) * 8;
             uint64_t e2 = phys_rd(c, a2, 8);
             if (!(e2 & 1))
@@ -408,8 +416,8 @@ static uint64_t walk(x86_cpu *c, uint64_t lin, int acc, int user, int *perm_out)
             leaf_addr = a;
             leaf = e;
         } else {
-            if (!(e & 0x20))
-                phys_or(c, a, e, 0x20, 4);
+            if (!(e & 0x20) && !phys_or(c, a, e, 0x20, 4))
+                goto retry;
             uint64_t a2 = (e & 0xfffff000u) + ((la >> 12) & 1023) * 4;
             uint32_t e2 = (uint32_t)phys_rd(c, a2, 4);
             if (!(e2 & 1))
@@ -432,8 +440,8 @@ static uint64_t walk(x86_cpu *c, uint64_t lin, int acc, int user, int *perm_out)
     uint64_t upd = leaf | 0x20;
     if (acc == 1)
         upd |= 0x40;
-    if (upd != leaf)
-        phys_or(c, leaf_addr, leaf, upd & ~leaf, leaf_size);
+    if (upd != leaf && !phys_or(c, leaf_addr, leaf, upd & ~leaf, leaf_size))
+        goto retry;
     int perm = 1;
     bool can_w = pw || (!user && !wp);
     if (can_w && (upd & 0x40)) /* so cacheia escrita se o bit D ja estiver marcado */
@@ -1189,7 +1197,15 @@ _Noreturn void x86_exception(x86_cpu *c, int vec, int has_err, uint32_t err)
     }
     c->exc_depth++;
     if (c->exc_depth >= 3) {
-        LOGE("x86: falha tripla (vetor %d em 0x%llx) - reiniciando", vec, (unsigned long long)c->cur_rip);
+        char sym[192] = "";
+        if (c->efer & EFER_LMA)
+            x86_debug_symbolize(c, c->cur_rip, sym, sizeof(sym));
+        LOGE("x86: falha tripla na CPU %d (vetor %d em 0x%llx %s) - reiniciando", c->index, vec,
+             (unsigned long long)c->cur_rip, sym);
+        if (getenv("MVM_X86_BUGCHECK")) {
+            x86_debug_bugcheck(c);
+            x86_debug_dump(c);
+        }
         if (c->trace && !c->trace_dumped) {
             c->trace_dumped = true;
             trace_dump(c, "falha tripla");
@@ -1950,7 +1966,7 @@ static void sample_dump(x86_cpu *c)
         x86_debug_symbolize(c, c->rip, sym, sizeof(sym));
         x86_guest_process(c, proc, sizeof(proc));
     }
-    LOGI("x86: amostra %04x:%llx cpl=%d if=%d hlt=%d cr3=%llx [%s] %s irqs:%s", c->seg[S_CS].sel, (unsigned long long)c->rip,
+    LOGI("x86: amostra cpu%d %04x:%llx cpl=%d if=%d hlt=%d cr3=%llx [%s] %s irqs:%s", c->index, c->seg[S_CS].sel, (unsigned long long)c->rip,
          c->cpl, !!(c->eflags & EFL_IF), c->halted, (unsigned long long)(c->cr3 & ~0xfffULL), proc, sym, buf);
 }
 
@@ -2157,6 +2173,58 @@ static bool dbg_pe_module(x86_cpu *c, uint64_t addr, char *name, size_t nlen, ui
 }
 
 /* simbolizacao para ferramentas (mapa de blocos do JIT): "modulo+offset" ou "" */
+/* MVM_X86_BUGCHECK=RVA (de KiBugCheckData no ntoskrnl, ver tools/pdb_syms.py): no reinicio
+ * ou desligamento pedido pelo convidado mostra o codigo de parada do Windows x64 e os 4
+ * parametros. O ntoskrnl e achado pelo tratador da excecao 0 da IDT. */
+void x86_debug_bugcheck(void *cpu)
+{
+    x86_cpu *c = cpu;
+    const char *e = getenv("MVM_X86_BUGCHECK");
+    if (!e || !(c->efer & EFER_LMA))
+        return;
+    uint64_t gate[2], base;
+    char name[192];
+    if (!dbg_read(c, c->idt_base, gate, 16))
+        return;
+    uint64_t h = (gate[0] & 0xffff) | ((gate[0] >> 32) & 0xffff0000ULL) | (gate[1] << 32);
+    if (!dbg_pe_module(c, h, name, sizeof(name), &base)) {
+        LOGI("x86: bugcheck: ntoskrnl nao achado (IDT 0 em %llx)", (unsigned long long)h);
+        return;
+    }
+    uint64_t d[5] = {0};
+    dbg_read(c, base + strtoull(e, NULL, 16), d, sizeof(d));
+    if (!d[0])
+        return;
+    LOGI("x86: bugcheck %s@%llx: STOP 0x%llx (%llx, %llx, %llx, %llx)", name, (unsigned long long)base,
+         (unsigned long long)d[0], (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[3],
+         (unsigned long long)d[4]);
+}
+
+/* MVM_X86_BUGCHECK: RIP e enderecos de retorno no codigo do kernel achados na pilha */
+void x86_debug_stack(void *cpu)
+{
+    x86_cpu *c = cpu;
+    if (!getenv("MVM_X86_BUGCHECK") || !(c->efer & EFER_LMA))
+        return;
+    char sym[192];
+    x86_debug_symbolize(c, c->rip, sym, sizeof(sym));
+    LOGI("x86: CPU %d rip %llx %s rsp %llx cpl %d", c->index, (unsigned long long)c->rip, sym,
+         (unsigned long long)c->r[R_SP], c->cpl);
+    int shown = 0;
+    for (int i = 0; i < 2048 && shown < 40; i++) {
+        uint64_t v;
+        if (!dbg_read(c, c->r[R_SP] + 8 * (uint64_t)i, &v, 8))
+            break;
+        if (v < 0xffff800000000000ULL)
+            continue;
+        x86_debug_symbolize(c, v, sym, sizeof(sym));
+        if (sym[0]) {
+            LOGI("x86:   [rsp+%04x] %llx %s", 8 * i, (unsigned long long)v, sym);
+            shown++;
+        }
+    }
+}
+
 void x86_debug_symbolize(x86_cpu *c, uint64_t addr, char *out, size_t n)
 {
     static struct { uint64_t base, end; char name[192]; } mods[64];

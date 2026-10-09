@@ -65,6 +65,8 @@ struct jit_block {
     uint32_t mode, ninsn;
     uint32_t *code;
     bool valid, interp;
+    uint32_t vlen;          /* MVM_JIT_VERIFY: bytes do convidado traduzidos e soma deles */
+    uint64_t vsum;
     jit_block *hnext, *pnext;
     jit_exit_rec exit[2];
 };
@@ -91,6 +93,7 @@ struct x86_jit {
     bool smp;               /* varias CPUs (ou MVM_SMP_FORCE): ordem TSO e atomicos de verdade */
     bool lrcpc;             /* host com LDAPR (ARMv8.3) */
     bool lse;               /* host com atomicos LSE (ARMv8.1) */
+    bool verify;            /* MVM_JIT_VERIFY: confere o codigo do convidado na entrada de cada bloco */
     long off_gen;           /* geracao de x86_jit_new_off ja aplicada (CLI "jitoff") */
     struct jinsn_s *tr_ins; /* buffers do tradutor (por JIT: cada CPU traduz na sua thread) */
     bool *tr_stored, *tr_dead;
@@ -1942,6 +1945,7 @@ static void vec_st(jctx *x, int vt, int i, bool q)
     }
 }
 
+static void fp_ld_mem(jctx *x, int vt, int sz);
 static bool emit_vec(jctx *x, jinsn *in)
 {
     uint32_t vop = 0;
@@ -1978,7 +1982,7 @@ static bool emit_vec(jctx *x, jinsn *in)
             if (q)                                                                             \
                 g_ldq(x, 1);                                                  \
             else                                                                               \
-                a64_put(a, 0xFC606800u | ((uint32_t)REA << 16) | (10u << 5) | 1u);            \
+                fp_ld_mem(x, 1, 8);                                                            \
         } else {                                                                               \
             vec_ld(x, 1, rm, q);                                                               \
         }                                                                                      \
@@ -2130,9 +2134,11 @@ static int simd2_kind(const jinsn *in)
 /* LDR/STR St/Dt, [x12] (registrador XMM em memoria) e [x10, REA] (memoria do convidado) */
 static void fp_ld_x12(a64 *a, int vt, int sz) { a64_put(a, (sz == 4 ? 0xBD400000u : 0xFD400000u) | (12u << 5) | (uint32_t)vt); }
 static void fp_st_x12(a64 *a, int vt, int sz) { a64_put(a, (sz == 4 ? 0xBD000000u : 0xFD000000u) | (12u << 5) | (uint32_t)vt); }
-static void fp_ld_mem(a64 *a, int vt, int sz)
+static void fp_ld_mem(jctx *x, int vt, int sz)
 {
-    a64_put(a, (sz == 4 ? 0xBC606800u : 0xFC606800u) | ((uint32_t)REA << 16) | (10u << 5) | (uint32_t)vt);
+    a64_put(&x->a, (sz == 4 ? 0xBC606800u : 0xFC606800u) | ((uint32_t)REA << 16) | (10u << 5) | (uint32_t)vt);
+    if (x->j->smp)
+        a64_dmb(&x->a, A64_DMB_ISHLD); /* ordem do x86 (como g_ldq) */
 }
 /* INS Vd.T[i], Vn.T[j] (es = bytes do elemento) */
 static void a64_ins(a64 *a, int vd, int i, int vn, int j, int es)
@@ -2188,7 +2194,7 @@ static bool emit_simd2(jctx *x, jinsn *in)
             if (q)                                                                             \
                 g_ldq(x, 1);                                                  \
             else                                                                               \
-                fp_ld_mem(a, 1, 8);                                                            \
+                fp_ld_mem(x, 1, 8);                                                            \
         } else {                                                                               \
             vec_ld(x, 1, rm, q);                                                               \
         }                                                                                      \
@@ -2198,7 +2204,7 @@ static bool emit_simd2(jctx *x, jinsn *in)
     do {                                                                                       \
         if (mem) {                                                                             \
             S2_TLB(sz, tag_r);                                                                 \
-            fp_ld_mem(a, 1, sz);                                                               \
+            fp_ld_mem(x, 1, sz);                                                               \
         } else {                                                                               \
             xmm_addr(x, rm);                                                                   \
             fp_ld_x12(a, 1, sz);                                                               \
@@ -3608,7 +3614,7 @@ static void group_code_hook(void *opaque, uint64_t pa, uint64_t len)
             h->j = j;
             h->pa = pa;
             h->len = len;
-            vm_run_on_cpu(vm, j->c->index, hook_work, h);
+            vm_run_on_cpu_sync(vm, j->c->index, hook_work, h);
         }
     }
     if (!any && vm) {
@@ -3835,6 +3841,34 @@ static bool xpage_decode(jctx *x, const uint8_t *page, unsigned off, uint64_t ri
            (o >= 0x50 && o <= 0x7f) || (o >= 0xc2 && o <= 0xc6) || o >= 0xd0;
 }
 
+static uint64_t vsum_of(const uint8_t *p, unsigned n)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (unsigned i = 0; i < n; i++)
+        h = (h ^ p[i]) * 0x100000001b3ULL;
+    return h;
+}
+
+/* MVM_JIT_VERIFY: o bloco que vai rodar ainda corresponde aos bytes do convidado? Se nao,
+ * uma escrita no codigo nao invalidou a traducao (traducao velha em execucao) */
+static void jit_verify(x86_cpu *c, uint64_t bp)
+{
+    jit_block *b = (jit_block *)(uintptr_t)bp;
+    static int nlog;
+    const uint8_t *p = space_ram_ptr(c->mem, b->phys, b->vlen, false);
+    if (!p || vsum_of(p, b->vlen) == b->vsum)
+        return;
+    if (nlog < 30) {
+        nlog++;
+        char sym[192] = "";
+        if (c->efer & EFER_LMA)
+            x86_debug_symbolize(c, b->rip, sym, sizeof(sym));
+        LOGE("JIT: CPU %d executa traducao velha: rip %llx phys %llx (%u bytes) %s valido=%d", c->index,
+             (unsigned long long)b->rip, (unsigned long long)b->phys, b->vlen, sym, b->valid);
+    }
+    b->vsum = vsum_of(p, b->vlen); /* registra uma vez por mudanca */
+}
+
 char x86_jit_dis_path[256]; /* depuracao (CLI "jitdis ARQ") */
 
 static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const bool *dead, jinsn *ins, bool *stored,
@@ -3845,6 +3879,11 @@ static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const b
     a64 *a = &x->a;
     jit_block *b = x->b;
 
+    if (j->verify) {
+        a64_mov(a, 1, 0, RC);
+        a64_mov_imm(a, 1, (uint64_t)(uintptr_t)b);
+        emit_call(x, (const void *)jit_verify);
+    }
     /* prologo: orcamento de instrucoes (corrigido no fim). O bloco roda se ainda ha
      * orcamento, mesmo que ultrapasse um pouco o fim da fatia. */
     uint32_t *blt, *sub_at;
@@ -4040,6 +4079,11 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
         fflush(dis);
     }
     __builtin___clear_cache((char *)b->code, (char *)j->pos);
+    if (j->verify) {
+        unsigned o = (unsigned)(phys & 0xfff), e = x.end_off > 0x1000 ? 0x1000 : x.end_off;
+        b->vlen = e > o ? e - o : 1;
+        b->vsum = vsum_of(page + o, b->vlen);
+    }
     mark_code_page(j, phys, x.end_off);
     if ((phys >> 12) < j->npages) {
         b->pnext = j->pages[phys >> 12];
@@ -4215,6 +4259,7 @@ struct x86_jit *x86_jit_new(x86_cpu *c)
     j->lrcpc = (getauxval(AT_HWCAP) & (1UL << 15)) != 0; /* HWCAP_LRCPC */
     j->lse = (getauxval(AT_HWCAP) & (1UL << 8)) != 0;    /* HWCAP_ATOMICS */
 #endif
+    j->verify = getenv("MVM_JIT_VERIFY") != NULL;
     if (j->smp)
         LOGI("JIT: modo SMP (ordem TSO%s)", j->lrcpc ? ", LDAPR" : ", LDAR");
     j->code = mem;

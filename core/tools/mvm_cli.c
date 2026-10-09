@@ -656,7 +656,7 @@ static void usage(void)
             "      --vnc-password S  senha do VNC (ate 8 caracteres)\n"
             "      --ide             discos -d/-r no controlador IDE (padrao com --bios)\n"
             "      --virtio          discos -d/-r em virtio-blk tambem com --bios (Linux; o SeaBIOS da boot por eles)\n"
-            "      --smp N           processadores do convidado (por enquanto so 1)\n"
+            "      --smp N           processadores do convidado (x86: ate 8)\n"
             "      --boot ORDEM      ordem de boot com BIOS: c=disco d=CD a=disquete (ex.: dca)\n"
             "      --vgabios ARQ     ROM de video (padrao: vgabios-stdvga.bin ao lado da BIOS)\n"
             "      --text            imprime a tela em modo texto ao sair\n"

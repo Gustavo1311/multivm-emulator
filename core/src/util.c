@@ -388,16 +388,20 @@ static int64_t now_raw(mvm_vm *vm)
     return (paused ? paused : host_ns()) - __atomic_load_n(&vm->clock_offset, __ATOMIC_RELAXED);
 }
 
+/* Estritamente crescente: no freio (ou com duas leituras no mesmo nanossegundo) devolve o
+ * ultimo valor + 1. O TSC real sempre anda: a sincronizacao do TSC do HAL do Windows faz
+ * um pingue-pongue entre CPUs esperando o valor gravado pela outra mudar, e um RDTSC
+ * repetido travava as duas para sempre. */
 int64_t mvm_now(mvm_vm *vm)
 {
     int64_t t = now_raw(vm);
     int64_t last = atomic_load_explicit(&vm->clock_last, memory_order_relaxed);
-    while (t > last) {
-        if (atomic_compare_exchange_weak_explicit(&vm->clock_last, &last, t, memory_order_relaxed,
+    for (;;) {
+        int64_t v = t > last ? t : last + 1;
+        if (atomic_compare_exchange_weak_explicit(&vm->clock_last, &last, v, memory_order_relaxed,
                                                   memory_order_relaxed))
-            return t;
+            return v;
     }
-    return last;
 }
 
 void timer_init(mvm_timer *t, void (*cb)(void *), void *opaque)
