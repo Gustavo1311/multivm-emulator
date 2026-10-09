@@ -200,7 +200,8 @@ public class MediaListView extends LinearLayout {
             ro.setButtonDrawable(R.drawable.ic_lock);
             ro.setButtonTintList(new ColorStateList(
                     new int[][]{{android.R.attr.state_checked}, {}},
-                    new int[]{getResources().getColor(R.color.warn, null), 0x55FFFFFF}));
+                    new int[]{getResources().getColor(R.color.warn, null),
+                            getResources().getColor(R.color.outline, null)}));
             ro.setChecked(m.ro);
             ro.setContentDescription("Somente leitura");
             ro.setPadding(dp(4), 0, dp(4), 0);
@@ -212,6 +213,7 @@ public class MediaListView extends LinearLayout {
         }
         ImageButton del = new ImageButton(c);
         del.setImageResource(R.drawable.ic_close);
+        del.setImageTintList(ColorStateList.valueOf(getResources().getColor(R.color.text2, null)));
         del.setBackgroundResource(R.drawable.toolbar_btn_bg);
         del.setContentDescription("Remover");
         del.setOnClickListener(v -> {

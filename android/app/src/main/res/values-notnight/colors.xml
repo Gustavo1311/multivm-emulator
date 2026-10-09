@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- tema claro (Ajustes > Tema > Claro, ou "Seguir o sistema" com o aparelho no modo claro) -->
+<resources>
+    <color name="bg">#F2F5F9</color>
+    <color name="bg_dark">#E3E9F0</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="surface2">#E8EEF4</color>
+    <color name="outline">#C5D1DC</color>
+    <color name="accent">#0277BD</color>
+    <color name="on_accent">#FFFFFF</color>
+    <color name="text">#14202B</color>
+    <color name="text2">#56677A</color>
+    <color name="ok">#2E7D32</color>
+    <color name="warn">#E65100</color>
+    <color name="danger">#C62828</color>
+    <color name="toolbar_top">#FFFFFF</color>
+    <color name="toolbar_bottom">#EDF1F5</color>
+    <color name="key">#DCE4EC</color>
+    <color name="pill_running">#E1F0FA</color>
+    <color name="trackpad_bg">#F2FFFFFF</color>
+    <color name="trackpad_pad">#E3E9F0</color>
+</resources>

@@ -33,7 +33,7 @@ import com.multivm.core.VirtualMachine;
 import java.util.Locale;
 
 /** Tela da VM em execucao: video, terminal serial e controles. */
-public class VmActivity extends Activity implements ScreenView.InputSink {
+public class VmActivity extends BaseActivity implements ScreenView.InputSink {
 
     /* codigos evdev */
     private static final int KEY_ESC = 1, KEY_BACKSPACE = 14, KEY_TAB = 15, KEY_ENTER = 28, KEY_LEFTCTRL = 29,
@@ -68,6 +68,8 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
     private final Button[] stickyButtons = new Button[stickyCodes.length];
     private final boolean[] sticky = new boolean[stickyCodes.length];
 
+    private AppSettings prefs;
+    private int frameMs = 33;
     private long lastInsns, lastStatusTime;
     private boolean ended;
 
@@ -80,7 +82,7 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
             if (vm == null) return;
             if (!showTerminal) screen.refresh(vm);
             else pumpTerminal();
-            ui.postDelayed(this, 33);
+            ui.postDelayed(this, frameMs);
         }
     };
 
@@ -103,8 +105,12 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
             finish();
             return;
         }
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        prefs = AppSettings.load(this);
         setContentView(R.layout.activity_vm);
+        if (prefs.orientation == AppSettings.ORIENT_LANDSCAPE)
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        else if (prefs.orientation == AppSettings.ORIENT_PORTRAIT)
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT);
 
         screen = findViewById(R.id.screen);
         terminalView = findViewById(R.id.terminal);
@@ -158,10 +164,9 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
         findViewById(R.id.btnStop).setOnClickListener(v -> askStop());
         btnMouse.setOnClickListener(v -> {
             sensIdx = (sensIdx + 1) % SENSITIVITY.length;
-            screen.setSensitivity(SENSITIVITY[sensIdx]);
-            btnMouse.setText("Mouse " + fmt(SENSITIVITY[sensIdx]) + "x");
+            applyMouseSpeed();
         });
-        btnMouse.setText("Mouse 1x");
+        findViewById(R.id.btnSettings).setOnClickListener(v -> startActivity(new Intent(this, SettingsActivity.class)));
 
         mediaPanel = new MediaPanel(this, vm);
         findViewById(R.id.btnMedia).setOnClickListener(v -> mediaPanel.show());
@@ -193,6 +198,8 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
         setKeysShown(getSharedPreferences("ui", MODE_PRIVATE).getBoolean("showKeys", false));
         vm.addStateListener(stateListener);
         setTerminal(!VmHolder.hasScreen);
+        if (prefs.startFullscreen) screen.post(() -> setFullscreen(true));
+        if (prefs.trackpadOnStart && VmHolder.hasScreen) screen.post(() -> setTrackpad(true));
         if (vm.getState() == VirtualMachine.State.STOPPED) onVmState(vm.getState(), vm.getLastExitReason());
     }
 
@@ -200,6 +207,13 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
     protected void onResume() {
         super.onResume();
         if (vm == null) return;
+        /* Configuracoes pode ter mudado (botao Ajustes) */
+        prefs = AppSettings.load(this);
+        frameMs = 1000 / AppSettings.FPS[prefs.fps];
+        screen.applySettings(prefs);
+        applyMouseSpeed();
+        if (prefs.keepScreenOn) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         /* a VM pode ter sido pausada/continuada pela tela inicial */
         btnPause.setText(vm.isPaused() ? "Continuar" : "Pausar");
         setTopIcon(btnPause, vm.isPaused() ? R.drawable.ic_play : R.drawable.ic_pause);
@@ -250,7 +264,18 @@ public class VmActivity extends Activity implements ScreenView.InputSink {
         setFullscreen(!fullscreen);
     }
 
+    @Override
+    protected boolean lightSystemBars() {
+        return false;
+    }
+
     /* ---- controles ---- */
+
+    /** Velocidade de Configuracoes vezes o multiplicador do botao Mouse (1x, 2x, 0,5x). */
+    private void applyMouseSpeed() {
+        screen.setSensitivity(prefs.mouseSpeed * SENSITIVITY[sensIdx]);
+        btnMouse.setText("Mouse " + fmt(SENSITIVITY[sensIdx]) + "x");
+    }
 
     private static void setTopIcon(Button b, int icon) {
         b.setCompoundDrawablesRelativeWithIntrinsicBounds(0, icon, 0, 0);

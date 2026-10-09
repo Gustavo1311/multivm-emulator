@@ -112,6 +112,10 @@ final class VmLauncher {
             if (s.initrd != null) b.initrd(copyToCache(a, s.initrd, "initrd"));
             String cl = s.cmdline == null ? "" : s.cmdline.trim();
             if (!cl.isEmpty()) b.cmdline(cl);
+            if (!x86 && s.dtb != null) b.deviceTree(copyToCache(a, s.dtb, "dtb"));
+            long addr = VmSettings.parseAddress(s.rawAddr);
+            if (addr < 0) throw new IllegalArgumentException("endereço de carga inválido: " + s.rawAddr);
+            if (addr > 0) b.rawLoadAddress(addr);
             if (s.fb) {
                 String[] wh = s.fbSize.trim().toLowerCase(Locale.ROOT).split("x");
                 try {
@@ -123,7 +127,9 @@ final class VmLauncher {
             }
         }
         /* ordem: discos, CDs, disquetes (o primeiro disco fica como mestre primario no IDE) */
-        DiskImage.Type hd = useSata ? DiskImage.Type.SATA : bios ? DiskImage.Type.IDE : DiskImage.Type.AUTO;
+        boolean useVirtio = bios && !useSata && s.virtio;
+        DiskImage.Type hd = useSata ? DiskImage.Type.SATA : useVirtio ? DiskImage.Type.VIRTIO
+                : bios ? DiskImage.Type.IDE : DiskImage.Type.AUTO;
         DiskImage.Type cd = useSata ? DiskImage.Type.SATA_CDROM : x86 ? DiskImage.Type.CDROM : DiskImage.Type.AUTO;
         int nHd = 0, nCd = 0, nFd = 0;
         for (VmSettings.Media m : disks)
@@ -145,7 +151,7 @@ final class VmLauncher {
                 nFd++;
             }
         /* com BIOS sempre ha um drive de CD e o A:, mesmo vazios, para trocar a midia com a VM ligada */
-        if (bios && nCd == 0 && (useSata || nHd < 4)) {
+        if (bios && nCd == 0 && (useSata || useVirtio || nHd < 4)) {
             b.addDisk(DiskImage.emptyCdrom(cd));
             media.get(VmSettings.KIND_CD).add(null);
         }
@@ -154,8 +160,20 @@ final class VmLauncher {
             media.get(VmSettings.KIND_FLOPPY).add(null);
         }
 
-        /* rede NAT e redirecionamentos de porta */
-        VmConfig.NicModel nic = VmSettings.NIC_MODELS[s.nic];
+        /* relogio */
+        if (s.rtc == VmSettings.RTC_LOCAL) {
+            long now = System.currentTimeMillis();
+            b.rtcBase((now + java.util.TimeZone.getDefault().getOffset(now)) / 1000);
+        } else if (s.rtc == VmSettings.RTC_FIXED) {
+            long t = VmSettings.parseRtcDate(s.rtcDate);
+            if (t < 0) throw new IllegalArgumentException("data do relógio inválida (use AAAA-MM-DD HH:MM): " + s.rtcDate);
+            b.rtcBase(t);
+        }
+
+        /* rede NAT e redirecionamentos de porta (a maquina ARM so tem virtio: o resto vira automatica) */
+        int nicIdx = contains(VmSettings.nicChoices(x86), s.nic) ? s.nic : 0;
+        int sndIdx = contains(VmSettings.soundChoices(x86), s.sound) ? s.sound : 0;
+        VmConfig.NicModel nic = VmSettings.NIC_MODELS[nicIdx];
         if (nic != VmConfig.NicModel.NONE) {
             b.network(nic, null).dns(hostDns(a));
             for (String f : s.forwards) {
@@ -164,11 +182,16 @@ final class VmLauncher {
             }
         }
         /* som (o microfone so com a permissao concedida) */
-        VmConfig.SoundModel snd = VmSettings.SOUND_MODELS[s.sound];
+        VmConfig.SoundModel snd = VmSettings.SOUND_MODELS[sndIdx];
         boolean mic = s.mic && a.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                 == android.content.pm.PackageManager.PERMISSION_GRANTED;
         b.audio(snd, mic);
         return b.build();
+    }
+
+    private static boolean contains(int[] a, int v) {
+        for (int x : a) if (x == v) return true;
+        return false;
     }
 
     /** O microfone foi pedido mas a permissao ainda nao foi dada. */

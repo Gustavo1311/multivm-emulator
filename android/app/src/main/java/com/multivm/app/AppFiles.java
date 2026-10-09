@@ -30,7 +30,30 @@ final class AppFiles {
     /** limites de memoria aceitos por VmConfig */
     static final int RAM_MIN = 4, RAM_MAX = 3072;
 
+    /** abaixo disto o live do Void/Debian com desktop para em "Kernel panic ... deadlocked on memory" */
+    static final int RAM_DESKTOP = 1024;
+
     private AppFiles() {}
+
+    /** RAM sugerida para VMs novas: 1 GiB, ou 1,5 GiB se o aparelho tiver 6 GiB ou mais. */
+    static int defaultRamMb(Context c) {
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) c.getSystemService(Context.ACTIVITY_SERVICE);
+            android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
+            am.getMemoryInfo(mi);
+            if ((mi.totalMem >> 20) >= 5800) return 1536;
+        } catch (Exception ignored) {
+        }
+        return RAM_DESKTOP;
+    }
+
+    /** Aviso de memoria pouca para sistemas com desktop, ou null. */
+    static String lowRamWarning(int mb) {
+        if (mb <= 0 || mb >= RAM_DESKTOP) return null;
+        return "Pouca memória: Linux com desktop (Void, Debian, Ubuntu com Xfce, GNOME…) precisa de pelo menos "
+                + RAM_DESKTOP + " MiB. Com menos, o boot pode parar em “Kernel panic … deadlocked on memory”. "
+                + "Windows XP, ReactOS, DOS e Linux em modo texto funcionam com menos.";
+    }
 
     static boolean isX86(Architecture a) {
         return a == Architecture.X86_64 || a == Architecture.I386;
@@ -92,52 +115,6 @@ final class AppFiles {
         String n = name.trim().replace('/', '_');
         if (!n.isEmpty() && !n.contains(".")) n += ".mvd";
         return n;
-    }
-
-    interface DiskChoice {
-        void chosen(String name, long gb);
-    }
-
-    /** Pergunta nome e tamanho (GiB) de um disco MVD novo. */
-    static void diskDialog(Activity a, String title, String name, long gb, DiskChoice done) {
-        LinearLayout box = new LinearLayout(a);
-        box.setOrientation(LinearLayout.VERTICAL);
-        int pad = (int) (20 * a.getResources().getDisplayMetrics().density);
-        box.setPadding(pad, pad / 2, pad, 0);
-        EditText n = new EditText(a);
-        n.setHint("nome do arquivo");
-        n.setText(name);
-        EditText size = new EditText(a);
-        size.setHint("tamanho máximo em GiB");
-        size.setInputType(InputType.TYPE_CLASS_NUMBER);
-        size.setText(String.valueOf(gb));
-        TextView help = new TextView(a);
-        help.setText("O arquivo MVD começa pequeno e cresce conforme o uso, até o tamanho máximo.");
-        help.setTextColor(a.getResources().getColor(R.color.text2, null));
-        help.setTextSize(12);
-        box.addView(n);
-        box.addView(size);
-        box.addView(help);
-        new AlertDialog.Builder(a)
-                .setTitle(title)
-                .setView(box)
-                .setPositiveButton("OK", (d, w) -> {
-                    long g;
-                    try {
-                        g = Long.parseLong(size.getText().toString().trim());
-                    } catch (NumberFormatException e) {
-                        g = -1;
-                    }
-                    String f = diskFileName(n.getText().toString());
-                    if (f.isEmpty() || g <= 0) {
-                        new AlertDialog.Builder(a).setMessage("Nome ou tamanho inválido.")
-                                .setPositiveButton("OK", null).show();
-                        return;
-                    }
-                    done.chosen(f, g);
-                })
-                .setNegativeButton("Cancelar", null)
-                .show();
     }
 
     /** Liga o campo de memoria (MiB) a uma barra de 64 em 64 MiB; after roda a cada mudanca. */

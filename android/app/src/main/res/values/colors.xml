@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- tema escuro (padrao); o tema claro fica em values-notnight -->
 <resources>
     <color name="bg">#0E1621</color>
     <color name="bg_dark">#0A1018</color>
@@ -12,4 +13,11 @@
     <color name="ok">#66BB6A</color>
     <color name="warn">#FFB74D</color>
     <color name="danger">#EF5350</color>
+    <!-- barra da VM, teclas, pilula em execucao e trackpad -->
+    <color name="toolbar_top">#141E2A</color>
+    <color name="toolbar_bottom">#0E1621</color>
+    <color name="key">#26364A</color>
+    <color name="pill_running">#1A2C3C</color>
+    <color name="trackpad_bg">#E6182230</color>
+    <color name="trackpad_pad">#0E1621</color>
 </resources>

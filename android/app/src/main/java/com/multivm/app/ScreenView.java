@@ -46,6 +46,10 @@ public class ScreenView extends View {
     private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private float sensitivity = 1f;
+    /* Configuracoes > Tela da VM e Mouse e toque */
+    private int scaleMode = AppSettings.SCALE_FIT;
+    private boolean tapClick = true, twoFingerRight = true, longPressDrag = true, leftHanded, haptics = true;
+    private float wheelFactor = 1f;
 
     /* touchpad */
     private final int slop;
@@ -58,8 +62,8 @@ public class ScreenView extends View {
     private final Runnable longPress = () -> {
         if (!moved && maxPointers == 1) {
             dragging = true;
-            setButtons(VirtualMachine.BUTTON_LEFT);
-            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            setButtons(primary());
+            if (haptics) performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
         }
     };
 
@@ -80,6 +84,28 @@ public class ScreenView extends View {
     void setInputSink(InputSink s) { sink = s; }
 
     void setSensitivity(float s) { sensitivity = s; }
+
+    /** Aplica escala, suavizacao e gestos de Configuracoes. */
+    void applySettings(AppSettings s) {
+        scaleMode = s.scale;
+        paint.setFilterBitmap(s.smooth);
+        tapClick = s.tapClick;
+        twoFingerRight = s.twoFingerRight;
+        longPressDrag = s.longPressDrag;
+        leftHanded = s.leftHanded;
+        haptics = s.haptics;
+        wheelFactor = (s.invertScroll ? -1f : 1f) * s.scrollSpeed;
+        invalidate();
+    }
+
+    /** botao do toque simples (o direito para canhotos) */
+    private int primary() {
+        return leftHanded ? VirtualMachine.BUTTON_RIGHT : VirtualMachine.BUTTON_LEFT;
+    }
+
+    private int secondary() {
+        return leftHanded ? VirtualMachine.BUTTON_LEFT : VirtualMachine.BUTTON_RIGHT;
+    }
 
     /** Copia o framebuffer se mudou. Chamado na thread de UI. */
     void refresh(VirtualMachine vm) {
@@ -115,24 +141,47 @@ public class ScreenView extends View {
         }
         int vw = getWidth(), vh = getHeight();
         int bw = bitmap.getWidth(), bh = bitmap.getHeight();
-        float s = Math.min((float) vw / bw, (float) vh / bh);
-        int w = Math.round(bw * s), h = Math.round(bh * s);
+        float fit = Math.min((float) vw / bw, (float) vh / bh);
+        int w, h;
+        switch (scaleMode) {
+            case AppSettings.SCALE_STRETCH:
+                w = vw;
+                h = vh;
+                break;
+            case AppSettings.SCALE_INTEGER: {
+                float s = fit >= 1f ? (float) Math.floor(fit) : fit; /* menor que a tela: so reduz */
+                w = Math.round(bw * s);
+                h = Math.round(bh * s);
+                break;
+            }
+            case AppSettings.SCALE_ORIGINAL:
+                w = bw;
+                h = bh;
+                break;
+            default:
+                w = Math.round(bw * fit);
+                h = Math.round(bh * fit);
+        }
         int x = (vw - w) / 2, y = (vh - h) / 2;
         dst.set(x, y, x + w, y + h);
         c.drawBitmap(bitmap, null, dst, paint);
     }
 
-    /** pixels do convidado por pixel da tela */
+    /** pixels do convidado por pixel da tela (horizontal e vertical: diferem ao esticar) */
     private float guestScale() {
         if (bitmap == null || dst.width() == 0) return 1f;
         return (float) bitmap.getWidth() / dst.width();
     }
 
+    private float guestScaleY() {
+        if (bitmap == null || dst.height() == 0) return 1f;
+        return (float) bitmap.getHeight() / dst.height();
+    }
+
     private void move(float dxView, float dyView, float wheel) {
-        float k = guestScale() * sensitivity;
-        accX += dxView * k;
-        accY += dyView * k;
-        accWheel += wheel;
+        accX += dxView * guestScale() * sensitivity;
+        accY += dyView * guestScaleY() * sensitivity;
+        accWheel += wheel * wheelFactor;
         int dx = (int) accX, dy = (int) accY, dw = (int) accWheel;
         if (dx == 0 && dy == 0 && dw == 0) return;
         accX -= dx;
@@ -174,7 +223,7 @@ public class ScreenView extends View {
                 downTime = e.getEventTime();
                 maxPointers = 1;
                 moved = dragging = false;
-                postDelayed(longPress, ViewConfiguration.getLongPressTimeout());
+                if (longPressDrag) postDelayed(longPress, ViewConfiguration.getLongPressTimeout());
                 return true;
             case MotionEvent.ACTION_POINTER_DOWN:
                 maxPointers = Math.max(maxPointers, e.getPointerCount());
@@ -206,7 +255,11 @@ public class ScreenView extends View {
                 if (dragging) {
                     setButtons(0);
                 } else if (!moved && e.getEventTime() - downTime < ViewConfiguration.getLongPressTimeout()) {
-                    click(maxPointers >= 2 ? VirtualMachine.BUTTON_RIGHT : VirtualMachine.BUTTON_LEFT);
+                    if (maxPointers >= 2) {
+                        if (twoFingerRight) click(secondary());
+                    } else if (tapClick) {
+                        click(primary());
+                    }
                 }
                 dragging = false;
                 return true;
@@ -250,9 +303,8 @@ public class ScreenView extends View {
     private boolean mouseEvent(MotionEvent e) {
         float x = e.getX(), y = e.getY();
         if (hoverValid) {
-            float k = guestScale();
-            accX += (x - hoverX) * k;
-            accY += (y - hoverY) * k;
+            accX += (x - hoverX) * guestScale();
+            accY += (y - hoverY) * guestScaleY();
         }
         hoverX = x;
         hoverY = y;
@@ -275,7 +327,9 @@ public class ScreenView extends View {
                     hoverValid = false;
                     return true;
                 case MotionEvent.ACTION_SCROLL: {
-                    int w = Math.round(-e.getAxisValue(MotionEvent.AXIS_VSCROLL));
+                    accWheel += -e.getAxisValue(MotionEvent.AXIS_VSCROLL) * wheelFactor;
+                    int w = (int) accWheel;
+                    accWheel -= w;
                     if (w != 0 && sink != null) sink.onPointer(0, 0, w, buttons);
                     return true;
                 }

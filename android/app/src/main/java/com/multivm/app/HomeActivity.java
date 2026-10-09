@@ -27,7 +27,7 @@ import java.util.Map;
  * Tela inicial: cada VM numa pilula com nome, resumo e estado. O botao de tres
  * pontos abre o menu da VM (iniciar, pausar/continuar, editar, excluir).
  */
-public class HomeActivity extends Activity {
+public class HomeActivity extends BaseActivity {
 
     /** extra do Intent: id da VM a iniciar assim que a tela abrir (vem do assistente) */
     static final String EXTRA_AUTOSTART = "autostart";
@@ -69,6 +69,7 @@ public class HomeActivity extends Activity {
         empty = findViewById(R.id.homeEmpty);
         findViewById(R.id.homeNew).setOnClickListener(v ->
                 startActivity(new Intent(this, WizardActivity.class).putExtra(WizardActivity.EXTRA_FROM_HOME, true)));
+        findViewById(R.id.homeSettings).setOnClickListener(v -> startActivity(new Intent(this, SettingsActivity.class)));
         if (saved == null) handleAutostart(getIntent());
     }
 
@@ -158,6 +159,7 @@ public class HomeActivity extends Activity {
 
         ImageButton more = new ImageButton(this);
         more.setImageResource(R.drawable.ic_more);
+        more.setImageTintList(ColorStateList.valueOf(getColor(R.color.text)));
         more.setBackgroundResource(R.drawable.round_btn_bg);
         more.setContentDescription("Opções de " + s.name);
         more.setOnClickListener(v -> showMenu(v, s));
@@ -315,8 +317,8 @@ public class HomeActivity extends Activity {
     private void askDelete(VmSettings s) {
         new AlertDialog.Builder(this)
                 .setTitle("Excluir “" + s.name + "”?")
-                .setMessage("A configuração da VM é apagada. Os arquivos de disco não são apagados (ficam em "
-                        + AppFiles.diskDir(this) + ").")
+                .setMessage("A configuração da VM é apagada. Os arquivos de disco não são apagados (ficam onde foram salvos; "
+                        + "os da pasta do app em " + AppFiles.diskDir(this) + ").")
                 .setPositiveButton("Excluir", (d, w) -> {
                     VmSettings.delete(this, s.id);
                     refresh();

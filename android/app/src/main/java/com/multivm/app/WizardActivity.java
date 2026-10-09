@@ -39,7 +39,7 @@ import java.util.Set;
  * (uma pagina cada) e o resumo aparece antes de criar. Grava a configuracao com
  * {@link VmSettings}, a mesma da MainActivity.
  */
-public class WizardActivity extends Activity implements MediaListView.Host {
+public class WizardActivity extends BaseActivity implements MediaListView.Host {
 
     /** extra do Intent: aberto pela tela inicial (nao e a primeira execucao: comeca em Sistema) */
     static final String EXTRA_FROM_HOME = "fromHome";
@@ -69,7 +69,7 @@ public class WizardActivity extends Activity implements MediaListView.Host {
     private EditText name, ram, cmdline, fbSize;
     private Spinner arch, bootOrder;
     private SeekBar ramBar;
-    private RadioButton modeBios, modeKernel, ctrlSata;
+    private RadioButton modeBios, modeKernel, ctrlSata, ctrlVirtio;
     private CheckBox fb, startNow;
     private View ctrlBox, biosBox, kernelBox;
     private MediaListView disks, cds, floppies;
@@ -84,6 +84,7 @@ public class WizardActivity extends Activity implements MediaListView.Host {
     private View vncGroup;
     private final List<String> forwards = new ArrayList<>();
     private ForwardList fwd;
+    private final DiskCreator diskCreator = new DiskCreator(this);
     /** sistema cujas placas sugeridas ja foram aplicadas (-1 = nenhum) */
     private int appliedOs = -1;
 
@@ -116,12 +117,14 @@ public class WizardActivity extends Activity implements MediaListView.Host {
         ram = findViewById(R.id.wRam);
         cmdline = findViewById(R.id.wCmdline);
         fbSize = findViewById(R.id.wFbSize);
+        fbSize.setText(AppSettings.load(this).defaultResolution);
         arch = findViewById(R.id.wArch);
         bootOrder = findViewById(R.id.wBootOrder);
         ramBar = findViewById(R.id.wRamBar);
         modeBios = findViewById(R.id.wModeBios);
         modeKernel = findViewById(R.id.wModeKernel);
         ctrlSata = findViewById(R.id.wCtrlSata);
+        ctrlVirtio = findViewById(R.id.wCtrlVirtio);
         fb = findViewById(R.id.wFb);
         startNow = findViewById(R.id.wStartNow);
         ctrlBox = findViewById(R.id.wCtrlBox);
@@ -155,6 +158,7 @@ public class WizardActivity extends Activity implements MediaListView.Host {
             public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
                 osHelp.setText("Placas sugeridas — som: " + VmSettings.SOUND_NAMES[OS_SOUND[pos]] + "; rede: "
                         + VmSettings.NIC_NAMES[OS_NIC[pos]] + ". Você pode trocar na próxima etapa, “Som e rede”.");
+                updateRamHelp();
             }
 
             @Override
@@ -226,6 +230,7 @@ public class WizardActivity extends Activity implements MediaListView.Host {
         } else {
             /* nome padrao: "Minha VM", "Minha VM 2", ... */
             int n = VmSettings.ids(this).size();
+            ram.setText(String.valueOf(AppFiles.defaultRamMb(this)));
             if (n > 0) name.setText("Minha VM " + (n + 1));
             /* sugestao inicial: um disco novo de 8 GiB (o nome acompanha o nome da VM) */
             suggestDiskName();
@@ -461,6 +466,10 @@ public class WizardActivity extends Activity implements MediaListView.Host {
         if (deviceRam > 0) sb.append("Seu aparelho tem ").append(deviceRam).append(" MiB de RAM.");
         if (mb > 0 && deviceRam > 0 && mb > deviceRam / 2)
             sb.append("\nAtenção: isso é mais da metade da memória do aparelho; o Android pode fechar o app.");
+        /* Linux e Windows 7+ (posicoes 0 e 2); XP, ReactOS e outros rodam com menos */
+        int o = os == null ? 0 : Math.max(0, os.getSelectedItemPosition());
+        String low = o == 0 || o == 2 ? AppFiles.lowRamWarning(mb) : null;
+        if (low != null) sb.append(sb.length() > 0 ? "\n" : "").append(low);
         ramHelp.setText(sb);
     }
 
@@ -523,6 +532,7 @@ public class WizardActivity extends Activity implements MediaListView.Host {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (diskCreator.onActivityResult(requestCode, resultCode, data)) return;
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
         String uri = AppFiles.takePersistable(this, data);
         if (requestCode == REQ_KERNEL) setKernel(uri);
@@ -551,8 +561,8 @@ public class WizardActivity extends Activity implements MediaListView.Host {
 
     @Override
     public void newDisk(MediaListView list) {
-        AppFiles.diskDialog(this, "Novo disco (MVD)", freeDiskName(nameBase()), DEFAULT_DISK_GB,
-                (n, gb) -> list.addPending(n, gb));
+        diskCreator.ask("Novo disco (MVD)", freeDiskName(nameBase()), DEFAULT_DISK_GB,
+                list::addPending, list::add);
     }
 
     @Override
@@ -561,9 +571,14 @@ public class WizardActivity extends Activity implements MediaListView.Host {
     @Override
     public void editPending(MediaListView list, int index) {
         VmSettings.Media m = list.items().get(index);
-        AppFiles.diskDialog(this, "Disco novo", m.newName, m.newGb, (n, gb) -> {
+        diskCreator.ask("Disco novo", m.newName, m.newGb, (n, gb) -> {
             m.newName = n;
             m.newGb = gb;
+            list.changed();
+        }, uri -> {
+            /* criado agora na pasta escolhida: vira um arquivo comum */
+            m.uri = uri;
+            m.newName = null;
             list.changed();
         });
     }
@@ -624,7 +639,7 @@ public class WizardActivity extends Activity implements MediaListView.Host {
             st.add("nenhum");
         } else {
             st.add("Controlador");
-            st.add(!b ? "automático (virtio)" : ctrlSata.isChecked() ? "SATA/AHCI" : "IDE");
+            st.add(!b ? "automático (virtio)" : ctrlSata.isChecked() ? "SATA/AHCI" : ctrlVirtio.isChecked() ? "virtio" : "IDE");
         }
         addCard("Armazenamento", STEP_STORAGE, R.drawable.ic_hdd, st.toArray(new String[0]));
 
@@ -776,6 +791,7 @@ public class WizardActivity extends Activity implements MediaListView.Host {
         s.fbSize = fbSize.getText().toString().trim();
         s.bootOrder = b ? VmSettings.BOOT_CODES[Math.max(0, bootOrder.getSelectedItemPosition())] : "";
         s.sata = b && ctrlSata.isChecked();
+        s.virtio = b && ctrlVirtio.isChecked();
         s.kernel = b ? null : kernel;
         s.initrd = b ? null : initrd;
         s.disks().addAll(disks.items());

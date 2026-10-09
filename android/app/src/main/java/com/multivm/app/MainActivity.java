@@ -31,20 +31,20 @@ import java.util.Arrays;
 import java.util.List;
 
 /** Edicao de uma VM, em cartoes por categoria. Os campos sao salvos ao sair da tela. */
-public class MainActivity extends Activity implements MediaListView.Host {
+public class MainActivity extends BaseActivity implements MediaListView.Host {
 
     private static final Architecture[] ARCHS = AppFiles.ARCHS;
     /** extra do Intent: id da VM a editar (VmSettings) */
     static final String EXTRA_VM_ID = "vmId";
 
     /* requestCodes do seletor de arquivos */
-    private static final int REQ_KERNEL = 0, REQ_INITRD = 1, REQ_MEDIA = 10, REQ_CONVERT = 100;
+    private static final int REQ_KERNEL = 0, REQ_INITRD = 1, REQ_DTB = 2, REQ_MEDIA = 10, REQ_CONVERT = 100;
 
     private VmSettings settings;
     private Spinner arch, bootOrder;
     private EditText ram, cmdline, fbSize;
     private SeekBar ramBar;
-    private RadioButton modeBios, modeKernel, sata;
+    private RadioButton modeBios, modeKernel, sata, virtioCtrl;
     private CheckBox fbEnable;
     private View kernelGroup, biosGroup, ctrlGroup;
     private MediaListView[] lists;
@@ -65,6 +65,23 @@ public class MainActivity extends Activity implements MediaListView.Host {
     private ForwardList fwd;
     private static final int REQ_MIC = 200;
     private boolean micAsked;
+    /* relogio, resolucao, parametros do kernel e opcoes ARM */
+    private Spinner rtcMode, fbRes;
+    private EditText rtcDate, rawAddr;
+    private TextView archHelp, dtbName, ramHelp;
+    private View dtbGroup;
+    private LinearLayout quickParams;
+    private String dtb;
+    /** placas oferecidas para a arquitetura atual (indices globais de VmSettings) */
+    private int[] nicIdx, sndIdx;
+    private Boolean choicesX86;
+
+    /** atalhos da linha de comando: parametro e rotulo */
+    private static final String[][] QUICK = {{"root=/dev/vda", "raiz /dev/vda"}, {"root=/dev/vda1", "raiz /dev/vda1"},
+            {"root=/dev/vda2", "raiz /dev/vda2"}, {"rootwait", "rootwait"}, {"rw", "rw"}, {"earlycon", "earlycon"},
+            {"console=tty0", "console na tela"}, {"quiet", "quiet"}, {"loglevel=7", "loglevel=7"},
+            {"init=/bin/sh", "init=/bin/sh"}};
+    private final DiskCreator diskCreator = new DiskCreator(this);
 
     @Override
     protected void onCreate(Bundle saved) {
@@ -80,11 +97,13 @@ public class MainActivity extends Activity implements MediaListView.Host {
         bootOrder = findViewById(R.id.bootOrder);
         ram = findViewById(R.id.ram);
         ramBar = findViewById(R.id.ramBar);
+        ramHelp = findViewById(R.id.ramHelp);
         cmdline = findViewById(R.id.cmdline);
         fbSize = findViewById(R.id.fbSize);
         modeBios = findViewById(R.id.modeBios);
         modeKernel = findViewById(R.id.modeKernel);
         sata = findViewById(R.id.sata);
+        virtioCtrl = findViewById(R.id.virtioCtrl);
         fbEnable = findViewById(R.id.fbEnable);
         kernelGroup = findViewById(R.id.kernelGroup);
         biosGroup = findViewById(R.id.biosGroup);
@@ -113,8 +132,37 @@ public class MainActivity extends Activity implements MediaListView.Host {
         modeBios.setOnCheckedChangeListener((b, c) -> updateMode());
         modeKernel.setOnCheckedChangeListener((b, c) -> updateMode());
         sata.setOnCheckedChangeListener((b, c) -> updateMode());
+        virtioCtrl.setOnCheckedChangeListener((b, c) -> updateMode());
         AppFiles.bindRam(ram, ramBar, this::updateChips);
-        fbEnable.setOnCheckedChangeListener((b, c) -> fbSize.setVisibility(c ? View.VISIBLE : View.GONE));
+        fbEnable.setOnCheckedChangeListener((b, c) -> updateFb());
+
+        rtcMode = findViewById(R.id.rtcMode);
+        rtcDate = findViewById(R.id.rtcDate);
+        fbRes = findViewById(R.id.fbRes);
+        rawAddr = findViewById(R.id.rawAddr);
+        archHelp = findViewById(R.id.archHelp);
+        dtbName = findViewById(R.id.dtbName);
+        dtbGroup = findViewById(R.id.dtbGroup);
+        quickParams = findViewById(R.id.quickParams);
+        rtcMode.setAdapter(spinnerAdapter(VmSettings.RTC_NAMES));
+        rtcMode.setOnItemSelectedListener(onSelect(() -> rtcDate.setVisibility(
+                rtcMode.getSelectedItemPosition() == VmSettings.RTC_FIXED ? View.VISIBLE : View.GONE)));
+        String[] res = Arrays.copyOf(AppSettings.RESOLUTIONS, AppSettings.RESOLUTIONS.length + 1);
+        res[res.length - 1] = "Personalizada…";
+        fbRes.setAdapter(spinnerAdapter(res));
+        fbRes.setOnItemSelectedListener(onSelect(this::updateFb));
+        findViewById(R.id.dtbPick).setOnClickListener(v -> pick(REQ_DTB, false));
+        findViewById(R.id.dtbClear).setOnClickListener(v -> setDtb(null));
+        cmdline.addTextChangedListener(new android.text.TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence t, int a, int b, int c) {}
+
+            @Override
+            public void onTextChanged(CharSequence t, int a, int b, int c) {}
+
+            @Override
+            public void afterTextChanged(android.text.Editable e) { renderQuickParams(); }
+        });
 
         findViewById(R.id.kernelPick).setOnClickListener(v -> pick(REQ_KERNEL, false));
         findViewById(R.id.initrdPick).setOnClickListener(v -> pick(REQ_INITRD, false));
@@ -134,8 +182,6 @@ public class MainActivity extends Activity implements MediaListView.Host {
         netHelp = findViewById(R.id.netHelp);
         vncHelp = findViewById(R.id.vncHelp);
         vncGroup = findViewById(R.id.vncGroup);
-        sound.setAdapter(spinnerAdapter(VmSettings.SOUND_NAMES));
-        nic.setAdapter(spinnerAdapter(VmSettings.NIC_NAMES));
         AdapterView.OnItemSelectedListener upd = new AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(AdapterView<?> p, View v, int pos, long id) { updateRemote(); }
@@ -170,7 +216,7 @@ public class MainActivity extends Activity implements MediaListView.Host {
         if (!abis.contains("arm64-v8a"))
             sb.append("\nAVISO: a biblioteca nativa deste APK só foi compilada para arm64-v8a.");
         sb.append("\nBIOS embutida: SeaBIOS (bios-256k.bin + vgabios-stdvga.bin).");
-        sb.append("\nNovos discos ficam em ").append(diskDir());
+        sb.append("\nPasta do app para discos: ").append(diskDir()).append(" (Configurações › Discos decide se o app pergunta a pasta).");
         info.setText(sb);
     }
 
@@ -201,8 +247,8 @@ public class MainActivity extends Activity implements MediaListView.Host {
     /* ---- som, rede e VNC ---- */
 
     private void updateRemote() {
-        mic.setVisibility(sound.getSelectedItemPosition() == VmSettings.SOUND_NONE ? View.GONE : View.VISIBLE);
-        int n = nic.getSelectedItemPosition();
+        mic.setVisibility(selectedSound() == VmSettings.SOUND_NONE ? View.GONE : View.VISIBLE);
+        int n = selectedNic();
         netHelp.setText(n == VmSettings.NIC_NONE ? "A VM fica sem rede."
                 : "Rede NAT: a VM recebe 10.0.2.15 por DHCP e acessa a internet pela conexão do aparelho. "
                 + "O próprio aparelho aparece para ela como 10.0.2.2.");
@@ -242,9 +288,17 @@ public class MainActivity extends Activity implements MediaListView.Host {
         ctrlGroup.setVisibility(b ? View.VISIBLE : View.GONE);
         lists[VmSettings.KIND_FLOPPY].setVisibility(x86 ? View.VISIBLE : View.GONE);
         cmdline.setHint("console=" + selectedArch().linuxConsole());
+        dtbGroup.setVisibility(x86 ? View.GONE : View.VISIBLE);
+        archHelp.setText(archHelpText());
+        if (choicesX86 == null || choicesX86 != x86)
+            updateCardChoices(nicIdx == null ? settings.nic : selectedNic(), sndIdx == null ? settings.sound : selectedSound());
+        renderQuickParams();
         int ataDevices = lists[0].items().size() + lists[1].items().size();
         if (sata.isChecked())
             ctrlHelp.setText("SATA/AHCI: Windows Vista ou mais novo e Linux. Até 8 discos e CDs.");
+        else if (virtioCtrl.isChecked())
+            ctrlHelp.setText("virtio-blk: só Linux (e BSDs), o disco mais rápido. Os CDs ficam no IDE. "
+                    + "Windows precisa de driver próprio e não dá boot por ele.");
         else if (ataDevices > 4)
             ctrlHelp.setText("O IDE tem 4 vagas: as mídias excedentes vão para o SATA/AHCI (o Windows XP não as enxerga).");
         else
@@ -256,6 +310,15 @@ public class MainActivity extends Activity implements MediaListView.Host {
         if (chipArch == null || lists == null) return;
         chipArch.setText(AppFiles.ARCH_NAMES[Math.max(0, arch.getSelectedItemPosition())]);
         chipRam.setText(ram.getText().toString().trim() + " MiB");
+        int mb;
+        try {
+            mb = Integer.parseInt(ram.getText().toString().trim());
+        } catch (NumberFormatException e) {
+            mb = -1;
+        }
+        String low = AppFiles.lowRamWarning(mb);
+        ramHelp.setText(low);
+        ramHelp.setVisibility(low != null ? View.VISIBLE : View.GONE);
         chipMode.setText(bios() ? "BIOS" : "Kernel Linux");
         int d = lists[0].items().size(), c = lists[1].items().size(), f = isX86() ? lists[2].items().size() : 0;
         StringBuilder sb = new StringBuilder();
@@ -277,8 +340,16 @@ public class MainActivity extends Activity implements MediaListView.Host {
         cmdline.setText(settings.cmdline);
         fbEnable.setChecked(settings.fb);
         fbSize.setText(settings.fbSize);
-        fbSize.setVisibility(settings.fb ? View.VISIBLE : View.GONE);
+        int ri = Arrays.asList(AppSettings.RESOLUTIONS).indexOf(settings.fbSize.trim());
+        fbRes.setSelection(ri >= 0 ? ri : AppSettings.RESOLUTIONS.length);
+        updateFb();
+        rtcMode.setSelection(settings.rtc);
+        rtcDate.setText(settings.rtcDate);
+        rtcDate.setVisibility(settings.rtc == VmSettings.RTC_FIXED ? View.VISIBLE : View.GONE);
+        rawAddr.setText(settings.rawAddr);
+        setDtb(settings.dtb);
         if (settings.sata) sata.setChecked(true);
+        else if (settings.virtio) virtioCtrl.setChecked(true);
         else ((RadioButton) findViewById(R.id.ide)).setChecked(true);
         setKernel(settings.kernel);
         setInitrd(settings.initrd);
@@ -297,8 +368,8 @@ public class MainActivity extends Activity implements MediaListView.Host {
         bootOrder.setAdapter(spinnerAdapter(names.toArray(new String[0])));
         bootOrder.setSelection(idx);
 
-        sound.setSelection(settings.sound);
-        nic.setSelection(settings.nic);
+        choicesX86 = null;
+        updateCardChoices(settings.nic, settings.sound);
         mic.setChecked(settings.mic);
         forwards.clear();
         forwards.addAll(settings.forwards);
@@ -323,14 +394,19 @@ public class MainActivity extends Activity implements MediaListView.Host {
         int b = bootOrder.getSelectedItemPosition();
         settings.bootOrder = b >= 0 && b < bootCodes.size() ? bootCodes.get(b) : "";
         settings.sata = sata.isChecked();
+        settings.virtio = virtioCtrl.isChecked();
         settings.kernel = kernel;
         settings.initrd = initrd;
         for (int k = 0; k < lists.length; k++) {
             settings.media[k].clear();
             settings.media[k].addAll(lists[k].items());
         }
-        settings.sound = Math.max(0, sound.getSelectedItemPosition());
-        settings.nic = Math.max(0, nic.getSelectedItemPosition());
+        settings.sound = selectedSound();
+        settings.nic = selectedNic();
+        settings.rtc = Math.max(0, rtcMode.getSelectedItemPosition());
+        settings.rtcDate = rtcDate.getText().toString().trim();
+        settings.rawAddr = rawAddr.getText().toString().trim();
+        settings.dtb = dtb;
         settings.mic = mic.isChecked();
         settings.forwards.clear();
         settings.forwards.addAll(forwards);
@@ -357,6 +433,122 @@ public class MainActivity extends Activity implements MediaListView.Host {
         initrdName.setText(v == null ? "(nenhum)" : displayName(v));
     }
 
+    private void setDtb(String v) {
+        dtb = v;
+        dtbName.setText(v == null ? "(gerado automaticamente)" : displayName(v));
+    }
+
+    /* ---- tela grafica, placas e parametros do kernel ---- */
+
+    private void updateFb() {
+        boolean on = fbEnable.isChecked();
+        int pos = fbRes.getSelectedItemPosition();
+        boolean custom = pos < 0 || pos >= AppSettings.RESOLUTIONS.length;
+        fbRes.setVisibility(on ? View.VISIBLE : View.GONE);
+        fbSize.setVisibility(on && custom ? View.VISIBLE : View.GONE);
+        if (!custom && !loading) fbSize.setText(AppSettings.RESOLUTIONS[pos]);
+    }
+
+    private String archHelpText() {
+        switch (selectedArch()) {
+            case ARM64:
+                return "Máquina virt: CPU Cortex-A53 (ARMv8, 64 bits), GICv2, timer genérico, serial PL011 (ttyAMA0), "
+                        + "RTC PL031 e dispositivos virtio (discos /dev/vda…, rede e som). Inicia um kernel Linux "
+                        + "(Image ou Image.gz) com initrd e device tree opcionais.";
+            case ARM:
+                return "Máquina virt: CPU Cortex-A15 (ARMv7, 32 bits), GICv2, timer genérico, serial PL011 (ttyAMA0), "
+                        + "RTC PL031 e dispositivos virtio (discos /dev/vda…, rede e som). Inicia um kernel Linux "
+                        + "(zImage) com initrd e device tree opcionais.";
+            default:
+                return "PC: BIOS SeaBIOS, vídeo VGA/VBE, IDE/SATA, ACPI, APIC. Também inicia um kernel Linux direto.";
+        }
+    }
+
+    /** Monta as listas de placas da arquitetura, mantendo a escolha quando ela existe nas duas. */
+    private void updateCardChoices(int nicSel, int sndSel) {
+        boolean x86 = isX86();
+        choicesX86 = x86;
+        nicIdx = VmSettings.nicChoices(x86);
+        sndIdx = VmSettings.soundChoices(x86);
+        nic.setAdapter(spinnerAdapter(choiceNames(VmSettings.NIC_NAMES, nicIdx, x86)));
+        sound.setAdapter(spinnerAdapter(choiceNames(VmSettings.SOUND_NAMES, sndIdx, x86)));
+        nic.setSelection(Math.max(0, indexOf(nicIdx, nicSel)));
+        sound.setSelection(Math.max(0, indexOf(sndIdx, sndSel)));
+    }
+
+    private static String[] choiceNames(String[] all, int[] idx, boolean x86) {
+        String[] out = new String[idx.length];
+        for (int i = 0; i < idx.length; i++) out[i] = idx[i] == 0 && !x86 ? "Automática (virtio)" : all[idx[i]];
+        return out;
+    }
+
+    private static int indexOf(int[] a, int v) {
+        for (int i = 0; i < a.length; i++) if (a[i] == v) return i;
+        return -1;
+    }
+
+    private int selectedNic() {
+        int p = nic.getSelectedItemPosition();
+        return nicIdx != null && p >= 0 && p < nicIdx.length ? nicIdx[p] : 0;
+    }
+
+    private int selectedSound() {
+        int p = sound.getSelectedItemPosition();
+        return sndIdx != null && p >= 0 && p < sndIdx.length ? sndIdx[p] : 0;
+    }
+
+    private List<String> cmdTokens() {
+        List<String> t = new ArrayList<>();
+        for (String x : cmdline.getText().toString().trim().split("\\s+")) if (!x.isEmpty()) t.add(x);
+        return t;
+    }
+
+    /** Liga/desliga um parametro; root= e init= sao exclusivos. Linha vazia ganha o console padrao. */
+    private void toggleParam(String p) {
+        List<String> t = cmdTokens();
+        if (t.isEmpty()) t.add("console=" + selectedArch().linuxConsole());
+        if (t.contains(p)) {
+            t.remove(p);
+        } else {
+            String key = p.contains("=") ? p.substring(0, p.indexOf('=') + 1) : null;
+            if ("root=".equals(key) || "init=".equals(key)) t.removeIf(x -> x.startsWith(key));
+            t.add(p);
+        }
+        cmdline.setText(String.join(" ", t));
+        cmdline.setSelection(cmdline.length());
+    }
+
+    private void renderQuickParams() {
+        if (quickParams == null) return;
+        quickParams.removeAllViews();
+        List<String> t = cmdTokens();
+        for (String[] q : QUICK) {
+            boolean on = t.contains(q[0]);
+            TextView chip = new TextView(this, null, 0, R.style.Chip);
+            chip.setText(on ? "✓ " + q[1] : q[1]);
+            chip.setBackgroundResource(R.drawable.chip_bg);
+            if (on) {
+                chip.setBackgroundTintList(android.content.res.ColorStateList.valueOf(getColor(R.color.accent)));
+                chip.setTextColor(getColor(R.color.on_accent));
+            }
+            chip.setOnClickListener(v -> toggleParam(q[0]));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.setMarginEnd((int) (6 * getResources().getDisplayMetrics().density));
+            quickParams.addView(chip, lp);
+        }
+    }
+
+    private static AdapterView.OnItemSelectedListener onSelect(Runnable r) {
+        return new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> p, View v, int pos, long id) { r.run(); }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> p) {}
+        };
+    }
+
     private void pick(int req, boolean writable) {
         Intent it = AppFiles.pickIntent(writable);
         if (req == REQ_CONVERT) it.setFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
@@ -370,6 +562,7 @@ public class MainActivity extends Activity implements MediaListView.Host {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (diskCreator.onActivityResult(requestCode, resultCode, data)) return;
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
         if (requestCode == REQ_CONVERT) {
             convertDialog(data.getData());
@@ -378,6 +571,7 @@ public class MainActivity extends Activity implements MediaListView.Host {
         String uri = AppFiles.takePersistable(this, data);
         if (requestCode == REQ_KERNEL) setKernel(uri);
         else if (requestCode == REQ_INITRD) setInitrd(uri);
+        else if (requestCode == REQ_DTB) setDtb(uri);
         else if (requestCode >= REQ_MEDIA && requestCode < REQ_MEDIA + lists.length) lists[requestCode - REQ_MEDIA].add(uri);
         save();
     }
@@ -403,14 +597,9 @@ public class MainActivity extends Activity implements MediaListView.Host {
 
     @Override
     public void newDisk(MediaListView list) {
-        AppFiles.diskDialog(this, "Novo disco (MVD)", "disco.mvd", 8, (name, gb) -> {
-            try {
-                String path = AppFiles.createMvd(this, name, gb);
-                list.add(path);
-                toast("Criado: " + path);
-            } catch (Exception ex) {
-                error("Falha ao criar o disco", ex);
-            }
+        diskCreator.ask("Novo disco (MVD)", "disco.mvd", 8, null, uri -> {
+            list.add(uri);
+            toast("Criado: " + (uri.startsWith("/") ? uri : displayName(uri)));
         });
     }
 
@@ -430,7 +619,7 @@ public class MainActivity extends Activity implements MediaListView.Host {
 
     /* ---- conversao de imagens ---- */
 
-    /** Pergunta o nome e a compressao; converte para MVD na pasta de discos. */
+    /** Pergunta o nome, a compressao e o local; converte para MVD. */
     private void convertDialog(Uri src) {
         String shown = displayName(src.toString());
         String base = shown.replaceAll("  \\(.*\\)$", "");
@@ -447,12 +636,16 @@ public class MainActivity extends Activity implements MediaListView.Host {
         name.setText(base.replace('/', '_') + ".mvd");
         CheckBox compress = new CheckBox(this);
         compress.setText("Comprimir (LZ4): ocupa menos; blocos regravados voltam a ocupar o normal");
+        android.widget.RadioGroup where = diskCreator.locationChooser();
         box.addView(from);
         box.addView(name);
         box.addView(compress);
+        box.addView(where);
+        android.widget.ScrollView sv = new android.widget.ScrollView(this);
+        sv.addView(box);
         new AlertDialog.Builder(this)
                 .setTitle("Converter para MVD")
-                .setView(box)
+                .setView(sv)
                 .setPositiveButton("Converter", (d, w) -> {
                     String n = name.getText().toString().trim().replace('/', '_');
                     if (n.isEmpty()) {
@@ -464,18 +657,25 @@ public class MainActivity extends Activity implements MediaListView.Host {
                         toast("não consegui criar " + dir);
                         return;
                     }
+                    if (DiskCreator.choosesFolder(where)) {
+                        /* converte num temporario da pasta do app e copia para a pasta escolhida */
+                        File tmp = new File(dir, ".convertendo-" + System.nanoTime() + ".mvd");
+                        diskCreator.saveAs(n, doc -> runConversion(src, tmp, compress.isChecked(), doc));
+                        return;
+                    }
                     File dst = new File(dir, n);
                     if (dst.exists()) {
                         toast(n + " já existe");
                         return;
                     }
-                    runConversion(src, dst, compress.isChecked());
+                    runConversion(src, dst, compress.isChecked(), null);
                 })
                 .setNegativeButton("Cancelar", null)
                 .show();
     }
 
-    private void runConversion(Uri src, File dst, boolean compress) {
+    /** doc != null: dst e temporario e o resultado vai para esse documento (pasta escolhida). */
+    private void runConversion(Uri src, File dst, boolean compress, Uri doc) {
         ProgressBar bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         bar.setMax(1000);
         TextView status = new TextView(this);
@@ -486,8 +686,9 @@ public class MainActivity extends Activity implements MediaListView.Host {
         box.addView(bar);
         box.addView(status);
         final boolean[] cancel = {false};
+        String shownName = doc != null ? displayName(doc.toString()) : dst.getName();
         AlertDialog dlg = new AlertDialog.Builder(this)
-                .setTitle("Convertendo " + dst.getName())
+                .setTitle("Convertendo " + shownName)
                 .setView(box)
                 .setCancelable(false)
                 .setNegativeButton("Cancelar", (d, w) -> cancel[0] = true)
@@ -511,8 +712,26 @@ public class MainActivity extends Activity implements MediaListView.Host {
                     }
                     return !cancel[0];
                 });
+                if (doc != null) {
+                    if (cancel[0]) throw new IOException("cancelado");
+                    runOnUiThread(() -> status.setText("Copiando para a pasta escolhida…"));
+                    final long[] last2 = {0};
+                    diskCreator.copyToDocument(dst, doc, (done, total) -> {
+                        long now = System.nanoTime();
+                        if (now - last2[0] > 200_000_000L || done == total) {
+                            last2[0] = now;
+                            runOnUiThread(() -> {
+                                bar.setProgress(total > 0 ? (int) (done * 1000 / total) : 1000);
+                                status.setText("Copiando: " + sizeStr(done) + " de " + sizeStr(total));
+                            });
+                        }
+                    });
+                }
             } catch (Exception ex) {
-                error = ex.getMessage();
+                error = ex.getMessage() != null ? ex.getMessage() : ex.toString();
+                if (doc != null) diskCreator.deleteDocument(doc);
+            } finally {
+                if (doc != null) dst.delete();
             }
             final String err = error;
             runOnUiThread(() -> {
@@ -521,12 +740,15 @@ public class MainActivity extends Activity implements MediaListView.Host {
                     error("Falha na conversão", new IOException(err));
                     return;
                 }
-                lists[VmSettings.KIND_DISK].add(dst.getAbsolutePath());
-                String msg = "Convertido: " + dst.getAbsolutePath();
-                try {
-                    DiskImages.Info i = DiskImages.info(dst.getAbsolutePath());
-                    msg += "\nDisco de " + sizeStr(i.virtualSize) + ", arquivo de " + sizeStr(i.fileSize);
-                } catch (IOException ignored) {
+                String result = doc != null ? doc.toString() : dst.getAbsolutePath();
+                lists[VmSettings.KIND_DISK].add(result);
+                String msg = "Convertido: " + (doc != null ? displayName(result) : result);
+                if (doc == null) {
+                    try {
+                        DiskImages.Info i = DiskImages.info(dst.getAbsolutePath());
+                        msg += "\nDisco de " + sizeStr(i.virtualSize) + ", arquivo de " + sizeStr(i.fileSize);
+                    } catch (IOException ignored) {
+                    }
                 }
                 new AlertDialog.Builder(this).setTitle("Conversão concluída").setMessage(msg)
                         .setPositiveButton("OK", null).show();

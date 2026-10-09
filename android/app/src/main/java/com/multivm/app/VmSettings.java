@@ -34,11 +34,26 @@ final class VmSettings {
             com.multivm.core.VmConfig.NicModel.E1000, com.multivm.core.VmConfig.NicModel.VIRTIO,
             com.multivm.core.VmConfig.NicModel.NONE};
     static final String[] SOUND_NAMES = {"Automática", "Intel AC'97 (Windows XP, ReactOS, Linux)",
-            "Intel HD Audio (Windows Vista/7/10/11/Server, Linux)", "Sem som"};
+            "Intel HD Audio (Windows Vista/7/10/11/Server, Linux)", "Sem som", "virtio-sound (Linux)"};
     static final com.multivm.core.VmConfig.SoundModel[] SOUND_MODELS = {
             com.multivm.core.VmConfig.SoundModel.AUTO, com.multivm.core.VmConfig.SoundModel.AC97,
-            com.multivm.core.VmConfig.SoundModel.HDA, com.multivm.core.VmConfig.SoundModel.NONE};
-    static final int NIC_NONE = 4, SOUND_NONE = 3;
+            com.multivm.core.VmConfig.SoundModel.HDA, com.multivm.core.VmConfig.SoundModel.NONE,
+            com.multivm.core.VmConfig.SoundModel.VIRTIO};
+    static final int NIC_NONE = 4, SOUND_NONE = 3, NIC_VIRTIO = 3, SOUND_VIRTIO = 4;
+
+    /** Placas oferecidas por arquitetura (indices em NIC_NAMES/SOUND_NAMES): a maquina ARM so tem virtio. */
+    static int[] nicChoices(boolean x86) {
+        return x86 ? new int[]{0, 1, 2, 3, 4} : new int[]{0, NIC_VIRTIO, NIC_NONE};
+    }
+
+    static int[] soundChoices(boolean x86) {
+        return x86 ? new int[]{0, 1, 2, 3} : new int[]{0, SOUND_VIRTIO, SOUND_NONE};
+    }
+
+    /** Relogio do convidado (RTC). */
+    static final int RTC_UTC = 0, RTC_LOCAL = 1, RTC_FIXED = 2;
+    static final String[] RTC_NAMES = {"UTC (Linux, padrão)", "Hora local do aparelho (Windows, DOS)",
+            "Data fixa (começa na data escolhida)"};
 
     /** Uma midia: arquivo (caminho ou URI) ou um disco novo ainda por criar (assistente). */
     static final class Media {
@@ -81,14 +96,21 @@ final class VmSettings {
     String id;
     String name = "MultiVM";
     int arch;
-    String ram = "512";
+    String ram = "1024";
     boolean bios = true;
     String cmdline = "";
     boolean fb;
     String fbSize = "800x600";
     String bootOrder = "";
     boolean sata;
+    /** discos rigidos em virtio-blk com BIOS (Linux): mais rapido; CDs continuam no IDE */
+    boolean virtio;
     String kernel, initrd;
+    /** boot direto: device tree externo (ARM) e endereco de carga de binario bruto ("" = padrao) */
+    String dtb;
+    String rawAddr = "";
+    int rtc;
+    String rtcDate = "2000-01-01 00:00";
     /* som e rede: indices em NIC_NAMES e SOUND_NAMES */
     int nic, sound;
     boolean mic;
@@ -179,15 +201,20 @@ final class VmSettings {
         s.id = id;
         s.name = p.getString("name", "MultiVM");
         s.arch = p.getInt("arch", 0);
-        s.ram = p.getString("ram", "512");
+        s.ram = p.getString("ram", "1024");
         s.bios = p.getBoolean("bios", true);
         s.cmdline = p.getString("cmdline", "");
         s.fb = p.getBoolean("fb", false);
         s.fbSize = p.getString("fbSize", "800x600");
         s.bootOrder = p.getString("bootOrder", "");
         s.sata = p.getBoolean("sata", false);
+        s.virtio = p.getBoolean("virtio", false) && !s.sata;
         s.kernel = p.getString("kernel", null);
         s.initrd = p.getString("initrd", null);
+        s.dtb = p.getString("dtb", null);
+        s.rawAddr = p.getString("rawAddr", "");
+        s.rtc = clamp(p.getInt("rtc", RTC_UTC), RTC_NAMES.length);
+        s.rtcDate = p.getString("rtcDate", "2000-01-01 00:00");
         for (int k = 0; k < 3; k++)
             for (int i = 0; i < MAX[k]; i++) {
                 String u = p.getString(KEY[k] + i, null);
@@ -263,8 +290,13 @@ final class VmSettings {
                 .putString("fbSize", fbSize)
                 .putString("bootOrder", bootOrder)
                 .putBoolean("sata", sata)
+                .putBoolean("virtio", virtio)
                 .putString("kernel", kernel)
                 .putString("initrd", initrd)
+                .putString("dtb", dtb)
+                .putString("rawAddr", rawAddr == null ? "" : rawAddr)
+                .putInt("rtc", rtc)
+                .putString("rtcDate", rtcDate)
                 .putInt("nic", nic)
                 .putInt("sound", sound)
                 .putBoolean("mic", mic)
@@ -301,6 +333,33 @@ final class VmSettings {
         if (nic != NIC_NONE) sb.append(" · rede");
         if (vnc) sb.append(" · VNC");
         return sb.toString();
+    }
+
+    /** "0x40080000", "40080000h" ou decimal -> endereco; -1 se invalido, 0 se vazio. */
+    static long parseAddress(String v) {
+        String t = v == null ? "" : v.trim().toLowerCase(java.util.Locale.ROOT).replace("_", "");
+        if (t.isEmpty()) return 0;
+        try {
+            if (t.startsWith("0x")) return Long.parseUnsignedLong(t.substring(2), 16);
+            if (t.endsWith("h")) return Long.parseUnsignedLong(t.substring(0, t.length() - 1), 16);
+            if (t.matches(".*[a-f].*")) return Long.parseUnsignedLong(t, 16);
+            return Long.parseLong(t);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /** "AAAA-MM-DD HH:MM" (hora local do aparelho) -> segundos Unix; -1 se invalido. */
+    static long parseRtcDate(String v) {
+        java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.ROOT);
+        f.setLenient(false);
+        try {
+            java.util.Date d = f.parse(v == null ? "" : v.trim());
+            long sec = d.getTime() / 1000;
+            return sec > 0 ? sec : -1;
+        } catch (java.text.ParseException e) {
+            return -1;
+        }
     }
 
     static int bootIndex(String code) {

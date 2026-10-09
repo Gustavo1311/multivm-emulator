@@ -100,11 +100,17 @@ SATA (hot-plug AHCI). Disco IDE não troca a quente. Com BIOS, o app sempre cria
   deslocamentos, rotações, MUL/DIV, BT*, BSF/BSR, CMPXCHG/XADD, movimentos e lógica SSE (NEON)
   em código nativo; encadeamento direto de blocos, cache de saltos por ponto de salto e global
   (validados pelo TLB, sobrevivem a trocas de CR3). Código automodificável é detectado por um
-  bitmap de páginas de código. Instruções raras (sistema, x87, SSE aritmético, MOV CR8) rodam no
-  interpretador de dentro do bloco.
+  bitmap de páginas de código. SSE de ponto flutuante e de inteiros (pshufd, pshufb, pmovmskb,
+  conversões, comparações) também é nativo; operações com registradores usam o cache de
+  registradores direto (imediatos lógicos do AArch64), caminhos lentos de memória ficam fora da
+  linha e instruções que cruzam páginas rodam dentro do bloco. Instruções raras (sistema, x87,
+  MOV CR8) rodam no interpretador de dentro do bloco.
 - **Depuração**: `MVM_JIT=0` desliga o JIT; `MVM_JIT_STATS=1` mostra estatísticas (instruções
   interpretadas, motivos de saída dos blocos); `MVM_JIT_OFF=bits` desliga otimizações para
-  bissecção; `MVM_JIT_SKIP=op,...` e `MVM_JIT_MAXINSN`; `MVM_PROF=arq` grava um perfil por
+  bissecção (16 flags mortos, 32 cache de registradores, 64 vetores, 128 SSE2+, 256 cur_rip
+  preguiçoso, 512 TLB, 1024 cc_op, 2048 orçamento, 4096 x87, 8192 instruções entre páginas,
+  16384 registradores diretos, 32768 caminhos lentos fora da linha; no CLI, `jitoff N` no FIFO
+  de controle troca os bits com a VM rodando); `MVM_JIT_SKIP=op,...` e `MVM_JIT_MAXINSN`; `MVM_PROF=arq` grava um perfil por
   amostragem do host (relatório: `tools/prof_report.py arq [N] [blocos]`, com
   `MVM_JIT_BLOCKS=blocos` para atribuir o tempo aos blocos/módulos do convidado);
   `MVM_DBG_DUMPDIR=dir` grava imagens PE do convidado vistas na pilha; `MVM_PC_DEBUG=N`
@@ -359,6 +365,17 @@ cd android
 ./build-native.sh
 ./gradlew :app:assembleRelease -Pmultivm.nativeBuild=prebuilt   # -> app/build/outputs/apk/release/app-release.apk
 ```
+
+O menu **Configurações** (engrenagem na tela inicial ou "Ajustes" na tela da VM) tem tema
+claro/escuro, escala da imagem, quadros por segundo, orientação, velocidade do mouse/rolagem e
+gestos, e onde salvar discos novos (o Android pergunta a pasta, ou pasta do app). No editor de
+cada VM há o controlador de disco (IDE, SATA/AHCI ou virtio-blk, o mais rápido para Linux),
+relógio (UTC/local/data fixa) e, em ARM, DTB, endereço do arquivo bruto e resolução da tela.
+
+Dicas para Linux com desktop (ex.: Void Xfce): use pelo menos 1024 MiB de RAM (com 512 MiB o
+live para em "Kernel panic ... deadlocked on memory"). No modo live, mais da metade do tempo até
+o desktop é o kernel descompactando o squashfs (xz); instalar o sistema num disco (virtio) evita
+isso.
 
 O APK de release é assinado com a chave de debug (é só para testes).
 

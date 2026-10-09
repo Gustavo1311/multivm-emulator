@@ -59,6 +59,7 @@ final class ForwardList {
             row.addView(t, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
             ImageButton del = new ImageButton(a);
             del.setImageResource(R.drawable.ic_close);
+            del.setImageTintList(android.content.res.ColorStateList.valueOf(a.getColor(R.color.text2)));
             del.setBackgroundResource(R.drawable.toolbar_btn_bg);
             del.setContentDescription("Remover");
             del.setOnClickListener(v -> {

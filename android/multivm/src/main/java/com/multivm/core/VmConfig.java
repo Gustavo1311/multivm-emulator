@@ -17,6 +17,7 @@ public final class VmConfig {
     final List<DiskImage> disks;
     final int fbWidth, fbHeight;
     final long rawLoadAddress;
+    final long rtcBase;
     final NicModel nic;
     final String mac, dns;
     final List<PortForward> forwards;
@@ -87,6 +88,7 @@ public final class VmConfig {
         fbWidth = b.fbWidth;
         fbHeight = b.fbHeight;
         rawLoadAddress = b.rawLoadAddress;
+        rtcBase = b.rtcBase;
         nic = b.nic;
         mac = b.mac;
         dns = b.dns;
@@ -108,6 +110,7 @@ public final class VmConfig {
     public List<DiskImage> getDisks() { return disks; }
     public String getFirmware() { return firmware; }
     public String getBootOrder() { return bootOrder; }
+    public long getRtcBase() { return rtcBase; }
     public boolean hasFramebuffer() { return fbWidth > 0 && fbHeight > 0; }
 
     public static Builder builder(Architecture arch) {
@@ -121,6 +124,7 @@ public final class VmConfig {
         private final List<DiskImage> disks = new ArrayList<>();
         private int fbWidth, fbHeight;
         private long rawLoadAddress;
+        private long rtcBase;
         private NicModel nic = NicModel.NONE;
         private String mac, dns;
         private final List<PortForward> forwards = new ArrayList<>();
@@ -209,6 +213,9 @@ public final class VmConfig {
 
         /** Endereco de carga de binarios brutos (0 = padrao da maquina). */
         public Builder rawLoadAddress(long addr) { this.rawLoadAddress = addr; return this; }
+
+        /** Data inicial do relogio (RTC) em segundos Unix; 0 = relogio do aparelho. */
+        public Builder rtcBase(long unixSeconds) { this.rtcBase = unixSeconds; return this; }
 
         /** 0 = disco rigido, 1 = CD/DVD, 2 = disquete */
         private static int kind(DiskImage.Type t) {

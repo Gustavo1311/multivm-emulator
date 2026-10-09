@@ -32,7 +32,7 @@ final class NativeBridge {
     static native long nativeCreate(int arch, int ramMb, String kernel, String initrd, String cmdline,
                                     String dtb, String firmware, String vgaBios, String bootOrder,
                                     String[] diskPaths, int[] diskFds, boolean[] diskReadOnly, int[] diskTypes,
-                                    String[] diskNames, int fbWidth, int fbHeight, long rawLoadAddress,
+                                    String[] diskNames, int fbWidth, int fbHeight, long rawLoadAddress, long rtcBase,
                                     int netModel, String mac, String dns, int[] forwards,
                                     int audioModel, boolean mic, Callbacks callbacks);
     static native void nativeDestroy(long handle);

@@ -32,6 +32,7 @@
             <Button android:id="@+id/btnPause" style="@style/ToolButton" android:drawableTop="@drawable/ic_pause" android:text="Pausar" />
             <Button android:id="@+id/btnReset" style="@style/ToolButton" android:drawableTop="@drawable/ic_restart" android:text="Reiniciar" />
             <Button android:id="@+id/btnPower" style="@style/ToolButton" android:drawableTop="@drawable/ic_power" android:text="Energia" />
+            <Button android:id="@+id/btnSettings" style="@style/ToolButton" android:drawableTop="@drawable/ic_settings" android:text="Ajustes" />
             <Button android:id="@+id/btnStop" style="@style/ToolButton" android:drawableTint="@color/danger" android:drawableTop="@drawable/ic_stop" android:text="Parar" />
         </LinearLayout>
     </HorizontalScrollView>

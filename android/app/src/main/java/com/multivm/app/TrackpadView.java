@@ -48,7 +48,7 @@ final class TrackpadView extends LinearLayout {
         setOrientation(VERTICAL);
         setElevation(dp(8));
         setPadding(dp(6), dp(2), dp(6), dp(6));
-        setBackground(round(0xE6182230, 18, getContext().getColor(R.color.outline)));
+        setBackground(round(getContext().getColor(R.color.trackpad_bg), 18, getContext().getColor(R.color.outline)));
 
         /* alca: arrasta o painel; X fecha */
         LinearLayout bar = new LinearLayout(ctx);
@@ -72,7 +72,7 @@ final class TrackpadView extends LinearLayout {
 
         /* superficie de toque */
         View pad = new View(ctx);
-        pad.setBackground(round(0xFF0E1621, 12, 0));
+        pad.setBackground(round(getContext().getColor(R.color.trackpad_pad), 12, 0));
         pad.setOnTouchListener((v, e) -> padTouch(e));
         pad.setContentDescription("Superfície do trackpad");
         addView(pad, new LayoutParams(LayoutParams.MATCH_PARENT, dp(130)));

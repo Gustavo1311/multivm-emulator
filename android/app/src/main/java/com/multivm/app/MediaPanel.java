@@ -240,8 +240,8 @@ final class MediaPanel {
             return;
         }
         new AlertDialog.Builder(act)
-                .setTitle("Disco no IDE")
-                .setMessage("O controlador IDE não aceita conectar disco com a VM ligada. O disco será adicionado "
+                .setTitle("Disco no próximo boot")
+                .setMessage("Os controladores IDE e virtio não aceitam conectar disco com a VM ligada. O disco será adicionado "
                         + "às configurações e aparece no próximo boot.\n\nPara conectar com a VM ligada, use o "
                         + "controlador SATA nas configurações da máquina.")
                 .setPositiveButton("Escolher disco", (d, w) -> pick(ADD_NEXT_BOOT))

@@ -125,7 +125,7 @@ JNIEXPORT jlong JNICALL JNI_FN(nativeCreate)(JNIEnv *env, jclass cls, jint arch,
                                             jstring vga_bios, jstring boot_order,
                                             jobjectArray disk_paths, jintArray disk_fds, jbooleanArray disk_ro,
                                             jintArray disk_types, jobjectArray disk_names, jint fb_w, jint fb_h,
-                                            jlong raw_load_addr,
+                                            jlong raw_load_addr, jlong rtc_base,
                                             jint net_model, jstring mac, jstring dns, jintArray forwards,
                                             jint audio_model, jboolean mic, jobject callbacks)
 {
@@ -147,6 +147,7 @@ JNIEXPORT jlong JNICALL JNI_FN(nativeCreate)(JNIEnv *env, jclass cls, jint arch,
     cfg.fb_width = (uint32_t)fb_w;
     cfg.fb_height = (uint32_t)fb_h;
     cfg.raw_load_addr = (uint64_t)raw_load_addr;
+    cfg.rtc_base = (int64_t)rtc_base;
 
     /* rede: forwards = [flags, porta do host, porta do convidado]...; flags: 1 = UDP, 2 = rede local */
     cfg.net.model = (mvm_nic_model)net_model;

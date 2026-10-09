@@ -32,6 +32,11 @@
             android:exported="false"
             android:windowSoftInputMode="adjustResize|stateHidden" />
 
+        <!-- configuracoes gerais: tema, tela, mouse, discos -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false" />
+
         <!-- boas-vindas e criacao da primeira VM -->
         <activity
             android:name=".WizardActivity"

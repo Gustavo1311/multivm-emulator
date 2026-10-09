@@ -19,7 +19,7 @@
             android:id="@+id/stepLabel"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:textColor="#4FC3F7"
+            android:textColor="@color/accent"
             android:textSize="13sp" />
 
         <LinearLayout
@@ -183,7 +183,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:inputType="number"
-                    android:text="512" />
+                    android:text="1024" />
 
                 <TextView
                     android:id="@+id/wRamHelp"
@@ -379,6 +379,12 @@
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:text="SATA/AHCI — Windows Vista ou mais novo, Linux" />
+
+                        <RadioButton
+                            android:id="@+id/wCtrlVirtio"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="virtio — só Linux, o mais rápido" />
                     </RadioGroup>
                 </LinearLayout>
             </LinearLayout>
