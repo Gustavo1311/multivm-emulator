@@ -457,6 +457,7 @@ typedef struct {
     int cur_insn, fl_insn;
     int8_t fl_dst, fl_s1, fl_s2;
     bool cond_regs_ok;
+    bool xp_hdr;                /* xpage_decode: prefixos/opcode/ModRM cruzam para a pagina seguinte */
     uint32_t mode;
     int flags_size;
     bool code64;
@@ -1685,7 +1686,9 @@ static void emit_icall(jctx *x, jinsn *in)
 {
     a64 *a = &x->a;
     if (x->j->stats) {
-        a64_mov_imm(a, 9, (uint64_t)(uintptr_t)&x->j->icall_op[(in->op & 0x3ff)]);
+        /* 0F 01: conta pelo /reg (0x3f8 + reg) para separar INVLPG, LGDT... */
+        unsigned slot = in->op == 0x101 ? 0x3f8u + (unsigned)(in->reg & 7) : (unsigned)(in->op & 0x3ff);
+        a64_mov_imm(a, 9, (uint64_t)(uintptr_t)&x->j->icall_op[slot]);
         a64_ldr(a, 8, 10, 9, 0);
         a64_add_imm(a, 10, 10, 1);
         a64_str(a, 8, 10, 9, 0);
@@ -2585,6 +2588,7 @@ static bool emit_simd2(jctx *x, jinsn *in)
 static void jit_wcr8(x86_cpu *c, uint64_t v) { x86_write_cr(c, 8, v); }
 static uint64_t jit_rcr8(x86_cpu *c) { return x86_read_cr(c, 8); }
 static void jit_cli(x86_cpu *c) { c->eflags &= ~(uint64_t)EFL_IF; }
+static void jit_invlpg(x86_cpu *c, uint64_t lin) { x86_tlb_flush_page(c, lin); }
 static void jit_sti(x86_cpu *c)
 {
     if (!(c->eflags & EFL_IF))
@@ -2625,6 +2629,8 @@ static int native_icall_kind(const jinsn *in)
         return 6; /* MOV de/para CR8 (o IRQL do Windows x64) */
     if (in->op == 0xfa || in->op == 0xfb)
         return 7; /* CLI/STI */
+    if (in->op == 0x101 && (in->reg & 7) == 7 && in->mem)
+        return 8; /* INVLPG (o kernel de 32 bits o usa a cada kmap_atomic) */
     if (in->op == 0x1ba && (in->reg & 7) >= 4)
         return 2;
     if ((in->op == 0x1a3 || in->op == 0x1ab || in->op == 0x1b3 || in->op == 0x1bb) && !in->mem)
@@ -3105,6 +3111,13 @@ static int emit_insn(jctx *x, jinsn *in)
         if (nk == 7) {
             a64_mov(a, 1, 0, RC);
             emit_call(x, (const void *)(in->op == 0xfa ? jit_cli : jit_sti));
+            return 1;
+        }
+        if (nk == 8) {
+            emit_ea(x, in);
+            a64_mov(a, 1, 1, REA);
+            a64_mov(a, 1, 0, RC);
+            emit_call(x, (const void *)jit_invlpg);
             return 1;
         }
         if (nk == 1) { /* LFENCE/MFENCE/SFENCE */
@@ -3908,8 +3921,8 @@ static int flags_effect(const jinsn *in)
             return 0;
         if (nk == 3 || nk == 4)
             return FX_WRITE; /* CMPXCHG/XADD reescrevem todos os flags */
-        if (nk == 6 || nk == 7)
-            return 0; /* MOV CR8, CLI, STI: flags intactos */
+        if (nk >= 6 && nk <= 8)
+            return 0; /* MOV CR8, CLI, STI, INVLPG: flags intactos */
         return FX_READ | FX_WRITE;
     }
     if (op < 0x40)
@@ -3969,7 +3982,9 @@ static bool xpage_decode(jctx *x, const uint8_t *page, unsigned off, uint64_t ri
     /* o ModRM pode ficar na outra pagina, exceto no grupo FF (CALL/JMP far) */
     if (op == 0xff)
         i++;
-    if (i > avail)
+    /* cabecalho na pagina seguinte: so pelo caminho nativo, que confere todos os bytes de la */
+    x->xp_hdr = i > avail;
+    if (x->xp_hdr && (unsigned)in->len - avail > 8)
         return false;
     if (op < 0x100) {
         switch (op) {
@@ -4164,6 +4179,8 @@ static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const b
             ended = true;
             break;
         }
+        if (xpage && x->xp_hdr) /* cabecalho na outra pagina e sem caminho nativo: termina antes */
+            break;
         if (xpage)
             emit_icall(x, &in);
         else

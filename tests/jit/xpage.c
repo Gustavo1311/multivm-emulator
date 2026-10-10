@@ -32,7 +32,18 @@ __asm__(
     "    ret\n"
     "xp_inc:\n"
     "    add $1, %eax\n"
+    "    ret\n"
+    /* opcode cruzando: o 0F de BSWAP e o ultimo byte da pagina 3 */
+    "    .skip 12288 - 8 - (. - xp_base), 0x90\n"
+    "    .globl xp_hdr\n"
+    "xp_hdr:\n"
+    "    mov %edi, %eax\n"
+    "    .skip 12288 - 1 - (. - xp_base), 0x90\n"
+    "    bswap %eax\n"
+    "    imul $3, %eax, %eax\n"
+    "    add $5, %eax\n"
     "    ret\n");
+extern uint32_t xp_hdr(uint32_t v);
 void fuzz_main(void)
 {
     uint32_t a = xp_loop(100000);
@@ -40,5 +51,10 @@ void fuzz_main(void)
     xp_imm[0] = 0x02;                /* ADD $0x02000000 a partir de agora */
     uint32_t b = xp_loop(1000);
     puts_("XP2 "); hex(b);
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < 20000; i++)
+        if (xp_hdr(i * 2654435761u) != __builtin_bswap32(i * 2654435761u) * 3 + 5)
+            bad++;
+    puts_("XP3 "); hex(bad);
     puts_("FUZZ END\n");
 }
