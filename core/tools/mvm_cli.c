@@ -230,6 +230,7 @@ static bool write_ppm(const char *path)
 static const char *g_control;
 
 static uint64_t *g_prof;
+static uint64_t *g_prof_ins; /* palavra da instrucao no PC e a anterior (codigo do JIT: classificacao) */
 static volatile unsigned g_prof_n;
 static double thread_cpu(void)
 {
@@ -498,8 +499,11 @@ static void prof_handler(int sig, siginfo_t *si, void *uc)
 #else
     uint64_t pc = 0; (void)uc;
 #endif
-    if (g_prof_n < PROF_MAX)
+    if (g_prof_n < PROF_MAX) {
+        if (g_prof_ins && pc >= 4 && !(pc & 3))
+            g_prof_ins[g_prof_n] = ((uint64_t)((uint32_t *)pc)[-1] << 32) | ((uint32_t *)pc)[0];
         g_prof[g_prof_n++] = pc;
+    }
 }
 
 static void prof_write(const char *path)
@@ -518,6 +522,16 @@ static void prof_write(const char *path)
         fclose(m);
     fclose(f);
     fprintf(stderr, "[mvm-cli] perfil: %u amostras em %s\n", g_prof_n, path);
+    if (g_prof_ins) { /* ARQ.ins: "pc anterior atual" */
+        char p2[1024];
+        snprintf(p2, sizeof(p2), "%s.ins", path);
+        FILE *g = fopen(p2, "w");
+        for (unsigned i = 0; g && i < g_prof_n; i++)
+            fprintf(g, "%llx %08x %08x\n", (unsigned long long)g_prof[i], (unsigned)(g_prof_ins[i] >> 32),
+                    (unsigned)g_prof_ins[i]);
+        if (g)
+            fclose(g);
+    }
 }
 
 /* sinais fatais: registra onde o host falhou e o estado do convidado antes de sair */
@@ -925,6 +939,7 @@ int main(int argc, char **argv)
     sigaddset(&profset, SIGPROF);
     if (prof) { /* so a thread principal (vCPU) recebe SIGPROF */
         g_prof = calloc(PROF_MAX, sizeof(*g_prof));
+        g_prof_ins = calloc(PROF_MAX, sizeof(*g_prof_ins));
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_sigaction = prof_handler;

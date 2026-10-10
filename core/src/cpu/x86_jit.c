@@ -78,7 +78,12 @@ struct x86_jit {
     uint32_t *exit_stub;
     /* saidas compartilhadas (entradas por BL/B a partir dos blocos, ver build_stubs) */
     uint32_t *stub_exit_rec, *stub_exit_rip, *stub_lookup_page, *stub_lookup_dyn;
-    uint32_t *code_start;   /* primeira palavra livre depois dos stubs */
+    uint32_t *code_start;   /* inicio da area de blocos */
+    /* MVM_JIT_CODEMB > 124: os stubs ficam no meio da area (desvios B de +-128 MB) e os
+     * blocos ocupam as duas metades: [code_start, r1_end) e [r2_start, code_end) */
+    uint32_t *r1_end, *r2_start;
+    size_t code_size;
+    unsigned max_blocks;
     void (*enter)(x86_cpu *c, uint32_t *code, void *tlb, void *jc);
     jit_block *blocks;
     unsigned nblocks;
@@ -4104,7 +4109,10 @@ static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const b
 
 static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_t phys, const uint8_t *page, uint32_t mode)
 {
-    if (j->nblocks >= MAX_BLOCKS || (size_t)(j->code_end - j->pos) < 65536) {
+    if (j->pos < j->r1_end && (size_t)(j->r1_end - j->pos) < 65536 && j->r2_start)
+        j->pos = j->r2_start; /* primeira metade cheia: continua depois dos stubs */
+    uint32_t *limit = j->pos < j->r1_end ? j->r1_end : j->code_end;
+    if (j->nblocks >= j->max_blocks || (size_t)(limit - j->pos) < 65536) {
         if (j->stats && j->n_flush < 2000) { /* por que o cache encheu: tamanho medio dos blocos */
             uint64_t ins = 0, valid = 0, interp = 0;
             for (unsigned i = 0; i < j->nblocks; i++) {
@@ -4114,11 +4122,12 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
             }
             size_t bytes = (size_t)(j->pos - j->code_start) * 4;
             LOGI("JIT: cache cheio (%s): %u blocos (%llu validos, %llu interpretados), %zu KB, %.0f B/bloco, %.1f insn/bloco, %.1f B/insn",
-                 j->nblocks >= MAX_BLOCKS ? "blocos" : "codigo", j->nblocks, (unsigned long long)valid,
+                 j->nblocks >= j->max_blocks ? "blocos" : "codigo", j->nblocks, (unsigned long long)valid,
                  (unsigned long long)interp, bytes >> 10, (double)bytes / j->nblocks, (double)ins / j->nblocks,
                  ins ? (double)bytes / (double)ins : 0.0);
         }
         x86_jit_flush(j);
+        limit = j->r1_end;
     }
     jit_block *b = &j->blocks[j->nblocks++];
     memset(b, 0, sizeof(*b));
@@ -4146,7 +4155,7 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
         x.page_lin = lin & ~0xfffULL;
         x.mode = mode;
         x.a.p = b->code;
-        x.a.end = j->code_end;
+        x.a.end = limit;
         rc_reset(&x);
         x.rc_on = !(j->off & 32);
         x.ccop_mem = -1;
@@ -4309,7 +4318,8 @@ int64_t x86_jit_run(x86_cpu *c, int64_t budget)
     }
     /* encadeia a saida anterior com este bloco (mesma pagina fisica, modo e CS) */
     if (e && j->n_flush == flushes && e->blk->valid && e->target == c->rip && e->blk->mode == mode &&
-        e->blk->csbase == csbase && (e->blk->phys >> 12) == (phys >> 12)) {
+        e->blk->csbase == csbase && (e->blk->phys >> 12) == (phys >> 12) &&
+        (b->code - e->patch < (1 << 25) && e->patch - b->code < (1 << 25))) { /* alcance do B */
         a64_patch_b(e->patch, b->code);
         __builtin___clear_cache((char *)e->patch, (char *)(e->patch + 1));
         j->n_chain++;
@@ -4359,7 +4369,9 @@ int64_t x86_jit_run(x86_cpu *c, int64_t budget)
 /* stub de entrada/saida: salva os registradores preservados e salta para o bloco */
 static void build_stubs(struct x86_jit *j)
 {
-    a64 A = {j->code, j->code_end, false}, *a = &A;
+    bool split = j->code_size > (124u << 20) || getenv("MVM_JIT_SPLIT"); /* MVM_JIT_SPLIT: teste com area pequena */
+    uint32_t *base = split ? j->code + j->code_size / 8 : j->code; /* meio (em palavras) */
+    a64 A = {base, base + 8192, false}, *a = &A;
     j->enter = (void (*)(x86_cpu *, uint32_t *, void *, void *))(void *)a64_here(a);
     a64_stp_pre(a, 29, 30, XSP, -96);
     a64_mov(a, 1, 29, XSP);
@@ -4409,8 +4421,16 @@ static void build_stubs(struct x86_jit *j)
     build_lookup_stub(j, a, EX_JC_PAGE);
     j->stub_lookup_dyn = a64_here(a);
     build_lookup_stub(j, a, EX_JC_DYN);
-    __builtin___clear_cache((char *)j->code, (char *)a->p);
-    j->code_start = j->pos = a->p;
+    __builtin___clear_cache((char *)base, (char *)a->p);
+    if (base == j->code) {
+        j->code_start = j->pos = a->p;
+        j->r1_end = j->code_end;
+        j->r2_start = NULL;
+    } else {
+        j->code_start = j->pos = j->code;
+        j->r1_end = base;
+        j->r2_start = a->p;
+    }
 }
 
 struct x86_jit *x86_jit_new(x86_cpu *c)
@@ -4418,7 +4438,11 @@ struct x86_jit *x86_jit_new(x86_cpu *c)
     const char *e = getenv("MVM_JIT");
     if (e && *e == '0')
         return NULL;
-    void *mem = mmap(NULL, CODE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    const char *cmb = getenv("MVM_JIT_CODEMB");
+    size_t code_size = CODE_SIZE;
+    if (cmb && atoi(cmb) >= 16 && atoi(cmb) <= 250)
+        code_size = (size_t)atoi(cmb) << 20;
+    void *mem = mmap(NULL, code_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) {
         LOGW("JIT: memoria executavel indisponivel; usando o interpretador");
         return NULL;
@@ -4438,9 +4462,11 @@ struct x86_jit *x86_jit_new(x86_cpu *c)
     if (j->smp)
         LOGI("JIT: modo SMP (ordem TSO%s)", j->lrcpc ? ", LDAPR" : ", LDAR");
     j->code = mem;
-    j->code_end = (uint32_t *)((uint8_t *)mem + CODE_SIZE);
+    j->code_size = code_size;
+    j->code_end = (uint32_t *)((uint8_t *)mem + code_size);
+    j->max_blocks = (unsigned)((uint64_t)MAX_BLOCKS * code_size / CODE_SIZE);
     jc_reset(j);
-    j->blocks = calloc(MAX_BLOCKS, sizeof(jit_block));
+    j->blocks = calloc(j->max_blocks, sizeof(jit_block));
     j->tr_ins = calloc(BLOCK_MAX_INSNS, sizeof(jinsn));
     j->tr_stored = calloc(BLOCK_MAX_INSNS, sizeof(bool));
     j->tr_dead = calloc(BLOCK_MAX_INSNS, sizeof(bool));
@@ -4507,7 +4533,7 @@ void x86_jit_free(struct x86_jit *j)
             free(g);
         }
     }
-    munmap(j->code, CODE_SIZE);
+    munmap(j->code, j->code_size);
     free(j->blocks);
     free(j->tr_ins);
     free(j->tr_stored);
