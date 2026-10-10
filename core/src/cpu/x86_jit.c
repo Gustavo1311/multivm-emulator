@@ -452,6 +452,11 @@ typedef struct {
     bool dead;      /* os flags desta instrucao sao sobrescritos antes de serem lidos */
     uint64_t csbase, page_lin;  /* base do CS e pagina linear do bloco */
     unsigned end_off;           /* deslocamento (na pagina) do fim da ultima instrucao */
+    /* operandos dos flags preguicosos ainda em registradores (x21-x24 ou XZR, que sobrevivem
+     * a chamadas em C): validos para o JCC logo depois da instrucao que os gerou */
+    int cur_insn, fl_insn;
+    int8_t fl_dst, fl_s1, fl_s2;
+    bool cond_regs_ok;
     uint32_t mode;
     int flags_size;
     bool code64;
@@ -710,7 +715,7 @@ static void emit_ea(jctx *x, jinsn *in)
     }
     if (in->asz == 4)
         a64_mov(a, 0, REA, REA);
-    if (!x->code64 || in->ea_seg == S_FS || in->ea_seg == S_GS) {
+    if (in->ea_seg == S_FS || in->ea_seg == S_GS || (!x->code64 && !(x->mode & 8))) {
         a64_ldr(a, 8, 10, RC, (uint32_t)(offsetof(x86_cpu, seg) + sizeof(x86_seg) * (unsigned)in->ea_seg + offsetof(x86_seg, base)));
         a64_add(a, REA, REA, 10);
         if (!x->code64)
@@ -1026,6 +1031,15 @@ static void emit_lazy(jctx *x, int op, int size, int dst, int s1, int s2)
     }
     x->flags_op = op;
     x->flags_size = size;
+#define FL_REG_OK(r) ((r) == RA || (r) == RB || (r) == RR || (r) == RT || (r) == XZR)
+    if (FL_REG_OK(dst) && FL_REG_OK(s1) && FL_REG_OK(s2) && !(x->j->off & 1048576 * 2)) {
+        x->fl_insn = x->cur_insn;
+        x->fl_dst = (int8_t)dst;
+        x->fl_s1 = (int8_t)s1;
+        x->fl_s2 = (int8_t)s2;
+    } else {
+        x->fl_insn = -1;
+    }
 }
 
 /* x87 ja decodificado pelo JIT: info = modrm | (opcode & 7) << 8 | osz << 16; lin = endereco */
@@ -1085,30 +1099,37 @@ static int emit_cond(jctx *x, int cc)
     a64 *a = &x->a;
     int t = cc >> 1, neg = cc & 1;
     int sz = x->flags_size;
+    /* JCC logo apos a instrucao que gerou os flags: operandos ainda nos registradores */
+    bool regs = x->cond_regs_ok && x->fl_insn >= 0 && x->fl_insn == x->cur_insn - 1;
+    int r_s1 = regs ? x->fl_s1 : 0, r_s2 = regs ? x->fl_s2 : 1, r_dst = regs ? x->fl_dst : 0;
     if (x->flags_op == CC_SUB && t != 5) {
-        a64_ldr(a, 8, 0, RC, OFF(cc_src1));
-        a64_ldr(a, 8, 1, RC, OFF(cc_src2));
+        if (!regs) {
+            a64_ldr(a, 8, 0, RC, OFF(cc_src1));
+            a64_ldr(a, 8, 1, RC, OFF(cc_src2));
+        }
         if (sz == 4) {
-            a64_cmp(a, 0, 0, 1);
-        } else {
-            if (sz < 4) {
-                a64_lsl_imm(a, 0, 0, 64 - 8 * sz);
-                a64_lsl_imm(a, 1, 1, 64 - 8 * sz);
-            }
+            a64_cmp(a, 0, r_s1, r_s2);
+        } else if (sz < 4) {
+            a64_lsl_imm(a, 0, r_s1, 64 - 8 * sz);
+            a64_lsl_imm(a, 1, r_s2, 64 - 8 * sz);
             a64_cmp(a, 1, 0, 1);
+        } else {
+            a64_cmp(a, 1, r_s1, r_s2);
         }
         static const int map[8] = {A_VS, A_LO, A_EQ, A_LS, A_MI, -2, A_LT, A_LE};
         int r = map[t];
         return neg ? (r ^ 1) : r;
     }
     if (x->flags_op == CC_LOGIC && t != 5) {
-        a64_ldr(a, 8, 0, RC, OFF(cc_dst));
+        if (!regs)
+            a64_ldr(a, 8, 0, RC, OFF(cc_dst));
         if (sz == 4) {
-            a64_tst(a, 0, 0, 0);
-        } else {
-            if (sz < 4)
-                a64_lsl_imm(a, 0, 0, 64 - 8 * sz);
+            a64_tst(a, 0, r_dst, r_dst);
+        } else if (sz < 4) {
+            a64_lsl_imm(a, 0, r_dst, 64 - 8 * sz);
             a64_tst(a, 1, 0, 0);
+        } else {
+            a64_tst(a, 1, r_dst, r_dst);
         }
         int r;
         switch (t) {
@@ -1134,13 +1155,15 @@ static int emit_cond(jctx *x, int cc)
         goto helper;
     if (x->flags_op && (t == 2 || t == 4)) {
         /* ZF/SF vem sempre do resultado (cc_dst), qualquer que seja a operacao */
-        a64_ldr(a, 8, 0, RC, OFF(cc_dst));
+        if (!regs)
+            a64_ldr(a, 8, 0, RC, OFF(cc_dst));
         if (sz == 4) {
-            a64_tst(a, 0, 0, 0);
-        } else {
-            if (sz < 4)
-                a64_lsl_imm(a, 0, 0, 64 - 8 * sz);
+            a64_tst(a, 0, r_dst, r_dst);
+        } else if (sz < 4) {
+            a64_lsl_imm(a, 0, r_dst, 64 - 8 * sz);
             a64_tst(a, 1, 0, 0);
+        } else {
+            a64_tst(a, 1, r_dst, r_dst);
         }
         int r = t == 2 ? A_EQ : A_MI;
         return neg ? (r ^ 1) : r;
@@ -1582,7 +1605,7 @@ static void emit_push(jctx *x, jinsn *in, int src, int sz)
     a64_sub_imm(a, RB, RB, (uint32_t)sz);
     if (!x->code64)
         a64_mov(a, 0, RB, RB);
-    if (x->code64) {
+    if (x->code64 || (x->mode & 8)) { /* pilha plana: SS com base 0 (RB ja truncado em 32 bits) */
         a64_mov(a, 1, REA, RB);
     } else {
         a64_ldr(a, 8, 10, RC, (uint32_t)(offsetof(x86_cpu, seg) + sizeof(x86_seg) * S_SS + offsetof(x86_seg, base)));
@@ -1598,8 +1621,8 @@ static void emit_pop_load(jctx *x, int dst, int sz)
 {
     a64 *a = &x->a;
     ld_greg(x, RB, R_SP, 8, true);
-    if (x->code64) {
-        a64_mov(a, 1, REA, RB);
+    if (x->code64 || (x->mode & 8)) { /* pilha plana: SS com base 0 */
+        a64_mov(a, x->code64 ? 1 : 0, REA, RB);
     } else {
         a64_ldr(a, 8, 10, RC, (uint32_t)(offsetof(x86_cpu, seg) + sizeof(x86_seg) * S_SS + offsetof(x86_seg, base)));
         a64_add(a, REA, RB, 10);
@@ -1614,7 +1637,9 @@ static void emit_pop_load(jctx *x, int dst, int sz)
 static void emit_jcc(jctx *x, jinsn *in, int cc, uint64_t target)
 {
     a64 *a = &x->a;
+    x->cond_regs_ok = true;
     int cond = emit_cond(x, cc);
+    x->cond_regs_ok = false;
     if (cond == A_AL) {
         emit_exit_next(x, target, true);
         return;
@@ -3455,7 +3480,7 @@ static int emit_insn(jctx *x, jinsn *in)
         ld_greg(x, RB, R_BP, 8, true);
         if (!x->code64)
             a64_mov(a, 0, RB, RB);
-        if (x->code64) {
+        if (x->code64 || (x->mode & 8)) { /* pilha plana: SS com base 0 (RB ja truncado em 32 bits) */
             a64_mov(a, 1, REA, RB);
         } else {
             a64_ldr(a, 8, 10, RC, (uint32_t)(offsetof(x86_cpu, seg) + sizeof(x86_seg) * S_SS + offsetof(x86_seg, base)));
@@ -3637,7 +3662,16 @@ static int emit_insn(jctx *x, jinsn *in)
 /* ------------------------------------------------------------ cache */
 
 
-static uint32_t mode_key(x86_cpu *c) { return (c->code64 ? 1u : 0) | (c->ssz == 8 ? 2u : 0) | (x86_user(c) ? 4u : 0); }
+/* bit 3 (so 32 bits): CS/DS/ES/SS com base 0 ("plano", como no Linux e no Windows): os
+ * blocos nao somam a base desses segmentos. Cargas de segmento nunca ficam dentro de um
+ * bloco (sao interpretadas entre blocos) e o modo e conferido em cada entrada/encadeamento. */
+static uint32_t mode_key(x86_cpu *c)
+{
+    uint32_t m = (c->code64 ? 1u : 0) | (c->ssz == 8 ? 2u : 0) | (x86_user(c) ? 4u : 0);
+    if (!c->code64 && !(c->seg[S_CS].base | c->seg[S_DS].base | c->seg[S_ES].base | c->seg[S_SS].base))
+        m |= 8u;
+    return m;
+}
 
 static bool mode_ok(x86_cpu *c)
 {
@@ -3991,6 +4025,72 @@ static void jit_verify(x86_cpu *c, uint64_t bp)
 
 char x86_jit_dis_path[256]; /* depuracao (CLI "jitdis ARQ") */
 
+/*
+ * Instrucao que cruza o fim da pagina, traduzida em codigo nativo: o bloco confere em
+ * tempo de execucao os bytes que estao na pagina seguinte (TLB de execucao + leitura de 8
+ * bytes comparada com os decodificados). Se mudaram (outro mapeamento, codigo reescrito)
+ * ou a pagina nao esta na TLB, executa pelo interpretador como antes. O bloco termina
+ * depois dela nos dois caminhos. Antes ia sempre ao interpretador: um CALL quente no fim
+ * de pagina (descompressao xz no boot do DSL) custava ~1 minuto de boot.
+ */
+static bool xpage_native(jctx *x, jinsn *in, uint64_t li, unsigned off)
+{
+    struct x86_jit *j = x->j;
+    a64 *a = &x->a;
+    unsigned k = (unsigned)in->len - (0x1000 - off); /* bytes na pagina seguinte */
+    if (k == 0 || k > 8 || (j->off & 8192))
+        return false;
+    uint64_t p2 = (li & ~0xfffULL) + 0x1000;
+    if (!x->code64)
+        p2 = (uint32_t)p2;
+    uint8_t bytes[8] = {0};
+    if (!x86_peek_code(x->c, p2, bytes, k))
+        return false;
+    uint64_t want = 0;
+    for (unsigned i = 0; i < k; i++)
+        want |= (uint64_t)bytes[i] << (8 * i);
+    jctx snap = *x;
+    uint32_t *save = a->p;
+    /* confere a pagina seguinte */
+    uint32_t *s1, *s2;
+    a64_mov_imm(a, REA, p2);
+    emit_tlb(x, REA, 1, (uint32_t)offsetof(x86_tlbe, tag_x), &s1, &s2);
+    a64_ldr_reg(a, 8, 11, 10, REA);
+    if (k < 8) {
+        uint32_t enc = 0;
+        a64_encode_bitmask((1ULL << (8 * k)) - 1, 1, &enc);
+        a64_logic_imm(a, 1, 0, 11, 11, enc); /* and x11, x11, #mascara */
+    }
+    a64_mov_imm(a, 12, want);
+    a64_cmp(a, 1, 11, 12);
+    uint32_t *sne = a64_here(a);
+    a64_bcond(a, A_NE, a64_here(a));
+    int r = emit_insn(x, in);
+    if (r < 0) { /* nao suportada: desfaz */
+        *x = snap;
+        a->p = save;
+        return false;
+    }
+    if (r == 1)
+        emit_exit_next(x, in->next, true);
+    /* caminho lento: a partir do estado de compilacao de antes da instrucao */
+    jctx after = *x;
+    *x = snap;
+    x->a = after.a;
+    x->ncold = after.ncold;
+    x->nm2c = after.nm2c;
+    x->nc2m = after.nc2m;
+    x->nexit = after.nexit;
+    a64_patch(s1, a64_here(a));
+    if (s2)
+        a64_patch(s2, a64_here(a));
+    a64_patch(sne, a64_here(a));
+    x->rip_pending = false;
+    emit_icall(x, in);
+    emit_exit_next(x, in->next, true);
+    return true;
+}
+
 static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const bool *dead, jinsn *ins, bool *stored,
                            bool *ended_out)
 {
@@ -4054,7 +4154,16 @@ static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const b
         x->stored = false;
         x->dead = dead ? dead[n] : false;
         x->rip_pending = false;
+        x->cur_insn = (int)n;
         int r = 1;
+        if (xpage && xpage_native(x, &in, li, off)) {
+            ins[n] = in;
+            stored[n] = true;
+            n++;
+            x->end_off = 0x1000;
+            ended = true;
+            break;
+        }
         if (xpage)
             emit_icall(x, &in);
         else
@@ -4159,6 +4268,7 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
         rc_reset(&x);
         x.rc_on = !(j->off & 32);
         x.ccop_mem = -1;
+        x.fl_insn = -1;
         memset(b->exit, 0, sizeof(b->exit));
         if (pass == 0) {
             n = emit_block(&x, page, j->max_insns, NULL, ins, stored, &ended);
@@ -4184,6 +4294,7 @@ static jit_block *translate(struct x86_jit *j, x86_cpu *c, uint64_t lin, uint64_
                 x.ncold = x.nm2c = x.nc2m = 0;
                 rc_reset(&x);
                 x.ccop_mem = -1;
+                x.fl_insn = -1;
                 memset(b->exit, 0, sizeof(b->exit));
                 x.nexit = 0;
                 n = emit_block(&x, page, n, NULL, ins, stored, &ended);

@@ -230,6 +230,7 @@ static bool write_ppm(const char *path)
 static const char *g_control;
 
 static uint64_t *g_prof;
+static uint32_t g_ram_mb; /* -m (para o comando ramdump) */
 static uint64_t *g_prof_ins; /* palavra da instrucao no PC e a anterior (codigo do JIT: classificacao) */
 static volatile unsigned g_prof_n;
 static double thread_cpu(void)
@@ -343,6 +344,20 @@ static void *control_thread(void *arg)
             } else if (!strcmp(line, "smpstats")) { /* depuracao: tempo das CPUs e uso da trava (zera) */
                 extern void vm_debug_smp_stats(mvm_vm *vm);
                 vm_debug_smp_stats(g_vm);
+            } else if (!strncmp(line, "ramdump ", 8)) { /* depuracao: grava a RAM fisica do convidado */
+                extern void *vm_debug_ram_ptr(mvm_vm *vm, uint64_t gpa, uint64_t len);
+                FILE *o = fopen(line + 8, "wb");
+                static uint8_t zero[4096];
+                uint64_t pa = 0;
+                for (; o; pa += 4096) {
+                    uint8_t *h = vm_debug_ram_ptr(g_vm, pa, 4096);
+                    if (!h && pa >= ((uint64_t)g_ram_mb << 20))
+                        break;
+                    fwrite(h ? h : zero, 1, 4096, o);
+                }
+                if (o)
+                    fclose(o);
+                fprintf(stderr, "[mvm-cli] RAM gravada em %s (%llu MB)\n", line + 8, (unsigned long long)(pa >> 20));
             } else if (!strcmp(line, "icount")) { /* instrucoes executadas + tempo (MIPS de um trecho) */
                 struct timespec ts;
                 clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -732,7 +747,7 @@ int main(int argc, char **argv)
                 return 2;
             }
             break;
-        case 'm': cfg.ram_mb = (uint32_t)atoi(optarg); break;
+        case 'm': cfg.ram_mb = g_ram_mb = (uint32_t)atoi(optarg); break;
         case 41: cfg.cpus = (uint32_t)atoi(optarg); break;
         case 'k': cfg.kernel = optarg; break;
         case 'i': cfg.initrd = optarg; break;
