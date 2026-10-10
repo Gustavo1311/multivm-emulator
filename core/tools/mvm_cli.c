@@ -420,7 +420,7 @@ static void *control_thread(void *arg)
 /* MVM_STRESS_ATOMIC=gpa:n (depuracao): uma thread do host faz o papel de outra CPU sobre a
  * RAM do convidado em gpa: espera o convidado escrever 1 em [gpa+8], faz n incrementos
  * atomicos em [gpa] e n entradas num spinlock [gpa+16] (CAS) incrementando [gpa+20] sem
- * atomico, e escreve 1 em [gpa+12] no fim. */
+ * atomico, e escreve 1 em [gpa+12] no fim. Fase 3: adicoes em contadores em [gpa+0x100]. */
 static void *stress_thread(void *arg)
 {
     (void)arg;
@@ -454,6 +454,16 @@ static void *stress_thread(void *arg)
         __atomic_store_n(&p[9], k, __ATOMIC_RELEASE);
     }
     __atomic_store_n(&p[10], 1, __ATOMIC_RELEASE);
+    /* fase 3: adicoes atomicas em contadores de 64/32/16 bits em [gpa+0x100] */
+    uint8_t *q = vm_debug_ram_ptr(g_vm, gpa + 0x100, 16);
+    while (!g_quit && !__atomic_load_n(&p[11], __ATOMIC_ACQUIRE))
+        usleep(100);
+    for (long i = 0; i < n && !g_quit && q; i++) {
+        __atomic_fetch_add((uint64_t *)q, 1, __ATOMIC_SEQ_CST);
+        __atomic_fetch_add((uint32_t *)(q + 8), 1, __ATOMIC_SEQ_CST);
+        __atomic_fetch_add((uint16_t *)(q + 12), 1, __ATOMIC_SEQ_CST);
+    }
+    __atomic_store_n(&p[12], 1, __ATOMIC_RELEASE);
     return NULL;
 }
 

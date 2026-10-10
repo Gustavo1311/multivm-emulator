@@ -188,6 +188,8 @@ void x86_tlb_flush(x86_cpu *c)
         }
     }
     c->tlb_nused = 0;
+    c->tlb_nlg = 0;
+    c->tlb_lg_over = false;
     c->fetch_page = 1;
     if (c->jit)
         x86_jit_tlb_flushed(c->jit);
@@ -213,6 +215,21 @@ void x86_tlb_protect_page(x86_cpu *c, uint64_t ppage)
         x86_tlbe *e = TLB_E(c, c->tlb_used[n]);
         if (e->pa == ppage && !(e->tag_w & (XTLB_INVALID | XTLB_IO)))
             e->tag_w |= XTLB_IO;
+    }
+}
+
+/* Como x86_tlb_protect_page, chamada pela thread de OUTRA CPU (que acabou de traduzir
+ * codigo da pagina): as escritas desta CPU passam ja pelo caminho lento, sem esperar o
+ * trabalho assincrono (que continua como reforco). A lista e as entradas podem mudar ao
+ * mesmo tempo: no pior caso protege uma entrada a mais (so fica lenta) ou perde uma que a
+ * dona refaz agora, e essa ja consulta o mapa comum de paginas com codigo. */
+void x86_tlb_protect_page_remote(x86_cpu *c, uint64_t ppage)
+{
+    unsigned n = __atomic_load_n(&c->tlb_nused, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < n; i++) {
+        x86_tlbe *e = TLB_E(c, __atomic_load_n(&c->tlb_used[i], __ATOMIC_RELAXED));
+        if (__atomic_load_n(&e->pa, __ATOMIC_RELAXED) == ppage)
+            __atomic_fetch_or(&e->tag_w, (uint64_t)XTLB_IO, __ATOMIC_SEQ_CST);
     }
 }
 
@@ -255,6 +272,24 @@ void x86_tlb_flush_page(x86_cpu *c, uint64_t lin)
     for (int u = 0; u < 2; u++) {
         x86_tlbe *e = &c->tlb[u][(lin >> 12) & (X86_TLB_SIZE - 1)];
         e->tag_r = e->tag_w = e->tag_x = XTLB_INVALID;
+    }
+    if (c->tlb_lg_over) { /* regioes demais para acompanhar: esvazia tudo */
+        x86_tlb_flush(c);
+        return;
+    }
+    /* endereco dentro de uma pagina grande: invalida as entradas de 4 KB dela toda */
+    for (unsigned i = 0; i < c->tlb_nlg; i++) {
+        int sh = (int)(c->tlb_lg[i] & 63);
+        uint64_t base = c->tlb_lg[i] & ~63ULL, mask = ~((1ULL << sh) - 1);
+        if ((lin & mask) != base)
+            continue;
+        for (unsigned n = 0; n < c->tlb_nused; n++) {
+            x86_tlbe *e = TLB_E(c, c->tlb_used[n]);
+            uint64_t t = !(e->tag_r & XTLB_INVALID) ? e->tag_r : !(e->tag_x & XTLB_INVALID) ? e->tag_x : e->tag_w;
+            if (!(t & XTLB_INVALID) && (t & mask) == base)
+                e->tag_r = e->tag_w = e->tag_x = XTLB_INVALID;
+        }
+        c->tlb_lg[i--] = c->tlb_lg[--c->tlb_nlg];
     }
     c->fetch_page = 1;
     if (c->jit)
@@ -338,7 +373,7 @@ static uint64_t walk(x86_cpu *c, uint64_t lin, int acc, int user, int *perm_out)
     }
     bool nxe = c->efer & EFER_NXE;
 retry:;
-    int pw = 1, pu = 1, nx = 0;
+    int pw = 1, pu = 1, nx = 0, large = 0;
     uint64_t pa, leaf_addr, leaf;
     unsigned leaf_size;
     if (c->efer & EFER_LMA) {
@@ -359,6 +394,7 @@ retry:;
                 pa = (e & 0x000fffffffffe000ULL & ~(sz - 1)) | (lin & (sz - 1));
                 leaf_addr = a;
                 leaf = e;
+                large = shift;
                 break;
             }
             if (shift == 12) {
@@ -388,6 +424,7 @@ retry:;
             pa = (e & 0x000fffffffe00000ULL) | (lin & 0x1fffff);
             leaf_addr = a;
             leaf = e;
+            large = 21;
         } else {
             if (!(e & 0x20) && !phys_or(c, a, e, 0x20, 8))
                 goto retry;
@@ -415,6 +452,7 @@ retry:;
             pa = (e & 0xffc00000u) | (la & 0x3fffff);
             leaf_addr = a;
             leaf = e;
+            large = 22;
         } else {
             if (!(e & 0x20) && !phys_or(c, a, e, 0x20, 4))
                 goto retry;
@@ -450,6 +488,7 @@ retry:;
         perm |= 4;
     if ((leaf & 0x100) && (c->cr4 & CR4_PGE))
         perm |= 8; /* global */
+    perm |= large << 8; /* log2 do tamanho da pagina grande (0 = 4 KB) */
     *perm_out = perm;
     return pa & c->a20_mask;
 }
@@ -478,6 +517,19 @@ static x86_tlbe *tlb_fill(x86_cpu *c, uint64_t lin, int acc, int user)
     e->addend = host ? (uintptr_t)host - (uintptr_t)page : 0;
     e->pa = ppage;
     c->tlb_g[user][(lin >> 12) & (X86_TLB_SIZE - 1)] = (perm & 8) != 0;
+    if (perm >> 8) { /* pagina grande: base | log2 do tamanho */
+        int sh = perm >> 8;
+        uint64_t rec = (lin & ~((1ULL << sh) - 1)) | (uint64_t)sh;
+        unsigned i = 0;
+        while (i < c->tlb_nlg && c->tlb_lg[i] != rec)
+            i++;
+        if (i == c->tlb_nlg) {
+            if (c->tlb_nlg < 16)
+                c->tlb_lg[c->tlb_nlg++] = rec;
+            else
+                c->tlb_lg_over = true;
+        }
+    }
     return e;
 }
 
@@ -1088,9 +1140,16 @@ uint8_t *x86_lk_host(x86_cpu *c, uint64_t lin, unsigned size)
     if ((lin & (size - 1)) || (lin & 0xfff) + size > 0x1000)
         return NULL;
     x86_tlbe *e = &c->tlb[x86_user(c)][(lin >> 12) & (X86_TLB_SIZE - 1)];
-    if (e->tag_w != (lin & ~0xfffULL))
-        return NULL;
-    return (uint8_t *)(e->addend + lin);
+    if (e->tag_w == (lin & ~0xfffULL))
+        return (uint8_t *)(e->addend + lin);
+    /* RAM com escrita lenta so por controle (codigo traduzido na pagina, VRAM com paginas
+     * sujas): o operando continua na RAM e o LOCK tem de ser atomico. Sem isto virava
+     * leitura + escrita comuns e perdia o incremento de outra CPU (o Windows reaproveita
+     * paginas que tiveram codigo para o pool: contador de referencias de objeto em -1).
+     * space_ram_ptr com escrita invalida as traducoes e marca a VRAM. */
+    if (e->tag_w == ((lin & ~0xfffULL) | XTLB_IO))
+        return space_ram_ptr(c->mem, e->pa | (lin & 0xfff), size, true);
+    return NULL;
 }
 
 static uint64_t atomic_ld_sz(uint8_t *h, unsigned size)
@@ -2615,6 +2674,7 @@ void x86_set_cpu_index(void *opaque, int index, unsigned ncpus)
     c->apic_id = (unsigned)index;
     c->ncpus = ncpus;
     c->exit_flag = vm_cpu_exit_flag(c->vm, index);
+    x86_jit_cpu_mask(c->jit, index);
     if (index > 0) { /* CPU extra: espera o INIT/SIPI da BSP */
         c->wait_sipi = true;
         c->halted = true;

@@ -23,6 +23,7 @@ void x86_tlb_flush_page(x86_cpu *c, uint64_t lin);
 void x86_tlb_flush_nonglobal(x86_cpu *c);
 /* escritas na pagina fisica ppage: pelo caminho lento (protect) ou nova traducao (unprotect) */
 void x86_tlb_protect_page(x86_cpu *c, uint64_t ppage);
+void x86_tlb_protect_page_remote(x86_cpu *c, uint64_t ppage);
 void x86_tlb_unprotect_page(x86_cpu *c, uint64_t ppage);
 void x86_debug_symbolize(x86_cpu *c, uint64_t addr, char *out, size_t n);
 uint64_t x86_sys_rd(x86_cpu *c, uint64_t lin, unsigned size);

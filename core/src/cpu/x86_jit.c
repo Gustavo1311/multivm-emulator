@@ -94,6 +94,13 @@ struct x86_jit {
     bool lrcpc;             /* host com LDAPR (ARMv8.3) */
     bool lse;               /* host com atomicos LSE (ARMv8.1) */
     bool verify;            /* MVM_JIT_VERIFY: confere o codigo do convidado na entrada de cada bloco */
+    bool sc;                /* MVM_JIT_SC (depuracao): barreira completa apos cada escrita (mais forte que TSO) */
+    /* modo SMP: invalidacoes pedidas por outras threads e ainda nao feitas, por pagina fisica.
+     * O prologo de cada bloco confere o contador da sua pagina e sai sem executar se houver
+     * uma pendente (a CPU faz o trabalho e traduz de novo): sem esperar a CPU dona, outra CPU
+     * (ou a DMA) que reescreveu o codigo nunca a ve rodar a traducao velha. */
+    uint16_t *pend;
+    _Atomic int pend_any;
     long off_gen;           /* geracao de x86_jit_new_off ja aplicada (CLI "jitoff") */
     struct jinsn_s *tr_ins; /* buffers do tradutor (por JIT: cada CPU traduz na sua thread) */
     bool *tr_stored, *tr_dead;
@@ -816,6 +823,8 @@ static void g_st(jctx *x, int size, int rt)
     }
     uint32_t *br = g_align_check(x, size);
     a64_stlr(a, size, rt, 9);
+    if (x->j->sc)
+        a64_dmb(a, A64_DMB_ISH);
     if (br && cold_begin(x, br, NULL)) {
         uint32_t *done = x->hot_p;
         a64_dmb(a, A64_DMB_ISH);
@@ -3571,6 +3580,7 @@ static void group_mark(struct x86_jit *j, uint64_t pg)
     for (int i = 0; i < vm->ncpus; i++) {
         if (i == j->c->index)
             continue;
+        x86_tlb_protect_page_remote((x86_cpu *)vm->vcpu[i].cpu, pg << 12);
         uint64_t *a = malloc(2 * sizeof(uint64_t));
         a[0] = (uint64_t)i;
         a[1] = pg << 12;
@@ -3586,6 +3596,8 @@ static void hook_work(mvm_vm *vm, void *arg)
     (void)vm;
     struct hook_arg *h = arg;
     code_hook(h->j, h->pa, h->len);
+    __atomic_fetch_sub(&h->j->pend[h->pa >> 12], 1, __ATOMIC_SEQ_CST);
+    atomic_fetch_sub(&h->j->pend_any, 1);
 }
 
 /* escrita (de qualquer thread) numa pagina do mapa comum */
@@ -3614,7 +3626,10 @@ static void group_code_hook(void *opaque, uint64_t pa, uint64_t len)
             h->j = j;
             h->pa = pa;
             h->len = len;
-            vm_run_on_cpu_sync(vm, j->c->index, hook_work, h);
+            /* antes de voltar (e da proxima escrita de quem chamou): a pagina fica bloqueada */
+            __atomic_fetch_add(&j->pend[pg], 1, __ATOMIC_SEQ_CST);
+            atomic_fetch_add(&j->pend_any, 1);
+            vm_run_on_cpu(vm, j->c->index, hook_work, h);
         }
     }
     if (!any && vm) {
@@ -3886,7 +3901,13 @@ static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const b
     }
     /* prologo: orcamento de instrucoes (corrigido no fim). O bloco roda se ainda ha
      * orcamento, mesmo que ultrapasse um pouco o fim da fatia. */
-    uint32_t *blt, *sub_at;
+    uint32_t *blt, *sub_at, *bpend = NULL;
+    if (j->pend && (b->phys >> 12) < j->npages) {
+        a64_mov_imm(a, 9, (uint64_t)(uintptr_t)&j->pend[b->phys >> 12]);
+        a64_put(a, 0x79400000u | (9u << 5) | 9u); /* ldrh w9, [x9] */
+        bpend = a64_here(a);
+        a64_cbnz(a, 0, 9, a64_here(a));
+    }
     if (j->off & 2048) { /* MVM_JIT_OFF=2048: orcamento so em memoria (como antes) */
         a64_ldr(a, 8, 9, RC, OFF(jit_budget));
         a64_addsub_imm(a, 1, 1, 1, XZR, 9, 0, 0);
@@ -3968,6 +3989,8 @@ static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const b
         emit_exit_next(x, rip, true);
     /* saida antecipada (orcamento esgotado): nada executado */
     a64_patch(blt, a64_here(a));
+    if (bpend)
+        a64_patch(bpend, a64_here(a));
     emit_exit_why(x, EX_BUDGET);
     a64_mov_imm(a, 9, b->rip);
     a64_str(a, 8, 9, RC, OFF(rip));
@@ -4098,6 +4121,14 @@ volatile long x86_jit_new_off = -1;
 volatile long x86_jit_new_smp = -1; /* depuracao (CLI "smp 0|1"): troca o modo SMP com a VM rodando */
 volatile long x86_jit_off_gen; /* incrementado a cada "jitoff"/"jits2"/"jitdis" (cada CPU aplica) */
 
+/* depuracao (MVM_JIT_CPUS=mascara): CPUs fora da mascara so com o interpretador */
+void x86_jit_cpu_mask(struct x86_jit *j, int index)
+{
+    const char *e = getenv("MVM_JIT_CPUS");
+    if (j && e && !((strtoul(e, NULL, 0) >> index) & 1))
+        j->off |= 0x40000000u;
+}
+
 int64_t x86_jit_run(x86_cpu *c, int64_t budget)
 {
     struct x86_jit *j = c->jit;
@@ -4117,6 +4148,8 @@ int64_t x86_jit_run(x86_cpu *c, int64_t budget)
     }
     if (unlikely(j->off & 0x40000000u)) /* depuracao: so o interpretador */
         return -1;
+    if (unlikely(atomic_load_explicit(&j->pend_any, memory_order_acquire)))
+        vm_cpu_work_now(c->vm); /* invalidacoes pedidas por outra thread: antes de executar */
     if (!mode_ok(c)) {
         j->ret_nomode++;
         return -1;
@@ -4260,6 +4293,9 @@ struct x86_jit *x86_jit_new(x86_cpu *c)
     j->lse = (getauxval(AT_HWCAP) & (1UL << 8)) != 0;    /* HWCAP_ATOMICS */
 #endif
     j->verify = getenv("MVM_JIT_VERIFY") != NULL;
+    j->sc = getenv("MVM_JIT_SC") != NULL;
+    if (j->sc)
+        j->lrcpc = false; /* LDAR (RCsc) */
     if (j->smp)
         LOGI("JIT: modo SMP (ordem TSO%s)", j->lrcpc ? ", LDAPR" : ", LDAR");
     j->code = mem;
@@ -4274,6 +4310,8 @@ struct x86_jit *x86_jit_new(x86_cpu *c)
     j->bits = calloc((j->npages + 7) / 8 + 1, 1);
     j->jc_cnt = calloc(j->npages, sizeof(uint16_t));
     j->chunks = calloc(j->npages, sizeof(uint64_t));
+    if (c->smp)
+        j->pend = calloc(j->npages, sizeof(uint16_t));
     jit_group *g = c->mem->code_hook == group_code_hook ? c->mem->code_opaque : NULL;
     if (!g) {
         g = calloc(1, sizeof(*g));
@@ -4339,6 +4377,7 @@ void x86_jit_free(struct x86_jit *j)
     free(j->bits);
     free(j->jc_cnt);
     free(j->chunks);
+    free(j->pend);
     free(j);
 }
 

@@ -450,47 +450,12 @@ static void work_run(mvm_vm *vm, int idx)
     }
 }
 
-/* Marca a CPU idx como executando o convidado; devolve false (e desmarca) se ha trabalho
- * pendente, que precisa rodar antes. Com vm_run_on_cpu_sync (que grava work_pending e
- * depois le in_run) forma um par de Dekker: ou a CPU ve o trabalho, ou quem pediu a ve
- * executando e espera. */
-static bool enter_run(mvm_vm *vm, int idx)
+/* chamado pela thread de uma CPU no meio da execucao (fronteira de instrucao): faz ja o
+ * trabalho pedido a ela (invalidacoes do JIT que bloqueiam paginas de codigo) */
+void vm_cpu_work_now(mvm_vm *vm)
 {
-    struct vm_vcpu *v = &vm->vcpu[idx];
-    atomic_store(&v->in_run, 1);
-    if (atomic_load(&v->work_pending)) {
-        atomic_store(&v->in_run, 0);
-        return false;
-    }
-    return true;
-}
-
-/*
- * Como vm_run_on_cpu, mas so volta quando a CPU idx ja nao pode executar codigo do
- * convidado sem ter feito o trabalho (invalidar traducoes do JIT escritas por outra CPU:
- * sem isso a escrita do codigo e um aviso posterior pela memoria chegariam antes da
- * invalidacao, e a outra CPU rodaria a traducao velha). Enquanto espera, faz o trabalho
- * pedido a esta CPU (duas CPUs podem se esperar). Quem segura a bql nao espera (a outra
- * CPU pode estar esperando a bql): fica assincrono.
- */
-void vm_run_on_cpu_sync(mvm_vm *vm, int idx, void (*fn)(mvm_vm *vm, void *arg), void *arg)
-{
-    if (idx >= vm->ncpus || vm_is_cpu_thread(vm, idx)) {
-        vm_run_on_cpu(vm, idx, fn, arg);
-        return;
-    }
-    vm_run_on_cpu(vm, idx, fn, arg);
-    if (tls_bql_depth > 0)
-        return;
-    struct vm_vcpu *v = &vm->vcpu[idx];
-    int me = tls_cpu_vm == vm ? tls_cpu_idx : -1;
-    while (atomic_load(&v->in_run) && atomic_load(&v->work_pending)) {
-        if (me >= 0)
-            work_run(vm, me);
-        if (__atomic_load_n(&vm->shutdown, __ATOMIC_RELAXED) || atomic_load(&vm->aps_quit))
-            break;
-        sched_yield();
-    }
+    if (tls_cpu_vm == vm && tls_cpu_idx >= 0)
+        work_run(vm, tls_cpu_idx);
 }
 
 /* depuracao (teste de atomicidade): ponteiro do host para a RAM do convidado em gpa */
@@ -822,11 +787,8 @@ static void *ap_loop(void *arg)
             v->st_halt += host_clock_ns() - t0;
             continue;
         }
-        if (!enter_run(vm, idx))
-            continue;
         int64_t t0 = host_clock_ns();
         int64_t n = vm->cpu_ops->run(v->cpu, SLICE_INSNS);
-        atomic_store(&v->in_run, 0);
         v->st_run += host_clock_ns() - t0;
         v->st_insns += (uint64_t)n;
         atomic_fetch_add_explicit(&vm->insn_count, (uint64_t)n, memory_order_relaxed);
@@ -958,11 +920,8 @@ static int run_loop(mvm_vm *vm)
                 !atomic_load(&vm->pause_req) && !atomic_load(&vm->vcpu[0].work_pending) && vm->io_started &&
                 atomic_load(&vm->io_active) && mvm_now(vm) < atomic_load(&vm->timer_next) && !vm->cpu_ops->halted(vm->cpu)) {
                 atomic_store(&vm->cpu_exit, 0); /* nada a servir: executa sem tocar na trava */
-                if (!enter_run(vm, 0))
-                    continue;
                 int64_t t0 = host_clock_ns();
                 int64_t n = vm->cpu_ops->run(vm->cpu, SLICE_INSNS);
-                atomic_store(&vm->vcpu[0].in_run, 0);
                 vm->vcpu[0].st_run += host_clock_ns() - t0;
                 vm->vcpu[0].st_insns += (uint64_t)n;
                 atomic_fetch_add_explicit(&vm->insn_count, (uint64_t)n, memory_order_relaxed);
@@ -1004,7 +963,11 @@ static int run_loop(mvm_vm *vm)
         if (atomic_exchange(&vm->reset_req, 0)) {
             if (vm->cfg.arch == MVM_ARCH_X86_64 && getenv("MVM_X86_BUGCHECK")) {
                 extern void x86_debug_bugcheck(void *cpu);
+                extern void x86_debug_stack(void *cpu);
                 x86_debug_bugcheck(vm->cpu); /* so mostra algo se o Windows parou com bugcheck */
+                for (int i = 0; i < vm->ncpus; i++)
+                    if (vm->vcpu[i].cpu)
+                        x86_debug_stack(vm->vcpu[i].cpu);
             }
             LOGI("reiniciando a maquina");
             vm->machine->reset(vm);
@@ -1053,11 +1016,8 @@ static int run_loop(mvm_vm *vm)
             continue;
         vm_bql_unlock(vm);
         locked = false;
-        if (!enter_run(vm, 0))
-            continue;
         int64_t t0 = host_clock_ns();
         int64_t n = vm->cpu_ops->run(vm->cpu, SLICE_INSNS);
-        atomic_store(&vm->vcpu[0].in_run, 0);
         vm->vcpu[0].st_run += host_clock_ns() - t0;
         vm->vcpu[0].st_insns += (uint64_t)n;
         atomic_fetch_add_explicit(&vm->insn_count, (uint64_t)n, memory_order_relaxed);

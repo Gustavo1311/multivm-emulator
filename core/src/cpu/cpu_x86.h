@@ -180,6 +180,11 @@ typedef struct x86_cpu {
     uint16_t tlb_used[2 * X86_TLB_SIZE];
     uint8_t tlb_inlist[2][X86_TLB_SIZE];
     unsigned tlb_nused;
+    /* regioes de paginas grandes (2 MB/1 GB) com entradas na TLB: o INVLPG de qualquer
+     * endereco dentro delas invalida a pagina grande inteira, como no hardware */
+    uint64_t tlb_lg[16];
+    unsigned tlb_nlg;
+    bool tlb_lg_over;
     bool tlb_listed; /* falso ate o primeiro esvaziamento completo */
     uint64_t fetch_page;
     uint8_t *fetch_host;

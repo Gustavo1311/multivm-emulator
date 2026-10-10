@@ -10,6 +10,7 @@ struct x86_jit *x86_jit_new(x86_cpu *c);
 void x86_jit_free(struct x86_jit *j);
 /* descarta todo o codigo traduzido */
 void x86_jit_flush(struct x86_jit *j);
+void x86_jit_cpu_mask(struct x86_jit *j, int index);
 /* Executa blocos traduzidos a partir de RIP. Retorna as instrucoes executadas,
  * ou -1 se a instrucao em RIP deve ser executada pelo interpretador. */
 int64_t x86_jit_run(x86_cpu *c, int64_t budget);
