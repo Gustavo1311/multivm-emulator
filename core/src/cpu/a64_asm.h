@@ -353,12 +353,22 @@ static inline void a64_blr(a64 *a, int rn) { a64_put(a, 0xD63F0000u | ((uint32_t
 static inline void a64_ret(a64 *a) { a64_put(a, 0xD65F03C0u); }
 
 /* corrige um desvio ja emitido (B, B.cond, CBZ/CBNZ) para apontar para 'target' */
+/* B incondicional em 'at' para 'target' (substitui o que houver, ex.: BL de saida) */
+static inline void a64_patch_b(uint32_t *at, uint32_t *target)
+{
+    *at = 0x14000000u | ((uint32_t)(int32_t)(target - at) & 0x3ffffff);
+}
+static inline void a64_bl(a64 *a, uint32_t *target)
+{
+    a64_put(a, 0x94000000u | ((uint32_t)(int32_t)(target - a->p) & 0x3ffffff));
+}
+
 static inline void a64_patch(uint32_t *at, uint32_t *target)
 {
     int32_t d = (int32_t)(target - at);
     uint32_t ins = *at;
-    if ((ins & 0xFC000000u) == 0x14000000u)
-        *at = 0x14000000u | ((uint32_t)d & 0x3ffffff);
+    if ((ins & 0x7C000000u) == 0x14000000u) /* B ou BL: mantem o tipo */
+        *at = (ins & 0xFC000000u) | ((uint32_t)d & 0x3ffffff);
     else
         *at = (ins & ~(0x7ffffu << 5)) | (((uint32_t)d & 0x7ffff) << 5);
 }
