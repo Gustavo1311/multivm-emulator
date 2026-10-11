@@ -785,6 +785,8 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
         s.name = vmName();
         s.arch = Math.max(0, arch.getSelectedItemPosition());
         s.ram = String.valueOf(ramMb());
+        s.cpus = AppFiles.defaultCpus(AppFiles.ARCHS[Math.min(AppFiles.ARCHS.length - 1, s.arch)],
+                os.getSelectedItemPosition() == 0 /* Linux */);
         s.bios = b;
         s.cmdline = b ? "" : cmdline.getText().toString().trim();
         s.fb = !b && fb.isChecked();

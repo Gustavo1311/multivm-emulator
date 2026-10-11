@@ -193,7 +193,7 @@
                     <TextView
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:text="Mais de um processador acelera o Linux quando há várias tarefas ao mesmo tempo (boot, desktop). Use no máximo os núcleos rápidos do celular (normalmente 2 a 4). Cada processador a mais deixa cada um cerca de 20% mais lento, então para um programa só, 1 é melhor. Sistemas instalados com 1 processador (como o Windows XP) continuam usando 1."
+                        android:text="Para Linux, 2 processadores deixam o boot e o desktop bem mais rápidos (o boot de uma ISO live fica cerca de 40% mais curto). Use no máximo os núcleos rápidos do celular (normalmente 2 a 4); cada processador a mais deixa cada um um pouco mais lento, então para um programa só, 1 é melhor. Dica: uma ISO live descomprime o sistema a cada boot; instalado num disco virtual, o mesmo Linux inicia até 2,5 vezes mais rápido. Sistemas instalados com 1 processador (como o Windows XP) continuam usando 1."
                         android:textColor="@color/text2"
                         android:textSize="12sp" />
                 </LinearLayout>

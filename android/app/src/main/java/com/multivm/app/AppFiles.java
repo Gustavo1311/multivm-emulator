@@ -47,6 +47,16 @@ final class AppFiles {
         return RAM_DESKTOP;
     }
 
+    /**
+     * Processadores sugeridos para VMs novas: 2 para Linux em x86 quando o aparelho tem 6
+     * nucleos ou mais (o boot de Linux live fica ~40% mais curto); 1 nos demais casos
+     * (Windows com mais de uma CPU ainda e lento e o XP nao foi testado assim).
+     */
+    static int defaultCpus(Architecture a, boolean linux) {
+        if (!isX86(a) || !linux) return 1;
+        return Runtime.getRuntime().availableProcessors() >= 6 ? 2 : 1;
+    }
+
     /** Aviso de memoria pouca para sistemas com desktop, ou null. */
     static String lowRamWarning(int mb) {
         if (mb <= 0 || mb >= RAM_DESKTOP) return null;
