@@ -745,19 +745,30 @@ static void emit_tlb(jctx *x, int addr, int size, uint32_t tag_off, uint32_t **s
     a64_ubfx(a, 9, addr, 12, X86_TLB_BITS);
     a64_addsub_reg(a, 1, 0, 0, 9, 9, 9, 2);      /* idx * 5 */
     a64_addsub_reg(a, 1, 0, 0, 9, RTLB, 9, 3);   /* base + idx * 40 */
-    a64_ldr(a, 8, 10, 9, tag_off);
+    /* leitura/escrita: etiqueta (em x9) e soma (em x10) num so LDP; execucao: so a etiqueta */
+    int tag = 10;
+    bool pair = !(x->j->off & 33554432u);
+    if (pair && tag_off == offsetof(x86_tlbe, tag_r)) {
+        a64_ldp(a, 9, 10, 9, 0);
+        tag = 9;
+    } else if (pair && tag_off == offsetof(x86_tlbe, tag_w)) {
+        a64_ldp(a, 10, 9, 9, (uint32_t)offsetof(x86_tlbe, addend));
+        tag = 9;
+    } else {
+        a64_ldr(a, 8, 10, 9, tag_off);
+    }
     *slow2 = NULL;
     if (size > 1 && !(x->j->off & 512)) {
         /* pagina do ULTIMO byte: se o acesso cruza a pagina ela difere da etiqueta (que e a
          * pagina do primeiro byte, ja que o indice vem dele) e vai para o caminho lento */
         a64_add_imm(a, 11, addr, (uint32_t)(size - 1));
         a64_and_bitmask(a, 11, 11, A64_MASK_PAGE_HI);
-        a64_cmp(a, 1, 10, 11);
+        a64_cmp(a, 1, tag, 11);
         *slow1 = a64_here(a);
         a64_bcond(a, A_NE, a64_here(a));
     } else {
         a64_and_bitmask(a, 11, addr, A64_MASK_PAGE_HI);
-        a64_cmp(a, 1, 10, 11);
+        a64_cmp(a, 1, tag, 11);
         *slow1 = a64_here(a);
         a64_bcond(a, A_NE, a64_here(a));
         if (size > 1) {
@@ -767,7 +778,8 @@ static void emit_tlb(jctx *x, int addr, int size, uint32_t tag_off, uint32_t **s
             a64_bcond(a, A_HI, a64_here(a));
         }
     }
-    a64_ldr(a, 8, 10, 9, (uint32_t)offsetof(x86_tlbe, addend));
+    if (tag == 10)
+        a64_ldr(a, 8, 10, 9, (uint32_t)offsetof(x86_tlbe, addend));
 }
 
 /* Acesso a memoria do convidado em [x10 + REA] (x10 = soma do TLB). No modo SMP segue a

@@ -78,8 +78,11 @@ enum { CC_NONE = 0, CC_ADD, CC_ADC, CC_SUB, CC_SBB, CC_LOGIC, CC_INC, CC_DEC, CC
 #define XTLB_IO 2ULL
 
 typedef struct {
-    uint64_t tag_r, tag_w, tag_x;
+    /* ordem pensada para o JIT: leitura carrega tag_r + addend e escrita addend + tag_w com
+     * um so LDP (uma carga dependente a menos por acesso) */
+    uint64_t tag_r;
     uintptr_t addend;
+    uint64_t tag_w, tag_x;
     uint64_t pa;
 } x86_tlbe;
 
