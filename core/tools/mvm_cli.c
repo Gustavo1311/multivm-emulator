@@ -358,6 +358,10 @@ static void *control_thread(void *arg)
                 if (o)
                     fclose(o);
                 fprintf(stderr, "[mvm-cli] RAM gravada em %s (%llu MB)\n", line + 8, (unsigned long long)(pa >> 20));
+            } else if (!strcmp(line, "pause")) { /* pausa a VM (como o botao Pausar do app) */
+                mvm_pause(g_vm);
+            } else if (!strcmp(line, "resume")) {
+                mvm_resume(g_vm);
             } else if (!strcmp(line, "icount")) { /* instrucoes executadas + tempo (MIPS de um trecho) */
                 struct timespec ts;
                 clock_gettime(CLOCK_MONOTONIC, &ts);

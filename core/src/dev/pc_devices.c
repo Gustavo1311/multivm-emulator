@@ -1013,7 +1013,14 @@ struct i8042 {
     uint8_t mouse_rate, mouse_res, mouse_status;
     int mouse_wrap;
     uint32_t mouse_buttons;
+    /* movimento ainda nao enviado (fila cheia ou VM parada): sai em pacotes inteiros */
+    int mouse_pdx, mouse_pdy;
+    uint32_t mouse_pbuttons;
 };
+
+/* a fila do mouse guarda no maximo ~32 pacotes: com a VM parada ou lenta o movimento
+ * acumula em vez de virar centenas de pacotes velhos */
+#define MOUSE_QUEUE_MAX 96
 
 static int i8042_dbg(void);
 
@@ -1024,8 +1031,12 @@ static void kq_push(kqueue *q, uint8_t v)
     q->count++;
 }
 
+static void mouse_fill(i8042 *k);
+
 static void i8042_update(i8042 *k)
 {
+    if (k->mouse_enabled && k->mq.count < MOUSE_QUEUE_MAX - 3)
+        mouse_fill(k); /* movimento acumulado com a fila cheia */
     if (!k->outbuf_full) {
         if (k->kq.count && !(k->mode & 0x10)) {
             k->outbuf = k->kq.data[k->kq.rpos];
@@ -1092,6 +1103,15 @@ static void kbd_write(i8042 *k, uint8_t val)
 
 static void mouse_write(i8042 *k, uint8_t val)
 {
+    /* comando para o mouse: como no aparelho real, o movimento ainda nao lido e descartado
+     * e a resposta (0xFA...) vem em seguida. Sem isso, depois de um acumulo (VM parada, tela
+     * do celular desligada) o driver do convidado tentava ressincronizar com um reset e lia
+     * pacotes velhos no lugar de FA AA 00: desistia do mouse */
+    if (!k->mouse_wrap) {
+        k->mq.count = 0;
+        k->mouse_pdx = k->mouse_pdy = 0;
+        k->mouse_pbuttons = k->mouse_buttons;
+    }
     uint8_t cmd = k->mouse_cmd;
     k->mouse_cmd = 0;
     if (cmd == 0xf3) { k->mouse_rate = val; kq_push(&k->mq, 0xfa); return; }
@@ -1261,6 +1281,25 @@ void i8042_key(i8042 *k, uint16_t code, bool pressed)
     i8042_update(k);
 }
 
+/* gera pacotes inteiros de 3 bytes do movimento pendente enquanto couberem na fila
+ * (byte perdido no meio de um pacote dessincroniza o driver do convidado) */
+static void mouse_fill(i8042 *k)
+{
+    while ((k->mouse_pdx || k->mouse_pdy || k->mouse_pbuttons != k->mouse_buttons) &&
+           k->mq.count + 3 <= MOUSE_QUEUE_MAX) {
+        int x = k->mouse_pdx > 127 ? 127 : k->mouse_pdx < -127 ? -127 : k->mouse_pdx;
+        int y = k->mouse_pdy > 127 ? 127 : k->mouse_pdy < -127 ? -127 : k->mouse_pdy;
+        int py = -y; /* PS/2: Y positivo para cima */
+        uint32_t b = k->mouse_pbuttons;
+        kq_push(&k->mq, (uint8_t)(0x08 | (b & 7) | (x < 0 ? 0x10 : 0) | (py < 0 ? 0x20 : 0)));
+        kq_push(&k->mq, (uint8_t)x);
+        kq_push(&k->mq, (uint8_t)py);
+        k->mouse_pdx -= x;
+        k->mouse_pdy -= y;
+        k->mouse_buttons = b;
+    }
+}
+
 void i8042_mouse(i8042 *k, int dx, int dy, int dz, uint32_t buttons)
 {
     (void)dz;
@@ -1269,17 +1308,13 @@ void i8042_mouse(i8042 *k, int dx, int dy, int dz, uint32_t buttons)
              k->mouse_enabled, k->mode, k->mq.count, k->status);
     if (!k->mouse_enabled)
         return;
-    while (dx || dy || buttons != k->mouse_buttons) {
-        int x = dx > 127 ? 127 : dx < -127 ? -127 : dx;
-        int y = dy > 127 ? 127 : dy < -127 ? -127 : dy;
-        int py = -y; /* PS/2: Y positivo para cima */
-        uint8_t b0 = (uint8_t)(0x08 | (buttons & 7) | (x < 0 ? 0x10 : 0) | (py < 0 ? 0x20 : 0));
-        kq_push(&k->mq, b0);
-        kq_push(&k->mq, (uint8_t)x);
-        kq_push(&k->mq, (uint8_t)py);
-        dx -= x;
-        dy -= y;
-        k->mouse_buttons = buttons;
+    /* acumula (com limite, para nao "andar" sozinho por muito tempo depois) e envia o que couber */
+    k->mouse_pdx = k->mouse_pdx + dx > 4096 ? 4096 : k->mouse_pdx + dx < -4096 ? -4096 : k->mouse_pdx + dx;
+    k->mouse_pdy = k->mouse_pdy + dy > 4096 ? 4096 : k->mouse_pdy + dy < -4096 ? -4096 : k->mouse_pdy + dy;
+    if (buttons != k->mouse_pbuttons && k->mouse_pbuttons != k->mouse_buttons) {
+        mouse_fill(k); /* nao perde um clique: o estado anterior dos botoes sai antes */
     }
+    k->mouse_pbuttons = buttons;
+    mouse_fill(k);
     i8042_update(k);
 }
