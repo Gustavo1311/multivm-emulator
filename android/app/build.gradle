@@ -11,8 +11,8 @@ android {
         applicationId 'com.multivm.app'
         minSdk 24
         targetSdk 34
-        versionCode 19
-        versionName '1.1-teste10'
+        versionCode 20
+        versionName '1.1-teste11'
     }
 
     buildTypes {

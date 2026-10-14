@@ -2601,6 +2601,8 @@ static void jit_wcr8(x86_cpu *c, uint64_t v) { x86_write_cr(c, 8, v); }
 static uint64_t jit_rcr8(x86_cpu *c) { return x86_read_cr(c, 8); }
 static void jit_cli(x86_cpu *c) { c->eflags &= ~(uint64_t)EFL_IF; }
 static void jit_invlpg(x86_cpu *c, uint64_t lin) { x86_tlb_flush_page(c, lin); }
+/* fim da sombra do STI dentro do bloco: a instrucao seguinte ja rodou */
+static void jit_sti_shadow_done(x86_cpu *c) { c->irq_inhibit = 0; }
 static void jit_sti(x86_cpu *c)
 {
     if (!(c->eflags & EFL_IF))
@@ -4160,6 +4162,7 @@ static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const b
     uint64_t rip = b->rip;
     unsigned n = 0;
     bool ended = false;
+    bool sti_shadow = false;
     while (n < limit) {
         uint64_t li = x->code64 ? rip : (uint32_t)(x->csbase + rip);
         unsigned off = (unsigned)(li & 0xfff);
@@ -4227,6 +4230,17 @@ static unsigned emit_block(jctx *x, const uint8_t *page, unsigned limit, const b
                 a64_patch(jbad, a64_here(a));
             }
         }
+        /* STI abre a janela de interrupcoes so depois da instrucao seguinte (a sombra). O bloco
+         * termina logo apos ela: com uma interrupcao pendente o jit_sti zerou o orcamento e o
+         * proximo bloco volta ao laco, que a entrega. Sem isso "sti; nop; nop; cli" (laco ocioso
+         * do XP multiprocessador) nunca deixava o relogio entrar e o boot parava numa tela preta. */
+        if (sti_shadow) {
+            a64_mov(a, 1, 0, RC);
+            emit_call(x, (const void *)jit_sti_shadow_done);
+            break;
+        }
+        if (in.op == 0xfb)
+            sti_shadow = true;
     }
     if (n && !ended)
         emit_exit_next(x, rip, true);

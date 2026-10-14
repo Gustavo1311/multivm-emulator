@@ -2442,6 +2442,16 @@ static int64_t x86_run(void *opaque, int64_t budget)
     }
     setjmp(c->jb);
     while (n < budget) {
+        /* a saida vem antes do teste de interrupcao: este consome a sombra do STI/MOV SS e a
+         * instrucao seguinte tem de rodar logo depois. Com a ordem inversa, um IPI da outra CPU
+         * (que tambem pede a saida) apagava a sombra e era entregue no "sti; sysexit" do
+         * KiSystemCallExit2 ainda no kernel com o FS do usuario: tela azul 0xA no XP com 2 CPUs. */
+        if (unlikely(c->halted)) {
+            c->irq_inhibit = 0; /* "sti; hlt": o HLT ja foi a instrucao da sombra */
+            break;
+        }
+        if (unlikely(atomic_load_explicit(c->exit_flag, memory_order_relaxed)))
+            break;
         if (unlikely(c->intr_line || c->nmi_pending)) {
             if (c->irq_inhibit) {
                 c->irq_inhibit = 0;
@@ -2464,8 +2474,6 @@ static int64_t x86_run(void *opaque, int64_t budget)
         } else {
             c->irq_inhibit = 0;
         }
-        if (unlikely(c->halted || atomic_load_explicit(c->exit_flag, memory_order_relaxed)))
-            break;
         if (likely(c->jit != NULL) && (!c->trace || c->trace_jit)) {
             int64_t done = x86_jit_run(c, budget - n);
             if (done > 0) {
