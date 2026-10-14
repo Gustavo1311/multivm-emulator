@@ -127,6 +127,8 @@ mvm_vm *mvm_create(const mvm_config *cfg, char *err, size_t errlen)
     vm->s_firmware = dupstr(cfg->firmware);
     vm->s_vga_bios = dupstr(cfg->vga_bios);
     vm->s_boot_order = dupstr(cfg->boot_order);
+    vm->s_uefi_vars = dupstr(cfg->uefi_vars);
+    vm->cfg.uefi_vars = vm->s_uefi_vars;
     vm->cfg.vga_bios = vm->s_vga_bios;
     vm->cfg.boot_order = vm->s_boot_order;
     vm->cfg.kernel = vm->s_kernel;
@@ -283,6 +285,7 @@ void mvm_destroy(mvm_vm *vm)
     free(vm->s_firmware);
     free(vm->s_vga_bios);
     free(vm->s_boot_order);
+    free(vm->s_uefi_vars);
     pthread_mutex_destroy(&vm->fb_lock);
     chr_destroy(&vm->serial);
     pthread_mutex_destroy(&vm->in_lock);

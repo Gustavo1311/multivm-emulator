@@ -44,7 +44,7 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
     private Spinner arch, bootOrder;
     private EditText ram, cmdline, fbSize;
     private SeekBar ramBar;
-    private RadioButton modeBios, modeKernel, sata, virtioCtrl;
+    private RadioButton modeBios, modeUefi, modeKernel, sata, virtioCtrl;
     private CheckBox fbEnable;
     private View kernelGroup, biosGroup, ctrlGroup;
     private MediaListView[] lists;
@@ -101,6 +101,7 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
         cmdline = findViewById(R.id.cmdline);
         fbSize = findViewById(R.id.fbSize);
         modeBios = findViewById(R.id.modeBios);
+        modeUefi = findViewById(R.id.modeUefi);
         modeKernel = findViewById(R.id.modeKernel);
         sata = findViewById(R.id.sata);
         virtioCtrl = findViewById(R.id.virtioCtrl);
@@ -130,6 +131,7 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
             public void onNothingSelected(AdapterView<?> p) {}
         });
         modeBios.setOnCheckedChangeListener((b, c) -> updateMode());
+        modeUefi.setOnCheckedChangeListener((b, c) -> updateMode());
         modeKernel.setOnCheckedChangeListener((b, c) -> updateMode());
         sata.setOnCheckedChangeListener((b, c) -> updateMode());
         virtioCtrl.setOnCheckedChangeListener((b, c) -> updateMode());
@@ -217,7 +219,7 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
                 .append(", Android ").append(Build.VERSION.RELEASE).append(", ABI ").append(abis.get(0));
         if (!abis.contains("arm64-v8a"))
             sb.append("\nAVISO: a biblioteca nativa deste APK só foi compilada para arm64-v8a.");
-        sb.append("\nBIOS embutida: SeaBIOS (bios-256k.bin + vgabios-stdvga.bin).");
+        sb.append("\nBIOS embutida: SeaBIOS (bios-256k.bin + vgabios-stdvga.bin). UEFI: OVMF do edk2 (OVMF_CODE.fd; cada VM guarda as suas variáveis).");
         sb.append("\nPasta do app para discos: ").append(diskDir()).append(" (Configurações › Discos decide se o app pergunta a pasta).");
         info.setText(sb);
     }
@@ -243,7 +245,12 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
     }
 
     private boolean bios() {
-        return isX86() && modeBios.isChecked();
+        return isX86() && (modeBios.isChecked() || modeUefi.isChecked());
+    }
+
+    /** UEFI (OVMF X64): so com a CPU de 64 bits */
+    private boolean uefi() {
+        return selectedArch() == Architecture.X86_64 && modeUefi.isChecked();
     }
 
     /* ---- som, rede e VNC ---- */
@@ -284,6 +291,11 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
         boolean x86 = isX86();
         findViewById(R.id.cpuBox).setVisibility(x86 ? View.VISIBLE : View.GONE); /* varios processadores: so x86 */
         modeBios.setEnabled(x86);
+        modeUefi.setEnabled(selectedArch() == Architecture.X86_64);
+        if (modeUefi.isChecked() && selectedArch() != Architecture.X86_64) {
+            if (x86) modeBios.setChecked(true);
+            else modeKernel.setChecked(true);
+        }
         if (!x86 && modeBios.isChecked()) modeKernel.setChecked(true);
         boolean b = bios();
         biosGroup.setVisibility(b ? View.VISIBLE : View.GONE);
@@ -338,7 +350,8 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
         title.setText(settings.name);
         arch.setSelection(Math.max(0, Math.min(ARCHS.length - 1, settings.arch)));
         ram.setText(settings.ram);
-        if (settings.bios) modeBios.setChecked(true);
+        if (settings.bios && settings.uefi) modeUefi.setChecked(true);
+        else if (settings.bios) modeBios.setChecked(true);
         else modeKernel.setChecked(true);
         cmdline.setText(settings.cmdline);
         fbEnable.setChecked(settings.fb);
@@ -391,7 +404,8 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
         if (!n.isEmpty()) settings.name = n;
         settings.arch = arch.getSelectedItemPosition();
         settings.ram = ram.getText().toString();
-        settings.bios = modeBios.isChecked();
+        settings.bios = modeBios.isChecked() || modeUefi.isChecked();
+        settings.uefi = uefi();
         settings.cmdline = cmdline.getText().toString();
         settings.fb = fbEnable.isChecked();
         settings.fbSize = fbSize.getText().toString();
@@ -790,8 +804,9 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
         start.setEnabled(false);
         start.setText("Preparando...");
         VmLauncher.checkRam(this, settings, () -> {
-            loading = true; /* a memoria pode ter sido ajustada no aviso */
+            loading = true; /* a memoria e o firmware podem ter sido ajustados no aviso */
             ram.setText(settings.ram);
+            if (settings.bios) (settings.uefi ? modeUefi : modeBios).setChecked(true);
             loading = false;
             VmLauncher.start(this, settings, err -> {
                 resetStart();

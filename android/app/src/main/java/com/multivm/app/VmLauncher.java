@@ -104,8 +104,15 @@ final class VmLauncher {
         List<VmSettings.Media> fds = x86 ? s.floppies() : new ArrayList<>();
         if (bios) {
             File dir = installBios(a);
-            b.firmware(new File(dir, "bios-256k.bin").getAbsolutePath());
-            b.vgaBios(new File(dir, "vgabios-stdvga.bin").getAbsolutePath());
+            if (s.uefi) {
+                if (arch != Architecture.X86_64)
+                    throw new IllegalArgumentException("UEFI só está disponível para x86-64");
+                b.firmware(new File(dir, "OVMF_CODE.fd").getAbsolutePath());
+                b.uefiVars(uefiVars(a, s, dir).getAbsolutePath());
+            } else {
+                b.firmware(new File(dir, "bios-256k.bin").getAbsolutePath());
+                b.vgaBios(new File(dir, "vgabios-stdvga.bin").getAbsolutePath());
+            }
             if (s.bootOrder != null && !s.bootOrder.isEmpty()) b.bootOrder(s.bootOrder);
             if (disks.isEmpty() && cds.isEmpty() && fds.isEmpty())
                 throw new IllegalArgumentException("adicione uma ISO, um disco ou um disquete para dar boot");
@@ -203,7 +210,70 @@ final class VmLauncher {
      * Fatdog64) e a memoria nao basta, pergunta se aumenta. go roda na thread da UI quando pode iniciar
      * (s.ram ja ajustada e salva se o usuario aceitou); cancel, se ele desistir.
      */
+    /**
+     * Antes de ligar: confere se as ISOs dao boot pelo firmware escolhido (BIOS x UEFI) e depois se a RAM
+     * basta para o live CD (checkRamOnly). Oferece trocar o firmware quando so o outro serve.
+     */
     static void checkRam(Activity a, VmSettings s, Runnable go, Runnable cancel) {
+        Architecture arch = AppFiles.ARCHS[Math.max(0, Math.min(AppFiles.ARCHS.length - 1, s.arch))];
+        List<String> isos = new ArrayList<>();
+        if (AppFiles.isX86(arch) && s.bios)
+            for (VmSettings.Media m : s.cdroms()) if (m.uri != null) isos.add(m.uri);
+        if (isos.isEmpty()) {
+            checkRamOnly(a, s, go, cancel);
+            return;
+        }
+        new Thread(() -> {
+            boolean anyBios = false, anyEfi = false, efiOnly = false, biosOnly = false;
+            for (String f : isos) {
+                int p = IsoInfo.bootPlatforms(a, f);
+                anyBios |= (p & IsoInfo.BOOT_BIOS) != 0;
+                anyEfi |= (p & IsoInfo.BOOT_EFI) != 0;
+                efiOnly |= p == IsoInfo.BOOT_EFI;
+                biosOnly |= p == IsoInfo.BOOT_BIOS;
+            }
+            final boolean wantUefi = !s.uefi && efiOnly && !anyBios;
+            final boolean wantBios = s.uefi && biosOnly && !anyEfi;
+            a.runOnUiThread(() -> {
+                if (a.isFinishing()) {
+                    cancel.run();
+                    return;
+                }
+                if (!wantUefi && !wantBios) {
+                    checkRamOnly(a, s, go, cancel);
+                    return;
+                }
+                android.app.AlertDialog.Builder d = new android.app.AlertDialog.Builder(a)
+                        .setNegativeButton("Iniciar assim mesmo", (x, w) -> checkRamOnly(a, s, go, cancel))
+                        .setOnCancelListener(x -> cancel.run());
+                if (wantUefi && arch != Architecture.X86_64) {
+                    d.setTitle("Este CD só dá boot por UEFI")
+                            .setMessage("A ISO só tem boot EFI, e o UEFI do MultiVM só existe para x86-64. Com BIOS ela "
+                                    + "vai parar em “Could not read from CDROM (code 0009)”. Mude a arquitetura da VM para x86-64.");
+                } else if (wantUefi) {
+                    d.setTitle("Este CD só dá boot por UEFI")
+                            .setMessage("A ISO só tem boot EFI. Com BIOS ela vai parar em “Could not read from CDROM "
+                                    + "(code 0009)”.")
+                            .setPositiveButton("Usar UEFI", (x, w) -> {
+                                s.uefi = true;
+                                s.save(a);
+                                checkRamOnly(a, s, go, cancel);
+                            });
+                } else {
+                    d.setTitle("Este CD só dá boot por BIOS")
+                            .setMessage("A ISO não tem boot EFI: o firmware UEFI não vai achar o que iniciar.")
+                            .setPositiveButton("Usar BIOS", (x, w) -> {
+                                s.uefi = false;
+                                s.save(a);
+                                checkRamOnly(a, s, go, cancel);
+                            });
+                }
+                d.show();
+            });
+        }, "MultiVM-iso-boot").start();
+    }
+
+    private static void checkRamOnly(Activity a, VmSettings s, Runnable go, Runnable cancel) {
         List<String> isos = new ArrayList<>();
         boolean x86 = AppFiles.isX86(AppFiles.ARCHS[Math.max(0, Math.min(AppFiles.ARCHS.length - 1, s.arch))]);
         if (x86 && s.bios)
@@ -312,6 +382,22 @@ final class VmLauncher {
     }
 
     /** Extrai a BIOS embutida (assets/bios) para o armazenamento do app. */
+    /** Variaveis UEFI da VM: na primeira vez, copia o modelo vazio (OVMF_VARS.fd). */
+    private static File uefiVars(Activity a, VmSettings s, File biosDir) throws IOException {
+        if (s.id == null) throw new IOException("salve a VM antes de iniciar com UEFI");
+        File f = VmSettings.uefiVarsFile(a, s.id);
+        if (f.isFile() && f.length() > 0) return f;
+        File parent = f.getParentFile();
+        if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new IOException("não consegui criar " + parent);
+        File tmp = new File(parent, f.getName() + ".tmp");
+        try (InputStream in = new java.io.FileInputStream(new File(biosDir, "OVMF_VARS.fd"));
+             OutputStream os = new FileOutputStream(tmp)) {
+            copy(in, os);
+        }
+        if (!tmp.renameTo(f)) throw new IOException("não consegui criar " + f);
+        return f;
+    }
+
     private static File installBios(Activity a) throws IOException {
         File dir = new File(a.getFilesDir(), "bios");
         if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("não consegui criar " + dir);

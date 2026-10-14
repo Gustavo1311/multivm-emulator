@@ -69,7 +69,7 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
     private EditText name, ram, cmdline, fbSize;
     private Spinner arch, bootOrder;
     private SeekBar ramBar;
-    private RadioButton modeBios, modeKernel, ctrlSata, ctrlVirtio;
+    private RadioButton modeBios, modeUefi, modeKernel, ctrlSata, ctrlVirtio;
     private CheckBox fb, startNow;
     private View ctrlBox, biosBox, kernelBox;
     private MediaListView disks, cds, floppies;
@@ -128,6 +128,7 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
         bootOrder = findViewById(R.id.wBootOrder);
         ramBar = findViewById(R.id.wRamBar);
         modeBios = findViewById(R.id.wModeBios);
+        modeUefi = findViewById(R.id.wModeUefi);
         modeKernel = findViewById(R.id.wModeKernel);
         ctrlSata = findViewById(R.id.wCtrlSata);
         ctrlVirtio = findViewById(R.id.wCtrlVirtio);
@@ -154,6 +155,7 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
             public void onNothingSelected(AdapterView<?> p) {}
         });
         modeBios.setOnCheckedChangeListener((b, c) -> updateMode());
+        modeUefi.setOnCheckedChangeListener((b, c) -> updateMode());
         modeKernel.setOnCheckedChangeListener((b, c) -> updateMode());
         bootOrder.setAdapter(spinnerAdapter(VmSettings.BOOT_NAMES));
         os = findViewById(R.id.wOs);
@@ -423,7 +425,11 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
     }
 
     private boolean bios() {
-        return AppFiles.isX86(selectedArch()) && modeBios.isChecked();
+        return AppFiles.isX86(selectedArch()) && (modeBios.isChecked() || modeUefi.isChecked());
+    }
+
+    private boolean uefi() {
+        return selectedArch() == Architecture.X86_64 && modeUefi.isChecked();
     }
 
     private boolean allDisksNew() {
@@ -456,10 +462,16 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
     private void updateMode() {
         boolean x86 = AppFiles.isX86(selectedArch());
         modeBios.setEnabled(x86);
+        modeUefi.setEnabled(selectedArch() == Architecture.X86_64);
+        if (modeUefi.isChecked() && selectedArch() != Architecture.X86_64) {
+            if (x86) modeBios.setChecked(true);
+            else modeKernel.setChecked(true);
+        }
         if (!x86 && modeBios.isChecked()) modeKernel.setChecked(true);
         boolean b = bios();
         modeHelp.setText(x86
-                ? b ? "A VM liga como um PC comum: a BIOS (SeaBIOS) dá boot pelo CD-ROM, pelo disco ou pelo disquete. Use para instalar Linux, Windows, ReactOS ou DOS."
+                ? uefi() ? "A VM liga com firmware UEFI (OVMF), como um PC moderno: dá boot por ISOs e discos UEFI. Use para ISOs que só têm boot EFI e sistemas instalados em modo UEFI. Não lê disquetes."
+                : b ? "A VM liga como um PC comum: a BIOS (SeaBIOS) dá boot pelo CD-ROM, pelo disco ou pelo disquete. Use para instalar Linux, Windows, ReactOS ou DOS."
                     : "O kernel Linux é carregado direto na memória, sem BIOS. A saída aparece no terminal serial."
                 : "Em ARM a VM é uma placa “virt”: o kernel Linux é carregado direto, sem BIOS. Discos usam virtio.");
         ctrlBox.setVisibility(b ? View.VISIBLE : View.GONE);
@@ -608,7 +620,7 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
         addCard("Sistema", STEP_SYSTEM, R.drawable.ic_monitor,
                 "Nome", vmName(),
                 "Arquitetura", AppFiles.ARCH_NAMES[Math.max(0, arch.getSelectedItemPosition())],
-                "Inicialização", b ? "PC com BIOS (SeaBIOS)" : "Kernel Linux direto");
+                "Inicialização", uefi() ? "PC com UEFI (OVMF)" : b ? "PC com BIOS (SeaBIOS)" : "Kernel Linux direto");
 
         int o = Math.max(0, os.getSelectedItemPosition());
         addCard("Hardware", STEP_HARDWARE, R.drawable.ic_memory,
@@ -796,6 +808,7 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
         s.cpus = AppFiles.defaultCpus(AppFiles.ARCHS[Math.min(AppFiles.ARCHS.length - 1, s.arch)],
                 os.getSelectedItemPosition() == 0 /* Linux */);
         s.bios = b;
+        s.uefi = uefi();
         s.cmdline = b ? "" : cmdline.getText().toString().trim();
         s.fb = !b && fb.isChecked();
         s.fbSize = fbSize.getText().toString().trim();

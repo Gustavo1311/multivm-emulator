@@ -711,7 +711,8 @@ static void usage(void)
             "                        media list | media insert N ARQ | media eject N | media add ARQ\n"
             "      --type-after TXT  so comeca a contar SEG depois que TXT aparecer na tela de texto\n"
             "      --dtb ARQ         device tree externo (ARM)\n"
-            "      --bios ARQ        firmware (x86)\n"
+            "      --bios ARQ        firmware (x86): SeaBIOS ou UEFI (OVMF.fd ou OVMF_CODE.fd)\n"
+            "      --uefi-vars ARQ   variaveis UEFI gravaveis (copia do OVMF_VARS.fd; use com OVMF_CODE.fd)\n"
             "      --load-addr HEX   endereco de carga para binario bruto\n"
             "      --fb WxH          framebuffer\n"
             "      --fb-dump ARQ     grava o framebuffer (PPM) ao sair\n"
@@ -739,7 +740,7 @@ int main(int argc, char **argv)
         {"audio", required_argument, 0, 22}, {"audio-wav", required_argument, 0, 23}, {"audio-in", required_argument, 0, 24},
         {"vnc", required_argument, 0, 25}, {"vnc-password", required_argument, 0, 26},
         {"vgabios", required_argument, 0, 9}, {"text", no_argument, 0, 10}, {"type", required_argument, 0, 11}, {"type-after", required_argument, 0, 12}, {"control", required_argument, 0, 13},
-        {"bios", required_argument, 0, 2}, {"load-addr", required_argument, 0, 3},
+        {"bios", required_argument, 0, 2}, {"uefi-vars", required_argument, 0, 42}, {"load-addr", required_argument, 0, 3},
         {"fb", required_argument, 0, 4}, {"fb-dump", required_argument, 0, 5}, {"viewer", no_argument, 0, 27},
         {"timeout", required_argument, 0, 't'}, {"expect", required_argument, 0, 'e'},
         {"verbose", no_argument, 0, 'v'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
@@ -755,6 +756,7 @@ int main(int argc, char **argv)
             break;
         case 'm': cfg.ram_mb = g_ram_mb = (uint32_t)atoi(optarg); break;
         case 41: cfg.cpus = (uint32_t)atoi(optarg); break;
+        case 42: cfg.uefi_vars = optarg; break;
         case 'k': cfg.kernel = optarg; break;
         case 'i': cfg.initrd = optarg; break;
         case 'c': cfg.cmdline = optarg; break;
@@ -1045,5 +1047,5 @@ int main(int argc, char **argv)
     pthread_join(in_th, NULL);
     if (g_expect)
         return g_expect_hit ? 0 : 1;
-    return r == MVM_EXIT_ERROR ? 1 : 0;
+    return r == MVM_EXIT_ERROR ? 1 : r == MVM_EXIT_REBOOT ? 3 : 0; /* 3: reinicio com --no-reboot */
 }

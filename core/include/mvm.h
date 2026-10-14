@@ -119,6 +119,7 @@ typedef struct {
     mvm_net_config net;
     mvm_audio_config audio;
     uint32_t cpus;            /* processadores (0 = 1); por enquanto so 1 */
+    const char *uefi_vars;    /* x86 com OVMF_CODE: variaveis UEFI (copia gravavel do OVMF_VARS.fd) */
 } mvm_config;
 
 typedef struct {

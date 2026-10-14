@@ -26,7 +26,7 @@ SRCS="$CORE/src/space.c $CORE/src/util.c $CORE/src/img/img_util.c $CORE/src/img/
       $CORE/src/cpu/cpu_arm32.c $CORE/src/cpu/a32_thumb.c $CORE/src/cpu/a32_vfp.c
       $CORE/src/cpu/cpu_x86.c $CORE/src/cpu/x86_exec.c $CORE/src/cpu/x86_fpu.c $CORE/src/cpu/x86_sse.c $CORE/src/cpu/x86_jit.c
       $CORE/src/dev/virtio.c $CORE/src/dev/arm_devices.c $CORE/src/dev/pc_devices.c $CORE/src/dev/pci.c
-      $CORE/src/dev/fw_cfg.c $CORE/src/dev/vga.c $CORE/src/dev/ide.c $CORE/src/dev/i8237.c $CORE/src/dev/fdc.c $CORE/src/dev/apic.c $CORE/src/dev/acpi.c $CORE/src/dev/hpet.c $CORE/src/dev/ahci.c
+      $CORE/src/dev/fw_cfg.c $CORE/src/dev/vga.c $CORE/src/dev/ide.c $CORE/src/dev/i8237.c $CORE/src/dev/fdc.c $CORE/src/dev/pflash.c $CORE/src/dev/apic.c $CORE/src/dev/acpi.c $CORE/src/dev/hpet.c $CORE/src/dev/ahci.c
       $CORE/src/dev/eeprom93.c $CORE/src/dev/virtio_net.c $CORE/src/dev/virtio_snd.c $CORE/src/dev/rtl8139.c $CORE/src/dev/e1000.c
       $CORE/src/dev/ac97.c $CORE/src/dev/hda.c $CORE/src/net/net.c $CORE/src/net/tcp.c $CORE/src/audio.c $CORE/src/vnc.c $CORE/src/des.c $CORE/src/zlib_dl.c $CORE/src/jpeg_enc.c
       $CORE/src/machine/machine_virt.c $CORE/src/machine/machine_pc.c"

@@ -42,6 +42,45 @@ final class IsoInfo {
         }
     }
 
+    /** Boot El Torito: entrada para PC com BIOS (plataforma 0) e/ou para UEFI (0xEF). */
+    static final int BOOT_BIOS = 1, BOOT_EFI = 2;
+
+    /** Plataformas do catalogo El Torito (BOOT_BIOS | BOOT_EFI); 0 se a ISO nao da boot ou nao deu para ler. */
+    static int bootPlatforms(Context c, String f) {
+        try (ParcelFileDescriptor pfd = open(c, f)) {
+            if (pfd == null) return 0;
+            try (FileChannel ch = new java.io.FileInputStream(pfd.getFileDescriptor()).getChannel()) {
+                ByteBuffer br = read(ch, 17L * SECTOR, SECTOR);
+                byte[] id = new byte[23];
+                br.position(7);
+                br.get(id);
+                if (br.get(0) != 0 || !new String(id, java.nio.charset.StandardCharsets.US_ASCII).equals("EL TORITO SPECIFICATION"))
+                    return 0;
+                long cat = br.getInt(0x47) & 0xffffffffL;
+                ByteBuffer d = read(ch, cat * SECTOR, SECTOR);
+                if (d.get(0) != 1 || (d.get(30) & 0xff) != 0x55 || (d.get(31) & 0xff) != 0xaa) return 0;
+                int r = 0;
+                int plat = d.get(1) & 0xff;
+                if ((d.get(32) & 0xff) == 0x88) r |= plat == 0xef ? BOOT_EFI : plat == 0 ? BOOT_BIOS : 0;
+                /* secoes seguintes: cabecalho 0x90 (mais secoes) / 0x91 (ultima) + n entradas */
+                for (int p = 64; p + 32 <= SECTOR; ) {
+                    int h = d.get(p) & 0xff;
+                    if (h != 0x90 && h != 0x91) break;
+                    int sp = d.get(p + 1) & 0xff, n = d.getShort(p + 2) & 0xffff;
+                    p += 32;
+                    for (int i = 0; i < n && p + 32 <= SECTOR; i++, p += 32) {
+                        if ((d.get(p) & 0xff) == 0x44) { i--; continue; } /* extensao de entrada */
+                        if ((d.get(p) & 0xff) == 0x88) r |= sp == 0xef ? BOOT_EFI : sp == 0 ? BOOT_BIOS : 0;
+                    }
+                    if (h == 0x91) break;
+                }
+                return r;
+            }
+        } catch (IOException | RuntimeException e) {
+            return 0;
+        }
+    }
+
     /** Percorre um diretorio; devolve o maior initrd* e, se pedido, onde fica o subdiretorio BOOT. */
     private static long scan(FileChannel ch, long lba, int len, long[] bootDir) throws IOException {
         if (len <= 0 || len > (1 << 20)) return 0;

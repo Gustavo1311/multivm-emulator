@@ -42,6 +42,7 @@ set(MVM_CORE_SOURCES
   ${CMAKE_CURRENT_LIST_DIR}/src/dev/ide.c
   ${CMAKE_CURRENT_LIST_DIR}/src/dev/i8237.c
   ${CMAKE_CURRENT_LIST_DIR}/src/dev/fdc.c
+  ${CMAKE_CURRENT_LIST_DIR}/src/dev/pflash.c
   ${CMAKE_CURRENT_LIST_DIR}/src/dev/eeprom93.c
   ${CMAKE_CURRENT_LIST_DIR}/src/dev/virtio_net.c
   ${CMAKE_CURRENT_LIST_DIR}/src/dev/virtio_snd.c

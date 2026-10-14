@@ -30,7 +30,7 @@ final class NativeBridge {
                                           DiskImages.Progress listener) throws java.io.IOException;
 
     static native long nativeCreate(int arch, int ramMb, String kernel, String initrd, String cmdline,
-                                    String dtb, String firmware, String vgaBios, String bootOrder,
+                                    String dtb, String firmware, String vgaBios, String uefiVars, String bootOrder,
                                     String[] diskPaths, int[] diskFds, boolean[] diskReadOnly, int[] diskTypes,
                                     String[] diskNames, int fbWidth, int fbHeight, long rawLoadAddress, long rtcBase, int cpus,
                                     int netModel, String mac, String dns, int[] forwards,

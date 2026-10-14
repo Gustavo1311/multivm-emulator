@@ -14,7 +14,7 @@ public final class VmConfig {
     final Architecture arch;
     final int ramMb;
     final int cpus;
-    final String kernel, initrd, cmdline, dtb, firmware, vgaBios, bootOrder;
+    final String kernel, initrd, cmdline, dtb, firmware, vgaBios, uefiVars, bootOrder;
     final List<DiskImage> disks;
     final int fbWidth, fbHeight;
     final long rawLoadAddress;
@@ -85,6 +85,7 @@ public final class VmConfig {
         dtb = b.dtb;
         firmware = b.firmware;
         vgaBios = b.vgaBios;
+        uefiVars = b.uefiVars;
         bootOrder = b.bootOrder;
         disks = Collections.unmodifiableList(new ArrayList<>(b.disks));
         fbWidth = b.fbWidth;
@@ -112,6 +113,7 @@ public final class VmConfig {
     public String getCmdline() { return cmdline; }
     public List<DiskImage> getDisks() { return disks; }
     public String getFirmware() { return firmware; }
+    public String getUefiVars() { return uefiVars; }
     public String getBootOrder() { return bootOrder; }
     public long getRtcBase() { return rtcBase; }
     public boolean hasFramebuffer() { return fbWidth > 0 && fbHeight > 0; }
@@ -124,7 +126,7 @@ public final class VmConfig {
         private final Architecture arch;
         private int ramMb = 256;
         private int cpus = 1;
-        private String kernel, initrd, cmdline, dtb, firmware, vgaBios, bootOrder;
+        private String kernel, initrd, cmdline, dtb, firmware, vgaBios, uefiVars, bootOrder;
         private final List<DiskImage> disks = new ArrayList<>();
         private int fbWidth, fbHeight;
         private long rawLoadAddress;
@@ -190,6 +192,12 @@ public final class VmConfig {
          * procura vgabios-stdvga.bin no mesmo diretorio do firmware.
          */
         public Builder vgaBios(String path) { this.vgaBios = path; return this; }
+
+        /**
+         * x86 com firmware UEFI (OVMF_CODE.fd): arquivo gravavel com as variaveis UEFI (uma copia do
+         * OVMF_VARS.fd por VM). Guarda a ordem de boot e as entradas criadas pelos instaladores.
+         */
+        public Builder uefiVars(String path) { this.uefiVars = path; return this; }
 
         /**
          * x86 com BIOS: ordem de boot como no QEMU ("c" = disco, "d" = CD-ROM,

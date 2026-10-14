@@ -15,6 +15,7 @@
 #include "../dev/devices.h"
 #include "../dev/hpet.h"
 #include "../dev/ide.h"
+#include "../dev/pflash.h"
 #include "../dev/pci.h"
 #include "../dev/vga.h"
 
@@ -63,6 +64,10 @@ typedef struct {
     size_t bios_size;
     uint8_t port92;
     bool bios_mode;     /* firmware + VGA + IDE + fw_cfg */
+    bool uefi;          /* firmware UEFI (OVMF): PIIX4 PM em 00:01.3 e bloco PM em 0xB000 */
+    pci_dev *pm_pci;    /* PIIX4 PM (so com UEFI) */
+    pflash *vars;       /* variaveis UEFI (flash logo abaixo do firmware) */
+    uint16_t pm_io;     /* base atual do bloco PM ACPI na E/S (0 = desligado) */
     pci_dev *piix3;
     fw_cfg *fw;
     vga *vgadev;
@@ -199,6 +204,37 @@ static irq_line pci_line(pc_machine *m, int slot, int pin, int *routed_irq)
     return (irq_line){pci_irq_set, m, src};
 }
 
+/* bloco PM ACPI na E/S: o PIIX4 PM o move conforme PMBA (0x40) e PMREGMISC.PMIOSE (0x80) */
+static void pm_io_map(mvm_vm *vm, pc_machine *m, uint16_t base)
+{
+    if (base == m->pm_io)
+        return;
+    if (m->pm_io)
+        space_remove_at(&vm->io, m->pm_io);
+    m->pm_io = 0;
+    if (base && !space_find(&vm->io, base) && !space_find(&vm->io, base + 0x3fu)) {
+        space_add_io(&vm->io, base, 0x40, &acpi_pm_ops, m->pm, "acpi-pm");
+        m->pm_io = base;
+    } else if (base) {
+        LOGW("PIIX4 PM: base 0x%x conflita com outra regiao de E/S", base);
+    }
+}
+
+static void piix4_pm_update(pc_machine *m)
+{
+    pci_dev *d = m->pm_pci;
+    d->cfg[0x40] = (uint8_t)((d->cfg[0x40] & 0xc0) | 1); /* RTE: espaco de E/S */
+    uint16_t base = (uint16_t)(ld_le(d->cfg + 0x40, 2) & 0xffc0);
+    pm_io_map(m->pci->vm, m, (d->cfg[0x80] & 1) ? base : 0);
+}
+
+static void piix4_pm_cfg_write(pci_dev *d, unsigned off, uint32_t val, unsigned size)
+{
+    (void)val;
+    if ((off < 0x44 && off + size > 0x40) || (off <= 0x80 && off + size > 0x80))
+        piix4_pm_update(d->priv);
+}
+
 static void piix3_cfg_write(pci_dev *d, unsigned off, uint32_t val, unsigned size)
 {
     (void)val;
@@ -260,7 +296,8 @@ static void debugcon_write(void *opaque, uint64_t off, uint64_t v, unsigned size
         line[n++] = ch;
     }
 }
-static const mvm_io_ops debugcon_ops = {dummy_read, debugcon_write};
+static uint64_t debugcon_read(void *opaque, uint64_t off, unsigned size) { (void)opaque; (void)off; (void)size; return 0xe9; }
+static const mvm_io_ops debugcon_ops = {debugcon_read, debugcon_write};
 
 static void exit_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
 {
@@ -443,6 +480,7 @@ static void acpi_config_for(mvm_vm *vm, acpi_config *c)
     c->hpet_block_id = hpet_block_id();
     pc_machine *m = vm->mach;
     c->floppies = (uint8_t)((m->fd_cmos[0] ? 1 : 0) | (m->fd_cmos[1] ? 2 : 0));
+    c->pm_base = m->uefi ? ACPI_PM_BASE_UEFI : ACPI_PM_BASE;
 }
 
 static int load_boot(mvm_vm *vm, pc_machine *m, char *err, size_t errlen)
@@ -655,11 +693,29 @@ static int pc_init(mvm_vm *vm, char *err, size_t errlen)
         m->bios = load_file(vm->cfg.firmware, &m->bios_size, err, errlen);
         if (!m->bios)
             return -1;
-        if (m->bios_size < 0x10000 || m->bios_size > 0x400000 || (m->bios_size & 0xffff)) {
+        /* SeaBIOS: 64 KiB a 256 KiB; OVMF: 2 MiB a 4 MiB (o OVMF_CODE_4M tem 3,5 MiB) */
+        if (m->bios_size < 0x10000 || m->bios_size > 0x800000 || (m->bios_size & 0xfff)) {
             snprintf(err, errlen, "tamanho de BIOS invalido (%zu)", m->bios_size);
             return -1;
         }
         space_add_ram(&vm->mem, 0x100000000ULL - m->bios_size, m->bios_size, m->bios, true, "bios");
+        /* UEFI (OVMF): a imagem comeca por um volume de firmware ("_FVH" no offset 0x28) */
+        m->uefi = !memcmp(m->bios + 0x28, "_FVH", 4);
+        if (m->uefi)
+            LOGI("firmware UEFI detectado");
+        if (vm->cfg.uefi_vars) {
+            /* OVMF_CODE + OVMF_VARS, como "-drive if=pflash" duas vezes no QEMU: as variaveis ficam
+             * logo abaixo do codigo e o conjunto forma o volume de firmware completo */
+            if (!m->uefi) {
+                snprintf(err, errlen, "variaveis UEFI so valem com firmware UEFI (OVMF)");
+                return -1;
+            }
+            m->vars = pflash_open(vm->cfg.uefi_vars, 0x100000, err, errlen);
+            if (!m->vars)
+                return -1;
+            uint32_t vs = pflash_size(m->vars);
+            space_add_io(&vm->mem, 0x100000000ULL - m->bios_size - vs, vs, &pflash_ops, m->vars, "uefi-vars");
+        }
     }
 
     m->apic = apic_bus_new(vm, cpu_startup);
@@ -702,7 +758,7 @@ static int pc_init(mvm_vm *vm, char *err, size_t errlen)
     space_add_io(&vm->io, 0xe9, 1, &debugcon_ops, NULL, "debugcon-e9");
     space_add_io(&vm->io, 0x501, 1, &exit_ops, vm, "debug-exit");
     m->pm = acpi_pm_new(vm, pic_line(m, ACPI_SCI_IRQ));
-    space_add_io(&vm->io, ACPI_PM_BASE, 0x40, &acpi_pm_ops, m->pm, "acpi-pm");
+    pm_io_map(vm, m, m->uefi ? 0 : ACPI_PM_BASE); /* com UEFI, o PIIX4 PM (00:01.3) o liga */
     space_add_io(&vm->io, ACPI_GPE0_BASE, 4, &acpi_gpe_ops, m->pm, "acpi-gpe");
     space_add_io(&vm->io, 0xcf9, 1, &reset_ops, vm, "rst");
     /* controladores DMA 8237 e registradores de pagina */
@@ -739,6 +795,7 @@ static int pc_init(mvm_vm *vm, char *err, size_t errlen)
             need_ide = true;
     if (need_ide) {
         m->ide = ide_new(vm, pic_line(m, 14), pic_line(m, 15));
+        ide_set_empty_bus_zero(m->ide, m->uefi);
         m->ide_pci = pci_add_fn(m->pci, 1, 1, 0x8086, 0x7010, 0x01018000);
         m->ide_pci->cfg[0x41] = 0x80; /* canais primario/secundario habilitados */
         m->ide_pci->cfg[0x43] = 0x80;
@@ -749,6 +806,20 @@ static int pc_init(mvm_vm *vm, char *err, size_t errlen)
         space_add_io(&vm->io, 0x3f6, 1, &ide_ctl_ops, ide_bus_opaque(m->ide, 0), "ide0-ctl");
         space_add_io(&vm->io, 0x170, 8, &ide_cmd_ops, ide_bus_opaque(m->ide, 1), "ide1");
         space_add_io(&vm->io, 0x376, 1, &ide_ctl_ops, ide_bus_opaque(m->ide, 1), "ide1-ctl");
+    }
+    if (m->uefi) {
+        /* PIIX4 PM: o OVMF le a base do temporizador ACPI em PMBA e a programa em 0xB000. Ja vem
+         * ligado nessa base (como se o firmware tivesse feito), para o ResetSystemLib dele, que usa
+         * 0xB000 fixo, e as tabelas ACPI concordarem desde o inicio. */
+        m->pm_pci = pci_add_fn(m->pci, 1, 3, 0x8086, 0x7113, 0x06800003);
+        m->pm_pci->priv = m;
+        m->pm_pci->cfg_write = piix4_pm_cfg_write;
+        st_le(m->pm_pci->cfg + 4, 1, 2);
+        st_le(m->pm_pci->cfg + 0x40, ACPI_PM_BASE_UEFI | 1u, 4);
+        m->pm_pci->cfg[0x80] = 1;
+        m->pm_pci->cfg[0x3c] = ACPI_SCI_IRQ;
+        pci_finalize(m->pm_pci);
+        piix4_pm_update(m);
     }
 
     int slot = 2;
@@ -761,11 +832,13 @@ static int pc_init(mvm_vm *vm, char *err, size_t errlen)
         pci_set_ram_bar(m->vga_pci, 0, VGA_VRAM_MB << 20, vga_vram(m->vgadev), vga_vram_gen(m->vgadev),
                         vga_vram_dirty(m->vgadev), true,
                         VGA_LFB_BASE);
-        char *vpath = vm->cfg.vga_bios ? strdup(vm->cfg.vga_bios) : default_vgabios(vm->cfg.firmware);
+        /* com UEFI, o QemuVideoDxe do OVMF cuida do video: a ROM VGA legada so se pedida */
+        char *vpath = vm->cfg.vga_bios ? strdup(vm->cfg.vga_bios) : m->uefi ? NULL : default_vgabios(vm->cfg.firmware);
         size_t vlen;
         char verr[256];
-        uint8_t *vrom = load_file(vpath, &vlen, verr, sizeof(verr));
-        if (vrom) {
+        uint8_t *vrom = vpath ? load_file(vpath, &vlen, verr, sizeof(verr)) : NULL;
+        if (!vpath) {
+        } else if (vrom) {
             pci_set_rom(m->vga_pci, vrom, vlen);
             free(vrom);
         } else {
@@ -774,7 +847,7 @@ static int pc_init(mvm_vm *vm, char *err, size_t errlen)
         free(vpath);
         pci_finalize(m->vga_pci);
         space_add_io(&vm->io, 0x3b0, 0x30, &vga_io_ops, m->vgadev, "vga");
-        space_add_io(&vm->io, 0x1ce, 2, &vga_vbe_ops, m->vgadev, "vbe");
+        space_add_io(&vm->io, 0x1ce, 3, &vga_vbe_ops, m->vgadev, "vbe"); /* dados em 0x1CF e 0x1D0 (OVMF), como no QEMU */
         /* a tela passa a ser o framebuffer do VGA (tamanho muda com o modo) */
         free(vm->fb);
         vm->fb_size = (uint64_t)DISPLAY_MAX_W * DISPLAY_MAX_H * 4;
@@ -997,6 +1070,10 @@ static void pc_reset(mvm_vm *vm)
         for (int i = 0; i < 4; i++)
             m->piix3->cfg[0x60 + i] = 0x80;
     pirq_update(m);
+    if (m->pm_pci)
+        piix4_pm_update(m);
+    if (m->vars)
+        pflash_reset(m->vars);
     if (m->ide)
         ide_reset(m->ide);
     if (m->vgadev)
@@ -1073,6 +1150,7 @@ static void pc_destroy(mvm_vm *vm)
     if (m->rtc)
         cmos_reset(m->rtc);
     ide_free(m->ide);
+    pflash_free(m->vars);
     for (int i = 0; m->apic && i < vm->ncpus; i++)
         lapic_free(apic_bus_get(m->apic, i));
     apic_bus_free(m->apic);

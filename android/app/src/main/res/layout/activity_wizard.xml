@@ -146,6 +146,12 @@
                         android:text="PC com BIOS — instalar um sistema a partir de uma ISO ou disco" />
 
                     <RadioButton
+                        android:id="@+id/wModeUefi"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="PC com UEFI — ISOs só UEFI e sistemas modernos (x86-64)" />
+
+                    <RadioButton
                         android:id="@+id/wModeKernel"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"

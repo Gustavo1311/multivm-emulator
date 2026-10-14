@@ -5,6 +5,7 @@
 #include "devices.h"
 
 #define ACPI_PM_BASE 0x600
+#define ACPI_PM_BASE_UEFI 0xb000 /* PIIX4_PMBA_VALUE do OVMF (fixo no ResetSystemLib dele) */
 #define ACPI_GPE0_BASE 0xafe0
 #define ACPI_SCI_IRQ 9
 #define ACPI_MAX_FIXUPS 32
@@ -15,6 +16,7 @@ typedef struct {
     uint8_t ncpus;          /* processadores (APIC ID = 0..ncpus-1) */
     uint32_t hpet_block_id; /* 0 = sem HPET */
     uint8_t floppies;       /* bit 0 = A:, bit 1 = B: (0 = sem controlador de disquete) */
+    uint16_t pm_base;       /* bloco PM ACPI (0 = ACPI_PM_BASE; o OVMF usa ACPI_PM_BASE_UEFI) */
 } acpi_config;
 
 /* ponteiro dentro de um arquivo que recebe o endereco base de outro */

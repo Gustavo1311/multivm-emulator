@@ -88,7 +88,7 @@ public final class VirtualMachine implements AutoCloseable {
             fw[3 * i + 2] = f.guestPort;
         }
         vm.handle = NativeBridge.nativeCreate(config.arch.nativeId, config.ramMb, config.kernel, config.initrd,
-                config.cmdline, config.dtb, config.firmware, config.vgaBios, config.bootOrder, paths, fds, ro,
+                config.cmdline, config.dtb, config.firmware, config.vgaBios, config.uefiVars, config.bootOrder, paths, fds, ro,
                 types, names, config.fbWidth, config.fbHeight, config.rawLoadAddress, config.rtcBase, config.cpus,
                 config.nic.nativeId, config.mac, config.dns, fw, config.sound.nativeId, config.mic, cb);
         return vm;

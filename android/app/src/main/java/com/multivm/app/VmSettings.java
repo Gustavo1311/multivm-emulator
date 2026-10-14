@@ -101,6 +101,8 @@ final class VmSettings {
     int arch;
     String ram = "1024";
     boolean bios = true;
+    /** com bios: firmware UEFI (OVMF) em vez do SeaBIOS (so x86-64) */
+    boolean uefi;
     String cmdline = "";
     boolean fb;
     String fbSize = "800x600";
@@ -193,6 +195,13 @@ final class VmSettings {
         ids.remove(id);
         registry(ctx).edit().putString("ids", String.join(",", ids)).commit();
         prefs(ctx, id).edit().clear().commit();
+        //noinspection ResultOfMethodCallIgnored
+        uefiVarsFile(ctx, id).delete();
+    }
+
+    /** Variaveis UEFI da VM (copia do OVMF_VARS.fd criada no primeiro boot com UEFI). */
+    static java.io.File uefiVarsFile(Context ctx, String id) {
+        return new java.io.File(new java.io.File(ctx.getFilesDir(), "uefi"), "vm_" + id + ".vars");
     }
 
     /** null se a VM nao existe (mais). */
@@ -208,6 +217,7 @@ final class VmSettings {
         s.arch = p.getInt("arch", 0);
         s.ram = p.getString("ram", "1024");
         s.bios = p.getBoolean("bios", true);
+        s.uefi = p.getBoolean("uefi", false);
         s.cmdline = p.getString("cmdline", "");
         s.fb = p.getBoolean("fb", false);
         s.fbSize = p.getString("fbSize", "800x600");
@@ -291,6 +301,7 @@ final class VmSettings {
                 .putInt("arch", arch)
                 .putString("ram", ram)
                 .putBoolean("bios", bios)
+                .putBoolean("uefi", uefi)
                 .putString("cmdline", cmdline)
                 .putBoolean("fb", fb)
                 .putString("fbSize", fbSize)
@@ -338,6 +349,7 @@ final class VmSettings {
         if (f > 0 && AppFiles.isX86(AppFiles.ARCHS[Math.max(0, Math.min(3, arch))]))
             sb.append(" · ").append(f).append(f == 1 ? " disquete" : " disquetes");
         if (!bios) sb.append(" · kernel Linux");
+        else if (uefi) sb.append(" · UEFI");
         if (sound != SOUND_NONE) sb.append(" · som");
         if (nic != NIC_NONE) sb.append(" · rede");
         if (vnc) sb.append(" · VNC");

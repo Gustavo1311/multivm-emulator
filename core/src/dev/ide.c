@@ -67,6 +67,7 @@ struct ide_bus {
 struct ide_ctrl {
     mvm_vm *vm;
     ide_bus bus[2];
+    uint8_t empty_val; /* leitura de um canal sem drives: 0xFF (barramento solto) ou 0 (QEMU) */
 };
 
 static void update_irq(ide_bus *b) { irq_set(&b->irq, b->irq_pending && !(b->devctl & 2)); }
@@ -1044,7 +1045,7 @@ static uint64_t ide_read(void *opaque, uint64_t off, unsigned size)
     if (off == 0)
         return data_read(b, size);
     if (bus_empty(b))
-        return 0xff;
+        return b->ctrl->empty_val;
     bool absent = d->kind == KIND_NONE;
     switch (off) {
     case 1: return absent ? 0 : hob ? d->hob_feature : d->error;
@@ -1098,7 +1099,7 @@ static uint64_t ctl_read(void *opaque, uint64_t off, unsigned size)
     ide_bus *b = opaque;
     (void)off; (void)size;
     if (bus_empty(b))
-        return 0xff;
+        return b->ctrl->empty_val;
     ide_drive *d = &b->drv[b->cur];
     return d->kind == KIND_NONE ? 0 : d->status;
 }
@@ -1132,6 +1133,7 @@ ide_ctrl *ide_new(mvm_vm *vm, irq_line irq14, irq_line irq15)
 {
     ide_ctrl *c = calloc(1, sizeof(*c));
     c->vm = vm;
+    c->empty_val = 0xff;
     for (int i = 0; i < 2; i++) {
         ide_bus *b = &c->bus[i];
         b->ctrl = c;
@@ -1337,3 +1339,7 @@ void ide_port_exec(ide_port *p, const uint8_t *fis, const uint8_t *cdb, ide_xfer
     r->bytes = moved;
     r->pio = pio;
 }
+
+/* canal sem drives le 0 (como no QEMU) em vez de 0xFF: o AtaAtapiPassThru do OVMF espera 35 s pelo
+ * BSY de cada posicao vazia quando le 0xFF */
+void ide_set_empty_bus_zero(ide_ctrl *c, bool zero) { c->empty_val = zero ? 0 : 0xff; }

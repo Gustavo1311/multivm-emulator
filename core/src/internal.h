@@ -238,7 +238,7 @@ extern const mvm_machine_ops machine_virt_ops;
 
 struct mvm_vm {
     mvm_config cfg;
-    char *s_kernel, *s_initrd, *s_cmdline, *s_dtb, *s_firmware, *s_vga_bios, *s_boot_order;
+    char *s_kernel, *s_initrd, *s_cmdline, *s_dtb, *s_firmware, *s_vga_bios, *s_boot_order, *s_uefi_vars;
     char *s_disks[MVM_MAX_DISKS];
     char *s_dns;
     char *s_names[MVM_MAX_DISKS];

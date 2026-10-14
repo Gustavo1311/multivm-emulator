@@ -24,6 +24,14 @@ por CD-ROM (ISO) ou disco IDE, mostra a tela VGA em modo texto e gráfico (VBE) 
 teclado PS/2. A ISO do Alpine 3.24 (x86-64 e i386) inicia pelo ISOLINUX até o `login:`,
 tanto como CD quanto como disco rígido (ISO híbrida).
 
+**Boot por UEFI (x86-64):** com o OVMF (edk2) a máquina `pc` inicia como um PC UEFI. O firmware
+acha o CD ou o disco IDE/SATA/virtio, mostra a tela gráfica (GOP pelo VBE) e roda o carregador EFI
+(GRUB, por exemplo). O live CD do SliTaz, que só tem boot EFI, inicia até o `login:` em menos de 1
+min, com os serviços de runtime e as variáveis UEFI visíveis no Linux. Com `OVMF_CODE.fd` +
+`--uefi-vars`, as variáveis (ordem de boot, entradas criadas por instaladores) ficam numa flash CFI
+emulada e persistem no arquivo. Para isso a máquina ganha, só no modo UEFI, a função PIIX4 PM
+(00:01.3) com o bloco PM em 0xB000, onde o OVMF o espera.
+
 **ACPI (x86):** tabelas RSDP/XSDT/RSDT, FADT, FACS, MADT e DSDT (PCI0 com `_CRS`/`_PRT`, links
 PIRQ, dispositivos ISA, `_S5`), entregues ao SeaBIOS pelo `etc/table-loader` do fw_cfg ou
 instaladas em 0xE0000 no boot direto. O bloco de energia (PM1, PM timer, GPE0, SCI na IRQ 9)
@@ -57,7 +65,7 @@ som Intel HD Audio. No OpenBSD também foram testados disco e rede virtio, e o C
 chega ao instalador. Para o kernel SMP do OpenBSD (`bsd.mp`), o DSDT declara um objeto de
 processador por CPU; sem isso ele para com "panic: null acpicpu". Teste: `tests/bsd/run_bsd_tests.sh`
 (baixe as ISOs com `tests/bsd/fetch_isos.sh`). Os BSDs para ARM exigem UEFI, que o MultiVM ainda
-não tem.
+não tem no ARM (só no x86-64).
 
 **Rede (NAT em modo usuário, `core/src/net/`):** sem root e sem tap, como o "user networking" do
 QEMU. O convidado recebe 10.0.2.15 por DHCP; o gateway 10.0.2.2 é o próprio host e o DNS 10.0.2.3 é
@@ -235,6 +243,23 @@ mvm-cli -a x86_64 -m 512 --bios /usr/share/seabios/bios-256k.bin --cdrom alpine.
 mvm-cli -a x86_64 --bios bios-256k.bin -d disco.img --boot c
 ```
 
+Boot por UEFI (só x86-64), com o OVMF embutido no app (`android/app/src/main/assets/bios`, gerado
+por `tools/build_ovmf.sh`) ou o do sistema (`apt install ovmf`):
+
+```sh
+# variaveis so na RAM: imagem unica (codigo + variaveis)
+mvm-cli -a x86_64 -m 1024 --bios /usr/share/ovmf/OVMF.fd --cdrom slitaz.iso
+
+# variaveis persistentes: cada VM tem a sua copia do OVMF_VARS.fd
+cp android/app/src/main/assets/bios/OVMF_VARS.fd minha-vm.vars
+mvm-cli -a x86_64 -m 1024 --bios android/app/src/main/assets/bios/OVMF_CODE.fd \
+    --uefi-vars minha-vm.vars -d disco.img --cdrom instalador.iso
+```
+
+O firmware é reconhecido pelo volume de firmware ("_FVH") no início da imagem. Com uma versão
+DEBUG do OVMF (`tools/build_ovmf.sh DEBUG`), o log do firmware sai pela porta 0x402 e aparece com
+`-v`.
+
 ### Imagens de disco
 
 Os discos (`-d`/`-r`, em IDE, AHCI ou virtio-blk, no CLI e no Android) aceitam vários formatos,
@@ -402,6 +427,7 @@ FUZZ_KIND=sse FUZZ_SSEOP=sse4 tests/fuzz/run_x86.sh 64 1   # so SSE3/SSSE3/SSE4.
 tests/linux/fetch_images.sh       # baixa kernels Alpine e busybox estático
 tests/linux/run_linux_tests.sh    # boota Linux nas 4 arquiteturas e testa o disco (raw, qcow2, MVD + TRIM)
 tests/img/run_img_tests.sh        # formatos de imagem contra o qemu-img (leitura, escrita, check, quedas)
+tests/uefi/run_uefi_tests.sh      # UEFI: live CD so-EFI, variaveis persistentes, poweroff e reboot
 tools/pdb_publics.py              # simbolos publicos de PDBs antigos (MSF 7.00, ex.: Windows XP)
 tests/guest/build_bench.sh        # benchmark de CPU (out/bench-*.elf; imprime MIPS ao final)
 tools/prof_report.py PERFIL       # relatorio de MVM_PROF (perfil do host por amostragem)
@@ -422,7 +448,7 @@ tools/pdb_syms.py / pe_pdb_url.py # simbolos publicos de binarios do Windows (se
 
 1. **Windows no x86**: desempenho (DWM/WARP e criptografia dominam o tempo: SSE de ponto
    flutuante e mais instruções no JIT); vídeo com driver próprio (WDDM/virtio-gpu); MSI no AHCI;
-   depois UEFI (OVMF) para Windows 11 x64 e Windows on ARM.
+   Windows 11 x64 pelo UEFI (falta TPM 2.0 e Secure Boot) e UEFI no ARM64 (Windows on ARM, BSDs).
 2. **Desempenho**: SSE aritmético e x87 no JIT, mais instruções de sistema no bloco, JIT para
    os convidados ARM.
 3. **Rede e acesso remoto**: IPv6 no NAT; mouse absoluto (tablet USB/virtio) para o VNC.

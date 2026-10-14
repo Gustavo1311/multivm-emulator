@@ -117,6 +117,17 @@ void acpi_build(acpi_tables *t, const acpi_config *cfg)
             break;
         }
     }
+    /* bloco PM fora do padrao: troca o IO (Decode16, 0x0600, 0x0600, 1, 0x40) do MBRS */
+    uint16_t pm = cfg->pm_base ? cfg->pm_base : ACPI_PM_BASE;
+    if (pm != ACPI_PM_BASE) {
+        static const uint8_t io_pm[] = {0x47, 0x01, 0x00, 0x06, 0x00, 0x06, 0x01, 0x40};
+        for (size_t i = 0; i + sizeof(io_pm) <= sizeof(dsdt_aml); i++)
+            if (!memcmp(dsdt + i, io_pm, sizeof(io_pm))) {
+                st_le(dsdt + i + 2, pm, 2);
+                st_le(dsdt + i + 4, pm, 2);
+                break;
+            }
+    }
     uint32_t dsdt_off = add_table(t, dsdt, sizeof(dsdt_aml));
     free(dsdt);
 
@@ -128,9 +139,9 @@ void acpi_build(acpi_tables *t, const acpi_config *cfg)
     fadt[45] = 0;                           /* perfil: nao especificado */
     st_le(fadt + 46, ACPI_SCI_IRQ, 2);
     /* SMI_CMD = 0: o hardware ja esta em modo ACPI (SCI_EN ligado) */
-    st_le(fadt + 56, ACPI_PM_BASE, 4);      /* PM1a_EVT */
-    st_le(fadt + 64, ACPI_PM_BASE + 4, 4);  /* PM1a_CNT */
-    st_le(fadt + 76, ACPI_PM_BASE + 8, 4);  /* PM_TMR */
+    st_le(fadt + 56, pm, 4);                /* PM1a_EVT */
+    st_le(fadt + 64, pm + 4u, 4);           /* PM1a_CNT */
+    st_le(fadt + 76, pm + 8u, 4);           /* PM_TMR */
     st_le(fadt + 80, ACPI_GPE0_BASE, 4);    /* GPE0 */
     fadt[88] = 4;                           /* PM1_EVT_LEN */
     fadt[89] = 2;                           /* PM1_CNT_LEN */
@@ -151,9 +162,9 @@ void acpi_build(acpi_tables *t, const acpi_config *cfg)
     /* X_FIRMWARE_CTRL fica 0: com os dois preenchidos a especificacao manda
      * ignorar o de 32 bits, mas alguns SOs antigos so leem FIRMWARE_CTRL */
     st_le(fadt + 140, dsdt_off, 8);         /* X_DSDT */
-    gas_io(fadt + 148, 32, ACPI_PM_BASE);
-    gas_io(fadt + 172, 16, ACPI_PM_BASE + 4);
-    gas_io(fadt + 208, 32, ACPI_PM_BASE + 8);
+    gas_io(fadt + 148, 32, pm);
+    gas_io(fadt + 172, 16, pm + 4u);
+    gas_io(fadt + 208, 32, pm + 8u);
     gas_io(fadt + 220, 32, ACPI_GPE0_BASE);
     uint32_t fadt_off = add_table(t, fadt, sizeof(fadt));
     add_ptr(t, F_TABLES, fadt_off + 36, 4, F_TABLES);

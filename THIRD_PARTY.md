@@ -9,9 +9,12 @@ sob a GPLv3 ou posterior (veja `LICENSE`). Os itens abaixo vêm de outros projet
 |---|---|---|---|
 | `android/app/src/main/assets/bios/bios-256k.bin` | SeaBIOS 1.16.3 (pacote Debian `seabios` 1.16.3-2) | LGPLv3 | https://www.seabios.org/ · https://sources.debian.org/src/seabios/1.16.3-2/ |
 | `android/app/src/main/assets/bios/vgabios-stdvga.bin` | VGA BIOS do SeaBIOS 1.16.3 (mesmo pacote) | LGPLv3 | idem |
+| `android/app/src/main/assets/bios/OVMF_CODE.fd`, `OVMF_VARS.fd` | OVMF X64 do edk2, tag `edk2-stable202502` (inclui OpenSSL 3, Brotli e outros submódulos do edk2) | BSD-2-Clause-Patent (edk2); Apache-2.0 (OpenSSL); MIT (Brotli) | https://github.com/tianocore/edk2/tree/edk2-stable202502 |
 
-Os binários não foram modificados. O texto da LGPLv3 está em
-https://www.gnu.org/licenses/lgpl-3.0.html.
+Os binários do SeaBIOS não foram modificados. O texto da LGPLv3 está em
+https://www.gnu.org/licenses/lgpl-3.0.html. O OVMF foi compilado sem alterações no código, com
+`tools/build_ovmf.sh` (RELEASE, sem SMM, Secure Boot, TPM, TLS e HTTP boot); as licenças de cada
+componente estão no próprio edk2 (`License.txt` e `License-History.txt` na raiz e nos submódulos).
 
 ## Usados só em tempo de execução (não incluídos)
 
@@ -27,5 +30,7 @@ https://www.gnu.org/licenses/lgpl-3.0.html.
   cada pacote do Alpine. Origem: https://dl-cdn.alpinelinux.org/
 - `tests/audio/run_audio_tests.sh`: pacotes do Alpine 3.24 listados em
   `tests/audio/apks.txt` (alsa-utils e dependências).
+- `tests/uefi/run_uefi_tests.sh` usa o live CD do SliTaz (GPL) e, no primeiro teste, o
+  `OVMF.fd` do sistema (`apt install ovmf`).
 - Os testes com BIOS usam o SeaBIOS do sistema (`/usr/share/seabios`) e as ISOs do Alpine,
   que não fazem parte do repositório.

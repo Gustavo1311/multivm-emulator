@@ -123,7 +123,7 @@ static char *dup_jstring(JNIEnv *env, jstring s)
 
 JNIEXPORT jlong JNICALL JNI_FN(nativeCreate)(JNIEnv *env, jclass cls, jint arch, jint ram_mb, jstring kernel,
                                             jstring initrd, jstring cmdline, jstring dtb, jstring firmware,
-                                            jstring vga_bios, jstring boot_order,
+                                            jstring vga_bios, jstring uefi_vars, jstring boot_order,
                                             jobjectArray disk_paths, jintArray disk_fds, jbooleanArray disk_ro,
                                             jintArray disk_types, jobjectArray disk_names, jint fb_w, jint fb_h,
                                             jlong raw_load_addr, jlong rtc_base, jint cpus,
@@ -136,7 +136,8 @@ JNIEXPORT jlong JNICALL JNI_FN(nativeCreate)(JNIEnv *env, jclass cls, jint arch,
     cfg.ram_mb = (uint32_t)ram_mb;
     char *s_kernel = dup_jstring(env, kernel), *s_initrd = dup_jstring(env, initrd);
     char *s_cmdline = dup_jstring(env, cmdline), *s_dtb = dup_jstring(env, dtb);
-    char *s_fw = dup_jstring(env, firmware);
+    char *s_fw = dup_jstring(env, firmware), *s_vars = dup_jstring(env, uefi_vars);
+    cfg.uefi_vars = s_vars;
     char *s_vga = dup_jstring(env, vga_bios), *s_boot = dup_jstring(env, boot_order);
     cfg.vga_bios = s_vga;
     cfg.boot_order = s_boot;
@@ -219,6 +220,7 @@ JNIEXPORT jlong JNICALL JNI_FN(nativeCreate)(JNIEnv *env, jclass cls, jint arch,
     free(s_cmdline);
     free(s_dtb);
     free(s_fw);
+    free(s_vars);
     free(s_vga);
     free(s_boot);
     for (int i = 0; i < MVM_MAX_DISKS; i++) {

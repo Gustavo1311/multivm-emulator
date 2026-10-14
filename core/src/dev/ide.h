@@ -10,6 +10,7 @@ ide_ctrl *ide_new(mvm_vm *vm, irq_line irq14, irq_line irq15);
 void ide_debug_dump(ide_ctrl *c);
 void ide_free(ide_ctrl *c);
 void ide_reset(ide_ctrl *c);
+void ide_set_empty_bus_zero(ide_ctrl *c, bool zero);
 /* bus 0/1 (primario/secundario), unit 0/1 (mestre/escravo). blk NULL = CD sem midia */
 bool ide_attach(ide_ctrl *c, int bus, int unit, mvm_blk *blk, bool cdrom);
 void *ide_bus_opaque(ide_ctrl *c, int bus);
