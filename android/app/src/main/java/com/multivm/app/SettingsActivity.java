@@ -133,6 +133,19 @@ public class SettingsActivity extends BaseActivity {
         help(c, "Perguntando, o Android abre o seletor “Salvar como” para escolher a pasta (Downloads, cartão SD…). "
                 + "A pasta do app é " + AppFiles.diskDir(this) + " e é apagada se o app for desinstalado.");
 
+        /* segundo plano */
+        c = card("Segundo plano", R.drawable.ic_power);
+        toggle(c, "Continuar rodando a VM em segundo plano",
+                "Ligado, a VM segue rodando ao sair do app ou apagar a tela, com uma notificação fixa "
+                        + "(Abrir, Pausar e Parar) e sem o aparelho dormir. Desligado, a VM pausa ao sair do app "
+                        + "e continua quando você volta. Gasta mais bateria ligado.",
+                s.runInBackground, b -> {
+                    s.runInBackground = b;
+                    save();
+                    if (b) askNotificationPermission();
+                    VmService.sync(this);
+                });
+
         /* sobre */
         c = card("Sobre", R.drawable.ic_launcher);
         String ver;
@@ -158,6 +171,29 @@ public class SettingsActivity extends BaseActivity {
         rl.topMargin = dp(16);
         rl.gravity = Gravity.CENTER_HORIZONTAL;
         root.addView(reset, rl);
+    }
+
+    private static final int REQ_NOTIFY = 7;
+
+    /** Android 13+: a notificacao fixa precisa da permissao de notificacoes. */
+    private void askNotificationPermission() {
+        if (android.os.Build.VERSION.SDK_INT < 33) return;
+        if (checkSelfPermission(VmService.PERM_NOTIFY) == android.content.pm.PackageManager.PERMISSION_GRANTED)
+            return;
+        requestPermissions(new String[]{VmService.PERM_NOTIFY}, REQ_NOTIFY);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] perms, int[] results) {
+        super.onRequestPermissionsResult(requestCode, perms, results);
+        if (requestCode == REQ_NOTIFY && (results.length == 0
+                || results[0] != android.content.pm.PackageManager.PERMISSION_GRANTED))
+            new AlertDialog.Builder(this)
+                    .setMessage("Sem a permissão de notificações a VM continua rodando em segundo plano, mas a "
+                            + "notificação fixa não aparece. Dá para liberar depois em Configurações do Android › "
+                            + "Apps › MultiVM › Notificações.")
+                    .setPositiveButton("OK", null)
+                    .show();
     }
 
     /* ---- construtores de linhas ---- */

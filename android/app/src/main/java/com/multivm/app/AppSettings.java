@@ -53,6 +53,8 @@ final class AppSettings {
     boolean showKeys;
     /* discos */
     int diskLocation = DISK_ASK;
+    /* segundo plano: a VM segue rodando (servico com notificacao) ou pausa ao sair do app */
+    boolean runInBackground;
 
     private AppSettings() {}
 
@@ -83,6 +85,7 @@ final class AppSettings {
         /* a barra de teclas ja era lembrada em "ui" pela tela da VM */
         s.showKeys = c.getSharedPreferences("ui", Context.MODE_PRIVATE).getBoolean("showKeys", false);
         s.diskLocation = clamp(p.getInt("diskLocation", DISK_ASK), DISK_NAMES.length);
+        s.runInBackground = p.getBoolean("runInBackground", false);
         return s;
     }
 
@@ -106,6 +109,7 @@ final class AppSettings {
                 .putBoolean("haptics", haptics)
                 .putBoolean("trackpadOnStart", trackpadOnStart)
                 .putInt("diskLocation", diskLocation)
+                .putBoolean("runInBackground", runInBackground)
                 .apply();
         c.getSharedPreferences("ui", Context.MODE_PRIVATE).edit().putBoolean("showKeys", showKeys).apply();
     }
@@ -114,6 +118,11 @@ final class AppSettings {
     static void reset(Context c) {
         prefs(c).edit().clear().apply();
         c.getSharedPreferences("ui", Context.MODE_PRIVATE).edit().remove("showKeys").apply();
+    }
+
+    /** Leitura rapida so da opcao de segundo plano. */
+    static boolean runInBackground(Context c) {
+        return prefs(c).getBoolean("runInBackground", false);
     }
 
     private static int clamp(int v, int n) { return v < 0 || v >= n ? 0 : v; }

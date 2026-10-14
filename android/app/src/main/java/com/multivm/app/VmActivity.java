@@ -207,6 +207,13 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
     protected void onResume() {
         super.onResume();
         if (vm == null) return;
+        if (vm != VmHolder.vm) {
+            /* fechada pelo Parar da notificacao enquanto a tela estava fora */
+            vm.removeStateListener(stateListener);
+            vm = null;
+            finish();
+            return;
+        }
         /* Configuracoes pode ter mudado (botao Ajustes) */
         prefs = AppSettings.load(this);
         frameMs = 1000 / AppSettings.FPS[prefs.fps];
@@ -390,6 +397,16 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
 
     private void onVmState(VirtualMachine.State state, ExitReason reason) {
         if (vm == null || state != VirtualMachine.State.STOPPED || ended) return;
+        if (vm != VmHolder.vm) {
+            /* parada pelo Parar da notificacao: nada a perguntar */
+            ended = true;
+            vm.removeStateListener(stateListener);
+            vm = null;
+            ui.removeCallbacks(frame);
+            ui.removeCallbacks(statusTick);
+            finish();
+            return;
+        }
         ended = true;
         updateStatus();
         pumpTerminal();

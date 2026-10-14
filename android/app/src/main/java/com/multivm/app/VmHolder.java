@@ -1,5 +1,7 @@
 package com.multivm.app;
 
+import android.content.Context;
+
 import com.multivm.core.VirtualMachine;
 
 import java.util.ArrayList;
@@ -19,6 +21,8 @@ final class VmHolder {
     static List<List<String>> media = new ArrayList<>();
     /** a VM usa o controlador SATA (aceita conectar discos com ela ligada) */
     static boolean sata;
+    /** a VM foi pausada sozinha porque o app saiu da tela (opcao de segundo plano desligada) */
+    static volatile boolean autoPaused;
 
     private VmHolder() {}
 
@@ -47,7 +51,11 @@ final class VmHolder {
             v = vm;
             vm = null;
             vmId = null;
+            autoPaused = false;
         }
         if (v != null) v.close();
+        /* sem VM: tira a notificacao de segundo plano */
+        Context app = MultiVmApp.context();
+        if (app != null) app.stopService(new android.content.Intent(app, VmService.class));
     }
 }

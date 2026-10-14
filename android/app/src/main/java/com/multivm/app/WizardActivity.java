@@ -89,10 +89,16 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
     private int appliedOs = -1;
 
     /* sistema convidado -> placas de som e de rede com driver nativo (indices de VmSettings) */
+    private static final int OS_LINUX = 0, OS_WIN7 = 2, OS_FREEBSD = 4, OS_OPENBSD = 5, OS_NETBSD = 6;
     private static final String[] OS_NAMES = {"Linux", "Windows XP", "Windows 7, 10, 11 ou Server", "ReactOS",
-            "Outro (DOS, BSD...)"};
-    private static final int[] OS_SOUND = {2, 1, 2, 1, 0};
-    private static final int[] OS_NIC = {3, 1, 2, 1, 0};
+            "FreeBSD", "OpenBSD", "NetBSD", "Outro (DOS...)"};
+    /* BSDs: e1000 (em/wm) e HD Audio (snd_hda/azalia/hdaudio) tem driver no kernel GENERIC */
+    private static final int[] OS_SOUND = {2, 1, 2, 1, 2, 2, 2, 0};
+    private static final int[] OS_NIC = {3, 1, 2, 1, 2, 2, 2, 0};
+
+    private static boolean isBsd(int o) {
+        return o == OS_FREEBSD || o == OS_OPENBSD || o == OS_NETBSD;
+    }
 
     @Override
     protected void onCreate(Bundle saved) {
@@ -157,7 +163,9 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
             @Override
             public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
                 osHelp.setText("Placas sugeridas — som: " + VmSettings.SOUND_NAMES[OS_SOUND[pos]] + "; rede: "
-                        + VmSettings.NIC_NAMES[OS_NIC[pos]] + ". Você pode trocar na próxima etapa, “Som e rede”.");
+                        + VmSettings.NIC_NAMES[OS_NIC[pos]] + ". Você pode trocar na próxima etapa, “Som e rede”."
+                        + (isBsd(pos) ? "\nBSD roda em PC x86 (x86-64 ou i386) com BIOS: dê boot pela ISO de "
+                        + "instalação. Em ARM os BSDs precisam de UEFI, que o MultiVM ainda não tem." : ""));
                 updateRamHelp();
             }
 
@@ -466,9 +474,9 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
         if (deviceRam > 0) sb.append("Seu aparelho tem ").append(deviceRam).append(" MiB de RAM.");
         if (mb > 0 && deviceRam > 0 && mb > deviceRam / 2)
             sb.append("\nAtenção: isso é mais da metade da memória do aparelho; o Android pode fechar o app.");
-        /* Linux e Windows 7+ (posicoes 0 e 2); XP, ReactOS e outros rodam com menos */
+        /* Linux, Windows 7+ e FreeBSD; XP, ReactOS, OpenBSD, NetBSD e outros rodam com menos */
         int o = os == null ? 0 : Math.max(0, os.getSelectedItemPosition());
-        String low = o == 0 || o == 2 ? AppFiles.lowRamWarning(mb) : null;
+        String low = o == OS_LINUX || o == OS_WIN7 || o == OS_FREEBSD ? AppFiles.lowRamWarning(mb) : null;
         if (low != null) sb.append(sb.length() > 0 ? "\n" : "").append(low);
         ramHelp.setText(sb);
     }
@@ -477,7 +485,7 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
         if (bios()) {
             bootHelp.setText(allDisksNew() && !disks.items().isEmpty()
                     ? "Adicione a ISO (ou o disquete) do sistema que será instalado no disco novo, por exemplo Alpine Linux, "
-                    + "ReactOS, Windows ou FreeDOS. Depois da instalação, mude a ordem para “Disco rígido primeiro”."
+                    + "FreeBSD, OpenBSD, ReactOS, Windows ou FreeDOS. Depois da instalação, mude a ordem para “Disco rígido primeiro”."
                     : "Adicione ISOs e disquetes para dar boot ou para usar no sistema. Sem eles, a VM inicia pelo disco.");
         } else {
             bootHelp.setText("Escolha o kernel Linux (Image, zImage ou bzImage) e, se houver, o initrd.");

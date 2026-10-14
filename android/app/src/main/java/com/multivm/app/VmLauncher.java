@@ -61,6 +61,8 @@ final class VmLauncher {
                 VmHolder.vncError = vncError;
                 final String warn = vncError;
                 a.runOnUiThread(() -> {
+                    /* opcao de segundo plano ligada: notificacao fixa enquanto a VM existir */
+                    VmService.sync(a);
                     done.done(null);
                     if (warn != null)
                         android.widget.Toast.makeText(a, "VNC não iniciou: " + warn, android.widget.Toast.LENGTH_LONG).show();

@@ -28,13 +28,13 @@ final class VmSettings {
 
     /** Placas de rede e de som (mesma ordem de VmConfig.NicModel/SoundModel em NIC_MODELS/SOUND_MODELS). */
     static final String[] NIC_NAMES = {"Automática", "Realtek RTL8139 (Windows XP, ReactOS, Linux)",
-            "Intel e1000 (Windows 7/10/11/Server, Linux)", "virtio-net (Linux, a mais rápida)", "Sem rede"};
+            "Intel e1000 (Windows 7/10/11/Server, Linux, BSD)", "virtio-net (Linux, BSD, a mais rápida)", "Sem rede"};
     static final com.multivm.core.VmConfig.NicModel[] NIC_MODELS = {
             com.multivm.core.VmConfig.NicModel.AUTO, com.multivm.core.VmConfig.NicModel.RTL8139,
             com.multivm.core.VmConfig.NicModel.E1000, com.multivm.core.VmConfig.NicModel.VIRTIO,
             com.multivm.core.VmConfig.NicModel.NONE};
     static final String[] SOUND_NAMES = {"Automática", "Intel AC'97 (Windows XP, ReactOS, Linux)",
-            "Intel HD Audio (Windows Vista/7/10/11/Server, Linux)", "Sem som", "virtio-sound (Linux)"};
+            "Intel HD Audio (Windows Vista/7/10/11/Server, Linux, BSD)", "Sem som", "virtio-sound (Linux)"};
     static final com.multivm.core.VmConfig.SoundModel[] SOUND_MODELS = {
             com.multivm.core.VmConfig.SoundModel.AUTO, com.multivm.core.VmConfig.SoundModel.AC97,
             com.multivm.core.VmConfig.SoundModel.HDA, com.multivm.core.VmConfig.SoundModel.NONE,
