@@ -1013,8 +1013,12 @@ struct i8042 {
     uint8_t mouse_rate, mouse_res, mouse_status;
     int mouse_wrap;
     uint32_t mouse_buttons;
+    /* 0 = PS/2 comum, 3 = IntelliMouse (roda), 4 = IntelliMouse Explorer (roda + botoes 4/5);
+     * o driver liga o modo com taxas em sequencia (200,100,80 e depois 200,200,80) */
+    uint8_t mouse_id;
+    uint8_t mouse_rates[3];
     /* movimento ainda nao enviado (fila cheia ou VM parada): sai em pacotes inteiros */
-    int mouse_pdx, mouse_pdy;
+    int mouse_pdx, mouse_pdy, mouse_pdz;
     uint32_t mouse_pbuttons;
 };
 
@@ -1035,7 +1039,7 @@ static void mouse_fill(i8042 *k);
 
 static void i8042_update(i8042 *k)
 {
-    if (k->mouse_enabled && k->mq.count < MOUSE_QUEUE_MAX - 3)
+    if (k->mouse_enabled)
         mouse_fill(k); /* movimento acumulado com a fila cheia */
     if (!k->outbuf_full) {
         if (k->kq.count && !(k->mode & 0x10)) {
@@ -1109,12 +1113,23 @@ static void mouse_write(i8042 *k, uint8_t val)
      * pacotes velhos no lugar de FA AA 00: desistia do mouse */
     if (!k->mouse_wrap) {
         k->mq.count = 0;
-        k->mouse_pdx = k->mouse_pdy = 0;
+        k->mouse_pdx = k->mouse_pdy = k->mouse_pdz = 0;
         k->mouse_pbuttons = k->mouse_buttons;
     }
     uint8_t cmd = k->mouse_cmd;
     k->mouse_cmd = 0;
-    if (cmd == 0xf3) { k->mouse_rate = val; kq_push(&k->mq, 0xfa); return; }
+    if (cmd == 0xf3) {
+        k->mouse_rate = val;
+        k->mouse_rates[0] = k->mouse_rates[1];
+        k->mouse_rates[1] = k->mouse_rates[2];
+        k->mouse_rates[2] = val;
+        if (k->mouse_rates[0] == 200 && k->mouse_rates[2] == 80) {
+            if (k->mouse_rates[1] == 100 && k->mouse_id == 0) k->mouse_id = 3;
+            else if (k->mouse_rates[1] == 200 && k->mouse_id == 3) k->mouse_id = 4;
+        }
+        kq_push(&k->mq, 0xfa);
+        return;
+    }
     if (cmd == 0xe8) { k->mouse_res = val; kq_push(&k->mq, 0xfa); return; }
     switch (val) {
     case 0xe6: case 0xe7: kq_push(&k->mq, 0xfa); break;
@@ -1125,12 +1140,14 @@ static void mouse_write(i8042 *k, uint8_t val)
         kq_push(&k->mq, k->mouse_res);
         kq_push(&k->mq, k->mouse_rate);
         break;
-    case 0xf2: kq_push(&k->mq, 0xfa); kq_push(&k->mq, 0x00); break;
+    case 0xf2: kq_push(&k->mq, 0xfa); kq_push(&k->mq, k->mouse_id); break;
     case 0xf4: k->mouse_enabled = true; kq_push(&k->mq, 0xfa); break;
     case 0xf5: k->mouse_enabled = false; kq_push(&k->mq, 0xfa); break;
     case 0xf6: kq_push(&k->mq, 0xfa); break;
     case 0xff:
         k->mouse_enabled = false;
+        k->mouse_id = 0;
+        memset(k->mouse_rates, 0, sizeof(k->mouse_rates));
         kq_push(&k->mq, 0xfa);
         kq_push(&k->mq, 0xaa);
         kq_push(&k->mq, 0x00);
@@ -1285,24 +1302,32 @@ void i8042_key(i8042 *k, uint16_t code, bool pressed)
  * (byte perdido no meio de um pacote dessincroniza o driver do convidado) */
 static void mouse_fill(i8042 *k)
 {
-    while ((k->mouse_pdx || k->mouse_pdy || k->mouse_pbuttons != k->mouse_buttons) &&
-           k->mq.count + 3 <= MOUSE_QUEUE_MAX) {
+    unsigned psize = k->mouse_id ? 4 : 3;
+    /* Explorer: so 4 bits de roda; IntelliMouse: o byte inteiro */
+    int zmin = k->mouse_id == 4 ? -8 : -127, zmax = k->mouse_id == 4 ? 7 : 127;
+    while ((k->mouse_pdx || k->mouse_pdy || k->mouse_pdz || k->mouse_pbuttons != k->mouse_buttons) &&
+           k->mq.count + psize <= MOUSE_QUEUE_MAX) {
         int x = k->mouse_pdx > 127 ? 127 : k->mouse_pdx < -127 ? -127 : k->mouse_pdx;
         int y = k->mouse_pdy > 127 ? 127 : k->mouse_pdy < -127 ? -127 : k->mouse_pdy;
+        int z = k->mouse_pdz > zmax ? zmax : k->mouse_pdz < zmin ? zmin : k->mouse_pdz;
         int py = -y; /* PS/2: Y positivo para cima */
         uint32_t b = k->mouse_pbuttons;
         kq_push(&k->mq, (uint8_t)(0x08 | (b & 7) | (x < 0 ? 0x10 : 0) | (py < 0 ? 0x20 : 0)));
         kq_push(&k->mq, (uint8_t)x);
         kq_push(&k->mq, (uint8_t)py);
+        if (k->mouse_id == 4) /* roda em complemento de 2 com 4 bits, botoes 4 e 5 nos bits 4 e 5 */
+            kq_push(&k->mq, (uint8_t)((z & 0x0f) | ((b >> 3) & 3) << 4));
+        else if (k->mouse_id)
+            kq_push(&k->mq, (uint8_t)z);
         k->mouse_pdx -= x;
         k->mouse_pdy -= y;
+        k->mouse_pdz -= z;
         k->mouse_buttons = b;
     }
 }
 
 void i8042_mouse(i8042 *k, int dx, int dy, int dz, uint32_t buttons)
 {
-    (void)dz;
     if (i8042_dbg())
         LOGI("i8042: evento de mouse %d,%d b=%u (habilitado=%d modo=%02x fila=%u status=%02x)", dx, dy, buttons,
              k->mouse_enabled, k->mode, k->mq.count, k->status);
@@ -1311,6 +1336,10 @@ void i8042_mouse(i8042 *k, int dx, int dy, int dz, uint32_t buttons)
     /* acumula (com limite, para nao "andar" sozinho por muito tempo depois) e envia o que couber */
     k->mouse_pdx = k->mouse_pdx + dx > 4096 ? 4096 : k->mouse_pdx + dx < -4096 ? -4096 : k->mouse_pdx + dx;
     k->mouse_pdy = k->mouse_pdy + dy > 4096 ? 4096 : k->mouse_pdy + dy < -4096 ? -4096 : k->mouse_pdy + dy;
+    if (k->mouse_id) /* roda (negativo = para cima, como no PS/2); sem modo de roda ela se perde */
+        k->mouse_pdz = k->mouse_pdz + dz > 64 ? 64 : k->mouse_pdz + dz < -64 ? -64 : k->mouse_pdz + dz;
+    if (k->mouse_id != 4)
+        buttons &= 7; /* botoes 4/5 so existem no Explorer */
     if (buttons != k->mouse_pbuttons && k->mouse_pbuttons != k->mouse_buttons) {
         mouse_fill(k); /* nao perde um clique: o estado anterior dos botoes sai antes */
     }

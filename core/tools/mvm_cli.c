@@ -399,6 +399,8 @@ static void *control_thread(void *arg)
                     usleep(20000);
                 }
                 mvm_pointer_event(g_vm, 0, 0, 0, (uint32_t)bt);
+            } else if (!strncmp(line, "wheel ", 6)) { /* wheel DZ (negativo = para cima) */
+                mvm_pointer_event(g_vm, 0, 0, atoi(line + 6), 0);
             } else if (!strncmp(line, "click", 5)) { /* clique com o botao esquerdo */
                 mvm_pointer_event(g_vm, 0, 0, 0, 1);
                 usleep(80000);
@@ -705,7 +707,7 @@ static void usage(void)
             "      --text            imprime a tela em modo texto ao sair\n"
             "      --type SEG:TEXTO  digita TEXTO no teclado apos SEG segundos (\\n = Enter, \\wN = espera N s, \\Sc = Alt+SysRq+c, \\P = botao de energia, \\kN = tecla evdev N)\n"
             "      --sata            discos (-d/-r) e CD-ROMs (--cdrom) no controlador SATA AHCI\n      --no-reboot       encerra quando o convidado reinicia (codigo de saida 3)\n      --rtc DATA        data inicial do relogio (AAAA-MM-DD[THH:MM:SS], UTC); padrao: a do host\n"
-            "      --control FIFO    comandos em tempo de execucao: type TXT, text ARQ, shot ARQ, mouse DX DY [B], click, power, reset, quit,\n"
+            "      --control FIFO    comandos em tempo de execucao: type TXT, text ARQ, shot ARQ, mouse DX DY [B], wheel DZ, click, power, reset, quit,\n"
             "                        media list | media insert N ARQ | media eject N | media add ARQ\n"
             "      --type-after TXT  so comeca a contar SEG depois que TXT aparecer na tela de texto\n"
             "      --dtb ARQ         device tree externo (ARM)\n"
