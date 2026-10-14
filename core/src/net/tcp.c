@@ -135,8 +135,10 @@ static void arm_rto(tcp_conn *c)
     c->rto_at = net_now_ms() + c->rto;
 }
 
-static void abort_conn(mvm_net *n, tcp_conn *c)
+static void abort_conn(mvm_net *n, tcp_conn *c, const char *why)
 {
+    NETDBG("TCP %u.%u.%u.%u:%u abortada: %s (errno %d)", c->rip >> 24, (c->rip >> 16) & 255, (c->rip >> 8) & 255,
+           c->rip & 255, c->rport, why, errno);
     if (c->state == T_ESTAB || c->state == T_SYN_RCVD)
         send_seg(n, c, TH_RST | TH_ACK, c->snd_nxt, NULL, 0);
     conn_free(n, c);
@@ -186,7 +188,7 @@ static bool flush_to_host(mvm_net *n, tcp_conn *c)
         if (w < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                 return true;
-            abort_conn(n, c);
+            abort_conn(n, c, "send no host");
             return false;
         }
         memmove(c->rbuf, c->rbuf + w, c->rlen - (size_t)w);
@@ -459,7 +461,7 @@ void tcp_events(mvm_net *n, void *owner, short revents)
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                 break;
-            abort_conn(n, c);
+            abort_conn(n, c, "recv no host");
             return;
         }
     }
@@ -475,7 +477,7 @@ void tcp_timers(mvm_net *n, int64_t now)
         if (!c->rto_at || now < c->rto_at)
             continue;
         if (++c->retries > MAX_RETRIES) {
-            abort_conn(n, c);
+            abort_conn(n, c, "convidado sem ACK");
             continue;
         }
         c->rto = c->rto * 2 > RTO_MAX ? RTO_MAX : c->rto * 2;

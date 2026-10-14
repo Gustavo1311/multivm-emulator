@@ -110,6 +110,13 @@ void acpi_build(acpi_tables *t, const acpi_config *cfg)
             break;
         }
     }
+    /* numero de CPUs: troca a marca "NCPU" (Name CPUN no dsdt.asl) */
+    for (size_t i = 0; i + 5 <= sizeof(dsdt_aml); i++) {
+        if (dsdt[i] == 0x0c && !memcmp(dsdt + i + 1, "NCPU", 4)) {
+            st_le(dsdt + i + 1, (uint64_t)(cfg->ncpus ? cfg->ncpus : 1), 4);
+            break;
+        }
+    }
     uint32_t dsdt_off = add_table(t, dsdt, sizeof(dsdt_aml));
     free(dsdt);
 

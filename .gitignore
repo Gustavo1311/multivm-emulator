@@ -36,3 +36,4 @@ tests/audio/apks/
 local.properties
 gmon.out
 tests/guest/err.txt
+tests/bsd/images

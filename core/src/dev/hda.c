@@ -84,6 +84,9 @@ typedef struct {
     uint32_t bd_off;
     audio_resampler rs;
     int64_t frac;
+    /* MVM_SND_DEBUG: estatisticas desde o RUN */
+    int64_t dbg_start;
+    uint64_t dbg_bytes, dbg_iocs, dbg_sts_reads;
 } hda_stream;
 
 struct hda {
@@ -118,6 +121,17 @@ struct hda {
 
 static uint64_t corb_base(hda *h) { return ((uint64_t)h->corb_hi << 32) | (h->corb_lo & ~0x7fu); }
 static uint64_t rirb_base(hda *h) { return ((uint64_t)h->rirb_hi << 32) | (h->rirb_lo & ~0x7fu); }
+
+/* MVM_SND_DEBUG=1: registra os streams (formato, BDL) */
+static int hda_debug(void)
+{
+    static int d = -1;
+    if (d < 0) {
+        const char *e = getenv("MVM_SND_DEBUG");
+        d = e && atoi(e) > 0;
+    }
+    return d;
+}
 
 /* ---------------------------------------------------------------- interrupcoes */
 
@@ -357,11 +371,14 @@ static void stream_dma(hda *h, int i, uint8_t *buf, size_t bytes, bool out)
         done += n;
         s->bd_off += (uint32_t)n;
         s->lpib += (uint32_t)n;
+        s->dbg_bytes += n;
         if (s->cbl && s->lpib >= s->cbl)
             s->lpib -= s->cbl;
         if (s->bd_off >= len) {
-            if (ioc)
+            if (ioc) {
                 s->sts |= STS_BCIS;
+                s->dbg_iocs++;
+            }
             s->bd_off = 0;
             s->bd_index = s->bd_index >= s->lvi ? 0 : s->bd_index + 1;
         }
@@ -487,7 +504,7 @@ static uint32_t sd_read(hda *h, int i, unsigned off)
 {
     hda_stream *s = &h->sd[i];
     switch (off) {
-    case 0x00: return s->ctl | ((uint32_t)s->sts << 24);
+    case 0x00: s->dbg_sts_reads++; return s->ctl | ((uint32_t)s->sts << 24);
     case 0x04: return s->lpib;
     case 0x08: return s->cbl;
     case 0x0c: return s->lvi | (0x04u << 16); /* FIFOW */
@@ -515,6 +532,25 @@ static void sd_write(hda *h, int i, unsigned off, uint32_t v, unsigned size)
         s->ctl = nv;
         if ((nv & CTL_RUN) && !was) {
             s->frac = 0;
+            s->dbg_start = mvm_now(h->vm);
+            s->dbg_bytes = s->dbg_iocs = s->dbg_sts_reads = 0;
+            if (hda_debug()) {
+                uint32_t rate;
+                int bits, nch;
+                stream_format(s->fmt, &rate, &bits, &nch);
+                LOGI("hda: stream %d RUN tag %u fmt %04x (%u Hz, %d bits, %d canais) cbl %u lvi %u ioce %d",
+                     i, (nv >> 20) & 0xf, s->fmt, rate, bits, nch, s->cbl, s->lvi, !!(nv & CTL_IOCE));
+                uint64_t bdl = ((uint64_t)s->bdpu << 32) | (s->bdpl & ~0x7fu);
+                for (unsigned k = 0; k <= s->lvi && k < 8; k++)
+                    LOGI("hda:   bdl[%u] addr %llx len %u ioc %u", k,
+                         (unsigned long long)space_read(&h->vm->mem, bdl + 16ULL * k, 8),
+                         (unsigned)space_read(&h->vm->mem, bdl + 16ULL * k + 8, 4),
+                         (unsigned)space_read(&h->vm->mem, bdl + 16ULL * k + 12, 4) & 1);
+            }
+        } else if (!(nv & CTL_RUN) && was && hda_debug()) {
+            LOGI("hda: stream %d parado (lpib %u) apos %lld ms: %llu bytes, %llu IOC, %llu leituras de STS", i, s->lpib,
+                 (long long)((mvm_now(h->vm) - s->dbg_start) / 1000000), (unsigned long long)s->dbg_bytes,
+                 (unsigned long long)s->dbg_iocs, (unsigned long long)s->dbg_sts_reads);
         }
         break;
     }

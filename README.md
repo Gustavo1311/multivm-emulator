@@ -51,16 +51,24 @@ não `SATA`), senão ele para com a tela azul 0x7B.
 **Windows 10 (x64):** o instalador do 22H2 de avaliação também instala, mas esse build de 2022
 está vencido: o serviço de licença da avaliação desliga a máquina cerca de uma hora após cada boot.
 
+**BSDs (x86 com BIOS):** **FreeBSD 15.1**, **OpenBSD 7.9** e **NetBSD 11.0** (amd64) instalam pela
+ISO oficial e bootam pelo disco, com 1 ou 2 CPUs, disco IDE, rede e1000 (DHCP e HTTP pelo NAT) e
+som Intel HD Audio. No OpenBSD também foram testados disco e rede virtio, e o CD do OpenBSD i386
+chega ao instalador. Para o kernel SMP do OpenBSD (`bsd.mp`), o DSDT declara um objeto de
+processador por CPU; sem isso ele para com "panic: null acpicpu". Teste: `tests/bsd/run_bsd_tests.sh`
+(baixe as ISOs com `tests/bsd/fetch_isos.sh`). Os BSDs para ARM exigem UEFI, que o MultiVM ainda
+não tem.
+
 **Rede (NAT em modo usuário, `core/src/net/`):** sem root e sem tap, como o "user networking" do
 QEMU. O convidado recebe 10.0.2.15 por DHCP; o gateway 10.0.2.2 é o próprio host e o DNS 10.0.2.3 é
 repassado ao servidor DNS do host. TCP, UDP e ping viram sockets comuns do host, e portas do host podem
 ser redirecionadas para o convidado (`--hostfwd tcp:2222-:22`). Placas: **RTL8139** (Windows XP, ReactOS,
-Linux), **Intel e1000** (Windows 7/10/11/Server, Linux; com offload de checksum e TSO) e **virtio-net**
-(Linux; também na máquina ARM). Testado com o Alpine (DHCP, ping, HTTP, DNS, download de 2 MiB,
+Linux), **Intel e1000** (Windows 7/10/11/Server, Linux, BSDs; com offload de checksum e TSO) e **virtio-net**
+(Linux, BSDs; também na máquina ARM). Testado com o Alpine (DHCP, ping, HTTP, DNS, download de 2 MiB,
 redirecionamento, `apk` por HTTPS) e com o Windows XP (DHCP, ping, TCP).
 
 **Som (`core/src/audio.c`):** placas **AC'97** (XP, ReactOS, Linux), **Intel HD Audio** (Windows Vista
-e mais novos, Linux) e **virtio-sound** (ARM), com saída e microfone. O DMA segue o relógio virtual e o
+e mais novos, Linux, BSDs) e **virtio-sound** (ARM), com saída e microfone. O DMA segue o relógio virtual e o
 áudio passa por anéis curtos (~20 ms) até o host: AAudio em modo de baixa latência no Android,
 `--audio-wav`/`--audio-in` na linha de comando. Testado com `speaker-test`/`arecord` no Alpine.
 

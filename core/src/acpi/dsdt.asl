@@ -1,5 +1,5 @@
 /*
- * DSDT da maquina "pc" do MultiVM (i440FX + PIIX3, uma CPU).
+ * DSDT da maquina "pc" do MultiVM (i440FX + PIIX3, ate 8 CPUs).
  *
  * Compilado com tools/gen_dsdt.sh (iasl) para dsdt_aml.h, que fica no
  * repositorio: o build normal nao precisa do iasl.
@@ -11,7 +11,41 @@ DefinitionBlock ("dsdt.aml", "DSDT", 2, "MULTVM", "MVMPC", 0x00000001)
 {
     Scope (\_SB)
     {
-        Processor (CPU0, 0x00, 0x00000000, 0x00) {}
+        /*
+         * Uma CPU por entrada da MADT (UID = indice). O OpenBSD exige um objeto de
+         * processador para cada CPU que liga (sem ele: "panic: null acpicpu" na CPU 1).
+         * acpi.c troca a marca "NCPU" pelo numero de CPUs da VM; as demais ficam ausentes.
+         */
+        Name (CPUN, 0x5550434E)
+        Processor (CPU0, 0x00, 0x00000000, 0x00) { Method (_STA, 0, NotSerialized) { Return (0x0F) } }
+        Processor (CPU1, 0x01, 0x00000000, 0x00)
+        {
+            Method (_STA, 0, NotSerialized) { If (LGreater (CPUN, 1)) { Return (0x0F) } Return (Zero) }
+        }
+        Processor (CPU2, 0x02, 0x00000000, 0x00)
+        {
+            Method (_STA, 0, NotSerialized) { If (LGreater (CPUN, 2)) { Return (0x0F) } Return (Zero) }
+        }
+        Processor (CPU3, 0x03, 0x00000000, 0x00)
+        {
+            Method (_STA, 0, NotSerialized) { If (LGreater (CPUN, 3)) { Return (0x0F) } Return (Zero) }
+        }
+        Processor (CPU4, 0x04, 0x00000000, 0x00)
+        {
+            Method (_STA, 0, NotSerialized) { If (LGreater (CPUN, 4)) { Return (0x0F) } Return (Zero) }
+        }
+        Processor (CPU5, 0x05, 0x00000000, 0x00)
+        {
+            Method (_STA, 0, NotSerialized) { If (LGreater (CPUN, 5)) { Return (0x0F) } Return (Zero) }
+        }
+        Processor (CPU6, 0x06, 0x00000000, 0x00)
+        {
+            Method (_STA, 0, NotSerialized) { If (LGreater (CPUN, 6)) { Return (0x0F) } Return (Zero) }
+        }
+        Processor (CPU7, 0x07, 0x00000000, 0x00)
+        {
+            Method (_STA, 0, NotSerialized) { If (LGreater (CPUN, 7)) { Return (0x0F) } Return (Zero) }
+        }
 
         Device (HPET)
         {
