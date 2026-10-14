@@ -575,6 +575,21 @@ static void setup_fw_cfg(mvm_vm *vm, pc_machine *m)
     uint32_t fail_wait = 10000;
     fw_cfg_add_file(f, "etc/boot-fail-wait", &fail_wait, 4);
 
+    /* SMBIOS (formato antigo do QEMU, chave 0x8001): o SeaBIOS monta as tabelas e so troca os campos
+     * dados aqui. "Version" do tipo 1 (System Information) diz que a maquina imita a do QEMU: o
+     * liloconfig do Salix/Slackware so instala no /dev/vda se o dmidecode mostrar "QEMU" (senao tenta
+     * /dev/sda e falha com 'raid_setup: stat("/dev/sda")'). Fabricante e produto seguem "Bochs". */
+    static const char smb_version[] = "QEMU-compatible (MultiVM)";
+    uint8_t smb[2 + 6 + sizeof(smb_version)];
+    uint16_t elen = (uint16_t)(6 + sizeof(smb_version));
+    st_le(smb, 1, 2);                      /* uma entrada */
+    st_le(smb + 2, elen, 2);               /* tamanho da entrada, com o cabecalho */
+    smb[4] = 0;                            /* entrada de campo */
+    smb[5] = 1;                            /* tabela tipo 1 */
+    st_le(smb + 6, 6, 2);                  /* offsetof(smbios_type_1, version_str) */
+    memcpy(smb + 8, smb_version, sizeof(smb_version));
+    fw_cfg_add_bytes(f, 0x8001, smb, sizeof(smb));
+
     /* ordem de boot: 'c' = discos, 'd' = CD-ROM, 'a' = disquete */
     const char *order = vm->cfg.boot_order;
     if (!order || !*order)
