@@ -789,10 +789,15 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
         starting = true;
         start.setEnabled(false);
         start.setText("Preparando...");
-        VmLauncher.start(this, settings, err -> {
-            resetStart();
-            if (err != null) error("Não foi possível iniciar a VM", err);
-        });
+        VmLauncher.checkRam(this, settings, () -> {
+            loading = true; /* a memoria pode ter sido ajustada no aviso */
+            ram.setText(settings.ram);
+            loading = false;
+            VmLauncher.start(this, settings, err -> {
+                resetStart();
+                if (err != null) error("Não foi possível iniciar a VM", err);
+            });
+        }, this::resetStart);
     }
 
     private void resetStart() {

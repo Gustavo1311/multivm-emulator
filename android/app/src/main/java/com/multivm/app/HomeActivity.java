@@ -270,6 +270,13 @@ public class HomeActivity extends BaseActivity {
         micAsked = false;
         starting = s.id;
         updateStates();
+        VmLauncher.checkRam(this, s, () -> launch(s), () -> {
+            starting = null;
+            updateStates();
+        });
+    }
+
+    private void launch(VmSettings s) {
         VmLauncher.start(this, s, err -> {
             starting = null;
             updateStates();

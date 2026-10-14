@@ -198,6 +198,63 @@ final class VmLauncher {
         return false;
     }
 
+    /**
+     * Antes de iniciar: se um CD de boot e um live que carrega o sistema inteiro na RAM (initrd enorme, ex.:
+     * Fatdog64) e a memoria nao basta, pergunta se aumenta. go roda na thread da UI quando pode iniciar
+     * (s.ram ja ajustada e salva se o usuario aceitou); cancel, se ele desistir.
+     */
+    static void checkRam(Activity a, VmSettings s, Runnable go, Runnable cancel) {
+        List<String> isos = new ArrayList<>();
+        boolean x86 = AppFiles.isX86(AppFiles.ARCHS[Math.max(0, Math.min(AppFiles.ARCHS.length - 1, s.arch))]);
+        if (x86 && s.bios)
+            for (VmSettings.Media m : s.cdroms()) if (m.uri != null) isos.add(m.uri);
+        int mb;
+        try {
+            mb = Integer.parseInt(s.ram.trim());
+        } catch (NumberFormatException e) {
+            mb = -1;
+        }
+        if (isos.isEmpty() || mb <= 0) {
+            go.run();
+            return;
+        }
+        final int cur = mb;
+        new Thread(() -> {
+            long initrd = 0;
+            for (String f : isos) initrd = Math.max(initrd, IsoInfo.largestInitrd(a, f));
+            final int need = IsoInfo.minRamMb(initrd);
+            final long initrdMb = initrd >> 20;
+            a.runOnUiThread(() -> {
+                if (a.isFinishing()) {
+                    cancel.run();
+                    return;
+                }
+                if (need <= cur) {
+                    go.run();
+                    return;
+                }
+                String msg = "Este CD carrega o sistema inteiro na memória (initrd de " + initrdMb + " MiB). Com "
+                        + cur + " MiB o boot deve parar numa tela preta ou em “Kernel panic … deadlocked on memory”.";
+                android.app.AlertDialog.Builder d = new android.app.AlertDialog.Builder(a)
+                        .setTitle("Memória pouca para este CD")
+                        .setNegativeButton("Iniciar assim mesmo", (x, w) -> go.run())
+                        .setOnCancelListener(x -> cancel.run());
+                if (need <= AppFiles.RAM_MAX) {
+                    d.setMessage(msg + "\n\nRecomendado: pelo menos " + need + " MiB.")
+                            .setPositiveButton("Usar " + need + " MiB", (x, w) -> {
+                                s.ram = String.valueOf(need);
+                                s.save(a);
+                                go.run();
+                            });
+                } else {
+                    d.setMessage(msg + "\n\nEle precisaria de uns " + need + " MiB, acima do máximo do MultiVM ("
+                            + AppFiles.RAM_MAX + " MiB).").setPositiveButton("Cancelar", (x, w) -> cancel.run());
+                }
+                d.show();
+            });
+        }, "MultiVM-iso").start();
+    }
+
     /** O microfone foi pedido mas a permissao ainda nao foi dada. */
     static boolean needsMicPermission(Activity a, VmSettings s) {
         return s.mic && s.sound != VmSettings.SOUND_NONE

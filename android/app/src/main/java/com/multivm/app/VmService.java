@@ -31,6 +31,7 @@ public final class VmService extends Service {
     private static final int NOTIF_ID = 1;
     private static final String ACTION_TOGGLE_PAUSE = "com.multivm.app.TOGGLE_PAUSE";
     private static final String ACTION_STOP = "com.multivm.app.STOP";
+    private static final String ACTION_REPOST = "com.multivm.app.REPOST";
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private VirtualMachine vm;
@@ -167,7 +168,9 @@ public final class VmService extends Service {
                 .setShowWhen(false)
                 .setOnlyAlertOnce(true)
                 .setCategory(Notification.CATEGORY_SERVICE)
-                .setContentIntent(PendingIntent.getActivity(this, 0, open, pendingFlags()));
+                .setContentIntent(PendingIntent.getActivity(this, 0, open, pendingFlags()))
+                /* Android 14+ deixa arrastar para tirar ate notificacao fixa: ela volta na hora */
+                .setDeleteIntent(service(ACTION_REPOST, 4));
         b.addAction(action(R.drawable.ic_monitor, "Abrir",
                 PendingIntent.getActivity(this, 1, open, pendingFlags())));
         b.addAction(action(paused ? R.drawable.ic_play : R.drawable.ic_pause, paused ? "Continuar" : "Pausar",
