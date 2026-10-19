@@ -149,7 +149,7 @@
                         android:id="@+id/wModeUefi"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="PC com UEFI — ISOs só UEFI e sistemas modernos (x86-64)" />
+                        android:text="UEFI — ISOs UEFI e sistemas modernos (x86-64, ARM e ARM64)" />
 
                     <RadioButton
                         android:id="@+id/wModeKernel"
@@ -178,18 +178,18 @@
                     style="@style/Label"
                     android:text="Memória (MiB)" />
 
-                <SeekBar
-                    android:id="@+id/wRamBar"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="8dp" />
-
                 <EditText
                     android:id="@+id/wRam"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:inputType="number"
                     android:text="1024" />
+
+                <SeekBar
+                    android:id="@+id/wRamBar"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp" />
 
                 <TextView
                     android:id="@+id/wRamHelp"
@@ -423,15 +423,22 @@
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content" />
 
-                    <TextView
-                        style="@style/Label"
-                        android:layout_marginTop="16dp"
-                        android:text="Ordem de boot" />
-
-                    <Spinner
-                        android:id="@+id/wBootOrder"
+                    <LinearLayout
+                        android:id="@+id/wBootOrderBox"
                         android:layout_width="match_parent"
-                        android:layout_height="wrap_content" />
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical">
+
+                        <TextView
+                            style="@style/Label"
+                            android:layout_marginTop="16dp"
+                            android:text="Ordem de boot" />
+
+                        <Spinner
+                            android:id="@+id/wBootOrder"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content" />
+                    </LinearLayout>
                 </LinearLayout>
 
                 <!-- kernel direto -->
@@ -471,6 +478,15 @@
                         android:layout_height="wrap_content"
                         android:fontFamily="monospace"
                         android:inputType="text" />
+
+                </LinearLayout>
+
+                <!-- tela grafica: kernel direto e UEFI no ARM -->
+                <LinearLayout
+                    android:id="@+id/wFbBox"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical">
 
                     <CheckBox
                         android:id="@+id/wFb"

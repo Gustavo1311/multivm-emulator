@@ -19,10 +19,12 @@ final class VmHolder {
     static volatile String vncError;
     /** arquivo em cada drive, por tipo (VmSettings.KIND_*) na ordem dos slots; null = vazio */
     static List<List<String>> media = new ArrayList<>();
-    /** a VM usa o controlador SATA (aceita conectar discos com ela ligada) */
+    /** a VM aceita conectar discos com ela ligada (SATA no PC, virtio-scsi no ARM com UEFI) */
     static boolean sata;
     /** a VM foi pausada sozinha porque o app saiu da tela (opcao de segundo plano desligada) */
     static volatile boolean autoPaused;
+    /** a tela da VM (VmActivity) esta visivel: VM em primeiro plano */
+    static volatile boolean screenVisible;
 
     private VmHolder() {}
 

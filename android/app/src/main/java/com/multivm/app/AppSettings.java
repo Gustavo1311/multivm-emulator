@@ -16,9 +16,10 @@ final class AppSettings {
     static final String[] THEME_NAMES = {"Escuro", "Claro", "Seguir o sistema"};
 
     /** Escala da imagem da VM na tela do aparelho. */
-    static final int SCALE_FIT = 0, SCALE_STRETCH = 1, SCALE_INTEGER = 2, SCALE_ORIGINAL = 3;
+    static final int SCALE_FIT = 0, SCALE_STRETCH = 1, SCALE_INTEGER = 2, SCALE_ORIGINAL = 3, SCALE_FILL = 4;
     static final String[] SCALE_NAMES = {"Ajustar à tela (mantém a proporção)", "Esticar (preenche a tela toda)",
-            "Múltiplo inteiro (pixels nítidos)", "Tamanho original (1 pixel da VM = 1 pixel da tela)"};
+            "Múltiplo inteiro (pixels nítidos)", "Tamanho original (1 pixel da VM = 1 pixel da tela)",
+            "Preencher a tela (corta as bordas, sem distorcer)"};
 
     static final int[] FPS = {30, 60};
     static final String[] FPS_NAMES = {"30 quadros/s (economiza bateria)", "60 quadros/s (mais fluido)"};
@@ -40,7 +41,9 @@ final class AppSettings {
     int fps = 0;
     boolean keepScreenOn = true;
     int orientation = ORIENT_AUTO;
-    boolean startFullscreen;
+    boolean startFullscreen = true;
+    /** ARM com UEFI: a resolucao do convidado segue o formato da tela do aparelho */
+    boolean matchDisplay = true;
     String defaultResolution = "800x600";
     /* mouse e toque */
     float mouseSpeed = 1f;
@@ -71,7 +74,9 @@ final class AppSettings {
         s.fps = clamp(p.getInt("fps", 0), FPS.length);
         s.keepScreenOn = p.getBoolean("keepScreenOn", true);
         s.orientation = clamp(p.getInt("orientation", ORIENT_AUTO), ORIENT_NAMES.length);
-        s.startFullscreen = p.getBoolean("startFullscreen", false);
+        /* chave nova: a tela cheia passou a ser o padrao (a antiga gravava false sem o usuario escolher) */
+        s.startFullscreen = p.getBoolean("fullscreenOnStart", true);
+        s.matchDisplay = p.getBoolean("matchDisplay", true);
         s.defaultResolution = p.getString("defaultResolution", "800x600");
         s.mouseSpeed = p.getFloat("mouseSpeed", 1f);
         s.tapClick = p.getBoolean("tapClick", true);
@@ -97,7 +102,8 @@ final class AppSettings {
                 .putInt("fps", fps)
                 .putBoolean("keepScreenOn", keepScreenOn)
                 .putInt("orientation", orientation)
-                .putBoolean("startFullscreen", startFullscreen)
+                .putBoolean("fullscreenOnStart", startFullscreen)
+                .putBoolean("matchDisplay", matchDisplay)
                 .putString("defaultResolution", defaultResolution)
                 .putFloat("mouseSpeed", mouseSpeed)
                 .putBoolean("tapClick", tapClick)

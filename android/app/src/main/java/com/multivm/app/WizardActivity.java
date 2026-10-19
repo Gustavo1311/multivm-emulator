@@ -71,7 +71,7 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
     private SeekBar ramBar;
     private RadioButton modeBios, modeUefi, modeKernel, ctrlSata, ctrlVirtio;
     private CheckBox fb, startNow;
-    private View ctrlBox, biosBox, kernelBox;
+    private View ctrlBox, biosBox, kernelBox, bootOrderBox, fbBox;
     private MediaListView disks, cds, floppies;
     private Button back, next;
     private long deviceRam;
@@ -137,6 +137,8 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
         ctrlBox = findViewById(R.id.wCtrlBox);
         biosBox = findViewById(R.id.wBiosBox);
         kernelBox = findViewById(R.id.wKernelBox);
+        bootOrderBox = findViewById(R.id.wBootOrderBox);
+        fbBox = findViewById(R.id.wFbBox);
         disks = findViewById(R.id.wDisks);
         cds = findViewById(R.id.wCds);
         floppies = findViewById(R.id.wFloppies);
@@ -167,7 +169,7 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
                 osHelp.setText("Placas sugeridas — som: " + VmSettings.SOUND_NAMES[OS_SOUND[pos]] + "; rede: "
                         + VmSettings.NIC_NAMES[OS_NIC[pos]] + ". Você pode trocar na próxima etapa, “Som e rede”."
                         + (isBsd(pos) ? "\nBSD roda em PC x86 (x86-64 ou i386) com BIOS: dê boot pela ISO de "
-                        + "instalação. Em ARM os BSDs precisam de UEFI, que o MultiVM ainda não tem." : ""));
+                        + "instalação. Em ARM, os BSDs precisam do modo UEFI com a ISO arm64 (ainda não testado no MultiVM)." : ""));
                 updateRamHelp();
             }
 
@@ -408,6 +410,12 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
                         return "A VM precisa de algo para dar boot: adicione uma ISO ou um disquete, ou volte e adicione um disco.";
                     if (!boot && allDisksNew())
                         return "Discos novos começam vazios: adicione a ISO (ou o disquete) do sistema que será instalado.";
+                } else if (armUefi()) {
+                    boolean boot = !cds.items().isEmpty();
+                    if (!boot && disks.items().isEmpty())
+                        return "A VM precisa de algo para dar boot: adicione uma ISO, ou volte e adicione um disco.";
+                    if (!boot && allDisksNew())
+                        return "Discos novos começam vazios: adicione a ISO do sistema que será instalado.";
                 } else {
                     if (kernel == null) return "Escolha o arquivo do kernel.";
                     if (fb.isChecked() && parseFb() == null) return "Resolução inválida: use LARGURAxALTURA, por exemplo 800x600.";
@@ -428,8 +436,14 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
         return AppFiles.isX86(selectedArch()) && (modeBios.isChecked() || modeUefi.isChecked());
     }
 
+    /** UEFI existe no x86-64 (OVMF) e no ARM/ARM64 (edk2 ArmVirtQemu); o i386 nao tem */
     private boolean uefi() {
-        return selectedArch() == Architecture.X86_64 && modeUefi.isChecked();
+        return selectedArch() != Architecture.I386 && modeUefi.isChecked();
+    }
+
+    /** ARM/ARM64 com firmware UEFI: boot por ISOs e discos, como no PC, mas sem disquete nem ordem de boot */
+    private boolean armUefi() {
+        return !AppFiles.isX86(selectedArch()) && modeUefi.isChecked();
     }
 
     private boolean allDisksNew() {
@@ -462,21 +476,23 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
     private void updateMode() {
         boolean x86 = AppFiles.isX86(selectedArch());
         modeBios.setEnabled(x86);
-        modeUefi.setEnabled(selectedArch() == Architecture.X86_64);
-        if (modeUefi.isChecked() && selectedArch() != Architecture.X86_64) {
-            if (x86) modeBios.setChecked(true);
-            else modeKernel.setChecked(true);
-        }
+        modeUefi.setEnabled(selectedArch() != Architecture.I386);
+        if (modeUefi.isChecked() && selectedArch() == Architecture.I386) modeBios.setChecked(true);
         if (!x86 && modeBios.isChecked()) modeKernel.setChecked(true);
-        boolean b = bios();
+        boolean b = bios(), au = armUefi();
         modeHelp.setText(x86
                 ? uefi() ? "A VM liga com firmware UEFI (OVMF), como um PC moderno: dá boot por ISOs e discos UEFI. Use para ISOs que só têm boot EFI e sistemas instalados em modo UEFI. Não lê disquetes."
                 : b ? "A VM liga como um PC comum: a BIOS (SeaBIOS) dá boot pelo CD-ROM, pelo disco ou pelo disquete. Use para instalar Linux, Windows, ReactOS ou DOS."
                     : "O kernel Linux é carregado direto na memória, sem BIOS. A saída aparece no terminal serial."
+                : au ? "A placa ARM “virt” liga com firmware UEFI (edk2): dá boot por ISOs e discos UEFI de ARM, como o "
+                    + "Alpine ou o Debian, com tela, teclado e mouse (virtio)."
                 : "Em ARM a VM é uma placa “virt”: o kernel Linux é carregado direto, sem BIOS. Discos usam virtio.");
         ctrlBox.setVisibility(b ? View.VISIBLE : View.GONE);
-        biosBox.setVisibility(b ? View.VISIBLE : View.GONE);
-        kernelBox.setVisibility(b ? View.GONE : View.VISIBLE);
+        biosBox.setVisibility(b || au ? View.VISIBLE : View.GONE);
+        floppies.setVisibility(b ? View.VISIBLE : View.GONE);
+        bootOrderBox.setVisibility(b ? View.VISIBLE : View.GONE);
+        kernelBox.setVisibility(b || au ? View.GONE : View.VISIBLE);
+        fbBox.setVisibility(b || au ? View.GONE : View.VISIBLE);
         cmdline.setHint("console=" + selectedArch().linuxConsole());
     }
 
@@ -499,6 +515,9 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
                     ? "Adicione a ISO (ou o disquete) do sistema que será instalado no disco novo, por exemplo Alpine Linux, "
                     + "FreeBSD, OpenBSD, ReactOS, Windows ou FreeDOS. Depois da instalação, mude a ordem para “Disco rígido primeiro”."
                     : "Adicione ISOs e disquetes para dar boot ou para usar no sistema. Sem eles, a VM inicia pelo disco.");
+        } else if (armUefi()) {
+            bootHelp.setText("Adicione a ISO UEFI de ARM do sistema (ex.: alpine-virt-…-aarch64.iso ou -armv7.iso). "
+                    + "Sem ISO, o UEFI dá boot pelo disco.");
         } else {
             bootHelp.setText("Escolha o kernel Linux (Image, zImage ou bzImage) e, se houver, o initrd.");
         }
@@ -620,7 +639,8 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
         addCard("Sistema", STEP_SYSTEM, R.drawable.ic_monitor,
                 "Nome", vmName(),
                 "Arquitetura", AppFiles.ARCH_NAMES[Math.max(0, arch.getSelectedItemPosition())],
-                "Inicialização", uefi() ? "PC com UEFI (OVMF)" : b ? "PC com BIOS (SeaBIOS)" : "Kernel Linux direto");
+                "Inicialização", armUefi() ? "UEFI (edk2)" : uefi() ? "PC com UEFI (OVMF)" : b ? "PC com BIOS (SeaBIOS)"
+                        : "Kernel Linux direto");
 
         int o = Math.max(0, os.getSelectedItemPosition());
         addCard("Hardware", STEP_HARDWARE, R.drawable.ic_memory,
@@ -681,6 +701,16 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
             }
             bt.add("Ordem de boot");
             bt.add(VmSettings.BOOT_NAMES[Math.max(0, bootOrder.getSelectedItemPosition())]);
+        } else if (armUefi()) {
+            List<VmSettings.Media> c = cds.items();
+            for (int i = 0; i < c.size(); i++) {
+                bt.add("CD " + (i + 1));
+                bt.add(mediaName(c.get(i)));
+            }
+            if (c.isEmpty()) {
+                bt.add("CD/DVD");
+                bt.add("nenhum");
+            }
         } else {
             String cl = cmdline.getText().toString().trim();
             bt.add("Kernel");
@@ -807,21 +837,22 @@ public class WizardActivity extends BaseActivity implements MediaListView.Host {
         s.ram = String.valueOf(ramMb());
         s.cpus = AppFiles.defaultCpus(AppFiles.ARCHS[Math.min(AppFiles.ARCHS.length - 1, s.arch)],
                 os.getSelectedItemPosition() == 0 /* Linux */);
-        s.bios = b;
+        boolean au = armUefi();
+        s.bios = b || au;
         s.uefi = uefi();
-        s.cmdline = b ? "" : cmdline.getText().toString().trim();
-        s.fb = !b && fb.isChecked();
+        s.cmdline = b || au ? "" : cmdline.getText().toString().trim();
+        s.fb = !b && !au && fb.isChecked();
         s.fbSize = fbSize.getText().toString().trim();
         s.bootOrder = b ? VmSettings.BOOT_CODES[Math.max(0, bootOrder.getSelectedItemPosition())] : "";
         s.sata = b && ctrlSata.isChecked();
         s.virtio = b && ctrlVirtio.isChecked();
-        s.kernel = b ? null : kernel;
-        s.initrd = b ? null : initrd;
+        s.kernel = b || au ? null : kernel;
+        s.initrd = b || au ? null : initrd;
         s.disks().addAll(disks.items());
-        if (b) {
+        if (b || au)
             s.cdroms().addAll(cds.items());
+        if (b)
             s.floppies().addAll(floppies.items());
-        }
         s.sound = Math.max(0, sound.getSelectedItemPosition());
         s.nic = Math.max(0, nic.getSelectedItemPosition());
         s.mic = mic.isChecked() && s.sound != VmSettings.SOUND_NONE;

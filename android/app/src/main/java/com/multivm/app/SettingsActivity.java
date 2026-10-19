@@ -95,8 +95,11 @@ public class SettingsActivity extends BaseActivity {
                 + "escolhida dentro do sistema convidado (ex.: Painel de controle › Vídeo no Windows).");
         choice(c, "Taxa de atualização", AppSettings.FPS_NAMES, s.fps, i -> { s.fps = i; save(); });
         choice(c, "Orientação ao abrir a VM", AppSettings.ORIENT_NAMES, s.orientation, i -> { s.orientation = i; save(); });
-        toggle(c, "Abrir a VM em tela cheia", "O botão Voltar alterna a tela cheia.", s.startFullscreen,
-                b -> { s.startFullscreen = b; save(); });
+        toggle(c, "Abrir a VM em tela cheia", "A imagem ocupa a tela toda, inclusive a área do entalhe da câmera. "
+                + "O botão Voltar alterna a tela cheia.", s.startFullscreen, b -> { s.startFullscreen = b; save(); });
+        toggle(c, "Resolução da VM no formato da tela", "ARM com UEFI: o sistema convidado recebe uma resolução com "
+                + "a mesma proporção da tela do aparelho (deitada; em pé só com a orientação “Retrato”) e preenche "
+                + "a tela sem faixas pretas.", s.matchDisplay, b -> { s.matchDisplay = b; save(); });
         toggle(c, "Manter a tela do aparelho ligada", null, s.keepScreenOn, b -> { s.keepScreenOn = b; save(); });
 
         /* mouse e toque */

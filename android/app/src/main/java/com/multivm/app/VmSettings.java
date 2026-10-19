@@ -3,6 +3,8 @@ package com.multivm.app;
 import android.content.Context;
 import android.content.SharedPreferences;
 
+import com.multivm.core.Architecture;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -101,7 +103,7 @@ final class VmSettings {
     int arch;
     String ram = "1024";
     boolean bios = true;
-    /** com bios: firmware UEFI (OVMF) em vez do SeaBIOS (so x86-64) */
+    /** com bios: firmware UEFI em vez do SeaBIOS (x86-64: OVMF; ARM/ARM64: edk2 ArmVirtQemu, unico firmware) */
     boolean uefi;
     String cmdline = "";
     boolean fb;
@@ -196,12 +198,17 @@ final class VmSettings {
         registry(ctx).edit().putString("ids", String.join(",", ids)).commit();
         prefs(ctx, id).edit().clear().commit();
         //noinspection ResultOfMethodCallIgnored
-        uefiVarsFile(ctx, id).delete();
+        for (Architecture a : new Architecture[]{Architecture.X86_64, Architecture.ARM64, Architecture.ARM})
+            uefiVarsFile(ctx, id, a).delete();
     }
 
-    /** Variaveis UEFI da VM (copia do OVMF_VARS.fd criada no primeiro boot com UEFI). */
-    static java.io.File uefiVarsFile(Context ctx, String id) {
-        return new java.io.File(new java.io.File(ctx.getFilesDir(), "uefi"), "vm_" + id + ".vars");
+    /**
+     * Variaveis UEFI da VM (copia do modelo vazio criada no primeiro boot com UEFI). O x86-64 mantem o nome
+     * antigo; ARM e ARM64 tem arquivos proprios (o formato do armazenamento e diferente).
+     */
+    static java.io.File uefiVarsFile(Context ctx, String id, Architecture arch) {
+        String suffix = arch == Architecture.ARM64 ? "-arm64" : arch == Architecture.ARM ? "-arm" : "";
+        return new java.io.File(new java.io.File(ctx.getFilesDir(), "uefi"), "vm_" + id + suffix + ".vars");
     }
 
     /** null se a VM nao existe (mais). */

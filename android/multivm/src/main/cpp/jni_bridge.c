@@ -306,6 +306,12 @@ JNIEXPORT void JNICALL JNI_FN(nativeStop)(JNIEnv *env, jclass cls, jlong h) { (v
 JNIEXPORT void JNICALL JNI_FN(nativeReset)(JNIEnv *env, jclass cls, jlong h) { (void)env; (void)cls; mvm_request_reset(ctx_of(h)->vm); }
 JNIEXPORT void JNICALL JNI_FN(nativePause)(JNIEnv *env, jclass cls, jlong h) { (void)env; (void)cls; mvm_pause(ctx_of(h)->vm); }
 JNIEXPORT void JNICALL JNI_FN(nativeResume)(JNIEnv *env, jclass cls, jlong h) { (void)env; (void)cls; mvm_resume(ctx_of(h)->vm); }
+JNIEXPORT void JNICALL JNI_FN(nativeSetPriority)(JNIEnv *env, jclass cls, jlong h, jint nice)
+{
+    (void)env;
+    (void)cls;
+    mvm_set_priority(ctx_of(h)->vm, nice);
+}
 JNIEXPORT jboolean JNICALL JNI_FN(nativeIsPaused)(JNIEnv *env, jclass cls, jlong h)
 {
     (void)env; (void)cls;
@@ -345,6 +351,39 @@ JNIEXPORT void JNICALL JNI_FN(nativePowerButton)(JNIEnv *env, jclass cls, jlong 
 {
     (void)env; (void)cls;
     mvm_power_button(ctx_of(h)->vm);
+}
+
+/* {x, y} do ponteiro na tela do convidado, ou null se a placa de video nao sabe */
+JNIEXPORT jintArray JNICALL JNI_FN(nativeCursorPosition)(JNIEnv *env, jclass cls, jlong h)
+{
+    (void)cls;
+    int xy[2];
+    if (!mvm_cursor_position(ctx_of(h)->vm, &xy[0], &xy[1]))
+        return NULL;
+    jintArray a = (*env)->NewIntArray(env, 2);
+    if (a)
+        (*env)->SetIntArrayRegion(env, a, 0, 2, (const jint *)xy);
+    return a;
+}
+
+JNIEXPORT void JNICALL JNI_FN(nativeDisplayHint)(JNIEnv *env, jclass cls, jlong h, jint w, jint hh)
+{
+    (void)env; (void)cls;
+    mvm_display_hint(ctx_of(h)->vm, w, hh);
+}
+
+/* {entregues, descartados} ou null se a maquina nao conta (PS/2) */
+JNIEXPORT jintArray JNICALL JNI_FN(nativeKeyboardStats)(JNIEnv *env, jclass cls, jlong h)
+{
+    (void)cls;
+    uint32_t ok = 0, drop = 0;
+    if (!mvm_keyboard_stats(ctx_of(h)->vm, &ok, &drop))
+        return NULL;
+    jint v[2] = {(jint)ok, (jint)drop};
+    jintArray a = (*env)->NewIntArray(env, 2);
+    if (a)
+        (*env)->SetIntArrayRegion(env, a, 0, 2, v);
+    return a;
 }
 
 JNIEXPORT jlong JNICALL JNI_FN(nativeClockLag)(JNIEnv *env, jclass cls, jlong h)

@@ -41,13 +41,19 @@ final class NativeBridge {
     static native void nativeReset(long handle);
     static native void nativePause(long handle);
     static native void nativeResume(long handle);
+    static native void nativeSetPriority(long handle, int nice);
     static native boolean nativeIsPaused(long handle);
     static native int nativeSerialInput(long handle, byte[] data, int off, int len);
     static native void nativeKeyEvent(long handle, int evdevCode, boolean down);
     static native void nativePointerEvent(long handle, int dx, int dy, int dz, int buttons);
     static native long nativeInstructionCount(long handle);
     static native long nativeClockLag(long handle);
+    static native int[] nativeKeyboardStats(long handle);
     static native void nativePowerButton(long handle);
+
+    static native void nativeDisplayHint(long handle, int width, int height);
+
+    static native int[] nativeCursorPosition(long handle);
     static native int[] nativeFbInfo(long handle);
     static native int nativeFbGeneration(long handle);
     /** (largura << 32) | altura; negativo se dst for pequeno; 0 sem framebuffer. */

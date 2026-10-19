@@ -232,6 +232,21 @@ public final class VirtualMachine implements AutoCloseable {
 
     public boolean isPaused() { return NativeBridge.nativeIsPaused(handle()); }
 
+    /** nice das threads da VM com a tela dela aberta (como android.os.Process.THREAD_PRIORITY_DISPLAY) */
+    public static final int PRIORITY_FOREGROUND = -4;
+    /** nice padrao das threads (fora da tela da VM: o Android ainda limita pelo grupo do processo) */
+    public static final int PRIORITY_DEFAULT = 0;
+
+    /**
+     * Primeiro plano: as threads da VM (CPUs e E/S) ganham prioridade acima das tarefas comuns,
+     * para o agendador preferir os nucleos rapidos e nao trocar a VM por trabalho de fundo.
+     * Vale tambem para threads que a VM criar depois. Sem efeito com a VM fechada.
+     */
+    public void setForeground(boolean fg) {
+        long h = handle;
+        if (h != 0) NativeBridge.nativeSetPriority(h, fg ? PRIORITY_FOREGROUND : PRIORITY_DEFAULT);
+    }
+
     /** Envia bytes para a serial do convidado. Retorna quantos foram aceitos. */
     public int sendSerial(byte[] data, int off, int len) {
         return NativeBridge.nativeSerialInput(handle(), data, off, len);
@@ -260,6 +275,12 @@ public final class VirtualMachine implements AutoCloseable {
         NativeBridge.nativePointerEvent(handle(), dx, dy, wheel, buttons);
     }
 
+    /**
+     * Teclas (apertos) entregues ao driver de teclado do convidado e descartadas porque o
+     * convidado ainda nao tinha driver: {entregues, descartados}. null se a maquina nao conta (PC).
+     */
+    public int[] getKeyboardStats() { return NativeBridge.nativeKeyboardStats(handle()); }
+
     public long getInstructionCount() { return NativeBridge.nativeInstructionCount(handle()); }
 
     /**
@@ -274,6 +295,15 @@ public final class VirtualMachine implements AutoCloseable {
      * desligamento ordenado, e o estado passa a STOPPED quando ele terminar.
      */
     public void pressPowerButton() { NativeBridge.nativePowerButton(handle()); }
+
+    /**
+     * Resolucao de tela preferida (ex.: a da tela do aparelho). Na placa ARM com UEFI (virtio-gpu) o
+     * convidado recebe o aviso e pode trocar de resolucao sozinho; nas outras maquinas nao faz nada.
+     */
+    public void setDisplayHint(int width, int height) { NativeBridge.nativeDisplayHint(handle(), width, height); }
+
+    /** Posicao {x, y} do ponteiro na tela do convidado (cursor de hardware da virtio-gpu), ou null. */
+    public int[] getCursorPosition() { return NativeBridge.nativeCursorPosition(handle()); }
 
     /** Informacoes do framebuffer, ou null se a VM nao tiver um. */
     public FramebufferInfo getFramebufferInfo() {

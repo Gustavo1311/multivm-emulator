@@ -154,7 +154,8 @@ final class MediaPanel {
     }
 
     private void addDisk(MediaSlot m, int n) {
-        String bus = m.bus == MediaSlot.Bus.SATA ? "SATA" : m.bus == MediaSlot.Bus.IDE ? "IDE" : "virtio";
+        String bus = m.bus == MediaSlot.Bus.SATA ? "SATA" : m.bus == MediaSlot.Bus.IDE ? "IDE"
+                : m.bus == MediaSlot.Bus.SCSI ? "SCSI" : "virtio";
         LinearLayout row = row(R.drawable.ic_hdd, "Disco " + n + " (" + bus + ")",
                 m.present ? m.name + (m.readOnly ? "  · somente leitura" : "") : "(desconectado)");
         if (m.changeable) {
@@ -243,7 +244,7 @@ final class MediaPanel {
                 .setTitle("Disco no próximo boot")
                 .setMessage("Os controladores IDE e virtio não aceitam conectar disco com a VM ligada. O disco será adicionado "
                         + "às configurações e aparece no próximo boot.\n\nPara conectar com a VM ligada, use o "
-                        + "controlador SATA nas configurações da máquina.")
+                        + "controlador SATA nas configurações da máquina (PC) ou o modo UEFI (ARM).")
                 .setPositiveButton("Escolher disco", (d, w) -> pick(ADD_NEXT_BOOT))
                 .setNegativeButton("Cancelar", null)
                 .show();

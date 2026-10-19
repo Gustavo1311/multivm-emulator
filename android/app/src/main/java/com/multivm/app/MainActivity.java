@@ -219,7 +219,7 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
                 .append(", Android ").append(Build.VERSION.RELEASE).append(", ABI ").append(abis.get(0));
         if (!abis.contains("arm64-v8a"))
             sb.append("\nAVISO: a biblioteca nativa deste APK só foi compilada para arm64-v8a.");
-        sb.append("\nBIOS embutida: SeaBIOS (bios-256k.bin + vgabios-stdvga.bin). UEFI: OVMF do edk2 (OVMF_CODE.fd; cada VM guarda as suas variáveis).");
+        sb.append("\nBIOS embutida: SeaBIOS (bios-256k.bin + vgabios-stdvga.bin). UEFI: OVMF do edk2 (OVMF_CODE.fd) no x86-64 e ArmVirtQemu do edk2 (AAVMF_CODE.fd/AAVMF32_CODE.fd) no ARM; cada VM guarda as suas variáveis.");
         sb.append("\nPasta do app para discos: ").append(diskDir()).append(" (Configurações › Discos decide se o app pergunta a pasta).");
         info.setText(sb);
     }
@@ -248,9 +248,13 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
         return isX86() && (modeBios.isChecked() || modeUefi.isChecked());
     }
 
-    /** UEFI (OVMF X64): so com a CPU de 64 bits */
+    /** UEFI existe no x86-64 (OVMF) e no ARM/ARM64 (edk2 ArmVirtQemu); o i386 nao tem */
+    private static boolean hasUefi(Architecture a) {
+        return a != Architecture.I386;
+    }
+
     private boolean uefi() {
-        return selectedArch() == Architecture.X86_64 && modeUefi.isChecked();
+        return hasUefi(selectedArch()) && modeUefi.isChecked();
     }
 
     /* ---- som, rede e VNC ---- */
@@ -289,17 +293,17 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
 
     private void updateMode() {
         boolean x86 = isX86();
-        findViewById(R.id.cpuBox).setVisibility(x86 ? View.VISIBLE : View.GONE); /* varios processadores: so x86 */
+        /* varios processadores: todas as arquiteturas */
+        findViewById(R.id.cpuBox).setVisibility(View.VISIBLE);
         modeBios.setEnabled(x86);
-        modeUefi.setEnabled(selectedArch() == Architecture.X86_64);
-        if (modeUefi.isChecked() && selectedArch() != Architecture.X86_64) {
-            if (x86) modeBios.setChecked(true);
-            else modeKernel.setChecked(true);
-        }
+        modeUefi.setEnabled(hasUefi(selectedArch()));
+        if (modeUefi.isChecked() && !hasUefi(selectedArch())) modeBios.setChecked(true);
         if (!x86 && modeBios.isChecked()) modeKernel.setChecked(true);
         boolean b = bios();
+        boolean armUefi = !x86 && modeUefi.isChecked();
         biosGroup.setVisibility(b ? View.VISIBLE : View.GONE);
-        kernelGroup.setVisibility(b ? View.GONE : View.VISIBLE);
+        kernelGroup.setVisibility(b || armUefi ? View.GONE : View.VISIBLE);
+        findViewById(R.id.fbGroup).setVisibility(b || armUefi ? View.GONE : View.VISIBLE);
         ctrlGroup.setVisibility(b ? View.VISIBLE : View.GONE);
         lists[VmSettings.KIND_FLOPPY].setVisibility(x86 ? View.VISIBLE : View.GONE);
         cmdline.setHint("console=" + selectedArch().linuxConsole());
@@ -334,7 +338,7 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
         String low = AppFiles.lowRamWarning(mb);
         ramHelp.setText(low);
         ramHelp.setVisibility(low != null ? View.VISIBLE : View.GONE);
-        chipMode.setText(bios() ? "BIOS" : "Kernel Linux");
+        chipMode.setText(uefi() ? "UEFI" : bios() ? "BIOS" : "Kernel Linux");
         int d = lists[0].items().size(), c = lists[1].items().size(), f = isX86() ? lists[2].items().size() : 0;
         StringBuilder sb = new StringBuilder();
         if (d > 0) sb.append(d).append(d == 1 ? " disco" : " discos");
@@ -473,11 +477,13 @@ public class MainActivity extends BaseActivity implements MediaListView.Host {
             case ARM64:
                 return "Máquina virt: CPU Cortex-A53 (ARMv8, 64 bits), GICv2, timer genérico, serial PL011 (ttyAMA0), "
                         + "RTC PL031 e dispositivos virtio (discos /dev/vda…, rede e som). Inicia um kernel Linux "
-                        + "(Image ou Image.gz) com initrd e device tree opcionais.";
+                        + "(Image ou Image.gz) com initrd e device tree opcionais, ou liga com firmware UEFI (edk2) para "
+                        + "dar boot por ISOs e discos UEFI de ARM64, com tela, teclado e mouse.";
             case ARM:
                 return "Máquina virt: CPU Cortex-A15 (ARMv7, 32 bits), GICv2, timer genérico, serial PL011 (ttyAMA0), "
                         + "RTC PL031 e dispositivos virtio (discos /dev/vda…, rede e som). Inicia um kernel Linux "
-                        + "(zImage) com initrd e device tree opcionais.";
+                        + "(zImage) com initrd e device tree opcionais, ou liga com firmware UEFI (edk2) para dar boot "
+                        + "por ISOs e discos UEFI de ARM 32 bits, com tela, teclado e mouse.";
             default:
                 return "PC: BIOS SeaBIOS, vídeo VGA/VBE, IDE/SATA, ACPI, APIC. Também inicia um kernel Linux direto.";
         }

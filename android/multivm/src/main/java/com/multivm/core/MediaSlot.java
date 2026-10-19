@@ -4,12 +4,12 @@ package com.multivm.core;
 public final class MediaSlot {
     public enum Kind { HARD_DISK, CDROM, FLOPPY }
 
-    public enum Bus { IDE, SATA, FLOPPY, VIRTIO }
+    public enum Bus { IDE, SATA, FLOPPY, VIRTIO, SCSI }
 
     public final int slot;
     public final Kind kind;
     public final Bus bus;
-    /** Unidade: canal*2+mestre/escravo no IDE, porta no SATA, 0 = A: e 1 = B: no disquete. */
+    /** Unidade: canal*2+mestre/escravo no IDE, porta no SATA, alvo no SCSI, 0 = A: e 1 = B: no disquete. */
     public final int unit;
     public final boolean present;
     public final boolean readOnly;

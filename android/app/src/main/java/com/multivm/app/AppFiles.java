@@ -53,8 +53,12 @@ final class AppFiles {
      * (Windows com mais de uma CPU ainda e lento e o XP nao foi testado assim).
      */
     static int defaultCpus(Architecture a, boolean linux) {
-        if (!isX86(a) || !linux) return 1;
-        return Runtime.getRuntime().availableProcessors() >= 6 ? 2 : 1;
+        if (!linux) return 1;
+        int n = Runtime.getRuntime().availableProcessors();
+        if (a == Architecture.ARM64 || a == Architecture.ARM) /* desktop Linux ARM: a sessao sobe cerca de 2x mais rapido com 4 */
+            return n >= 8 ? 4 : n >= 4 ? 2 : 1;
+        if (!isX86(a)) return 1;
+        return n >= 6 ? 2 : 1;
     }
 
     /** Aviso de memoria pouca para sistemas com desktop, ou null. */

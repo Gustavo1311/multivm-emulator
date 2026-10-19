@@ -15,7 +15,8 @@ a ponte JNI e a biblioteca Android (`.aar`).
 | x86-64 | `pc` (8259, 8254, RTC, 16550, i8042, PCI) | Alpine 6.18 `virt` (bzImage, com PTI) | musl/busybox dinâmico | leitura + escrita (virtio-pci) | JIT: ~490 MIPS |
 | i386 | `pc` (idem) | Alpine 6.18 `lts` | musl/busybox dinâmico | leitura + escrita (virtio-pci) | JIT: ~245 MIPS |
 
-\* medido em um celular ARM64 (Cortex-A55). ARM: interpretador. x86: JIT para AArch64
+\* medido em um celular ARM64 (Cortex-A55). ARM: interpretador (o ARM64 agora também tem JIT,
+ver abaixo). x86: JIT para AArch64
 (benchmark de CPU `tests/guest/out/bench-*.elf`; o interpretador puro faz 15–37 MIPS). O boot
 do kernel Linux até o shell leva de 7 a 12 s.
 
@@ -31,6 +32,32 @@ min, com os serviços de runtime e as variáveis UEFI visíveis no Linux. Com `O
 `--uefi-vars`, as variáveis (ordem de boot, entradas criadas por instaladores) ficam numa flash CFI
 emulada e persistem no arquivo. Para isso a máquina ganha, só no modo UEFI, a função PIIX4 PM
 (00:01.3) com o bloco PM em 0xB000, onde o OVMF o espera.
+
+**Boot por UEFI (ARM64 e ARMv7):** com o edk2 ArmVirtQemu a máquina `virt` liga como o `virt` do
+QEMU com `-bios`: o firmware fica em 0x0 (somente leitura), as variáveis numa flash CFI de 32 bits
+(dois chips de 16 bits, blocos de 256 KiB) em 0x04000000 e o device tree no início da RAM. A tela é
+uma virtio-gpu 2D e o teclado e o mouse são virtio-input, todos em virtio-mmio: o firmware, o GRUB e
+o Linux aparecem na tela e aceitam o teclado (o edk2 recebe um patch para pôr a GPU e o teclado
+virtio-mmio no console, ver `tools/edk2-patches`). No ARM64 o firmware recebe tabelas ACPI pelo
+fw_cfg (MMIO em 0x09020000: FADT de hardware reduzido com PSCI por HVC, MADT com GICv2, GTDT, SPCR e
+DSDT com a PL011 e os virtio-mmio) e as entrega ao sistema no lugar do device tree, como o QEMU faz:
+o SPCR torna a serial o console preferido desde o início e o Linux não abre um segundo login no
+mesmo terminal de vídeo. As ISOs do Alpine 3.24 (aarch64 standard/virt e armv7 virt) iniciam até o
+`login:`, com efivarfs e variáveis persistentes. O kernel armv7 "virt" do Alpine é LPAE; para ele a
+CPU ARMv7 ganhou a MMU de descritores longos. O Linux ARM 32 bits não usa ACPI: com device tree, o
+Alpine armv7 abre dois logins no terminal de vídeo (tty0 e tty1), como também acontece no QEMU.
+
+**Vários processadores no ARM64 (`--smp N`, até 8):** cada CPU roda na sua thread com o seu JIT. As
+extras começam desligadas e o sistema as liga pelo PSCI `CPU_ON` (device tree com `enable-method =
+"psci"` e MADT com uma GICC por CPU, MPIDR.Aff0 = índice). O GICv2 tem interfaces e SGIs/PPIs por
+CPU (IPIs pelo SGIR) e cada CPU tem o seu timer genérico. Atômicos de verdade: CAS/CASP/SWP/LD<op>
+usam atômicos do host e o par LDXR/STXR vira compare-and-swap do valor lido (como no QEMU); DMB/DSB
+e LDAR/STLR viram barreiras do host. Os TLBI das formas IS/OS chegam a todas as CPUs e o DSB seguinte
+espera elas concluírem. O mapa de páginas com código traduzido é comum a todos os JITs: escrita de
+uma CPU em código de outra invalida os blocos dela, que sai da fatia para isso. Os discos virtio
+(blk e scsi) têm trava própria, então a leitura do disco não para as outras CPUs. Com o Debian 13
+arm64 + Xfce, a área de trabalho aparece cerca de 2 vezes mais rápido com 4 CPUs do que com 1.
+Teste: `tests/smp/run_arm_smp_tests.sh`.
 
 **ACPI (x86):** tabelas RSDP/XSDT/RSDT, FADT, FACS, MADT e DSDT (PCI0 com `_CRS`/`_PRT`, links
 PIRQ, dispositivos ISA, `_S5`), entregues ao SeaBIOS pelo `etc/table-loader` do fw_cfg ou
@@ -64,8 +91,8 @@ ISO oficial e bootam pelo disco, com 1 ou 2 CPUs, disco IDE, rede e1000 (DHCP e 
 som Intel HD Audio. No OpenBSD também foram testados disco e rede virtio, e o CD do OpenBSD i386
 chega ao instalador. Para o kernel SMP do OpenBSD (`bsd.mp`), o DSDT declara um objeto de
 processador por CPU; sem isso ele para com "panic: null acpicpu". Teste: `tests/bsd/run_bsd_tests.sh`
-(baixe as ISOs com `tests/bsd/fetch_isos.sh`). Os BSDs para ARM exigem UEFI, que o MultiVM ainda
-não tem no ARM (só no x86-64).
+(baixe as ISOs com `tests/bsd/fetch_isos.sh`). Os BSDs para ARM exigem UEFI, que já existe no ARM,
+mas ainda não foram testados.
 
 **Rede (NAT em modo usuário, `core/src/net/`):** sem root e sem tap, como o "user networking" do
 QEMU. O convidado recebe 10.0.2.15 por DHCP; o gateway 10.0.2.2 é o próprio host e o DNS 10.0.2.3 é
@@ -90,6 +117,11 @@ teclado e mouse (`--vnc :1`). A compressão deflate usa a zlib do sistema carreg
 UNIT ATTENTION e evento de mídia), o disquete (linha de troca do 82078) e conectam/desconectam discos
 SATA (hot-plug AHCI). Disco IDE não troca a quente. Com BIOS, o app sempre cria um drive de CD e o A:
 (vazios se nada for escolhido); na CLI, `--cdrom none`/`--fda none`. Teste: `tests/media/run_media_tests.sh`.
+Na placa ARM `virt` os CDs (`--cdrom`) ficam num controlador virtio-scsi (`core/src/dev/virtio_scsi.c`:
+CD MMC com UNIT ATTENTION e evento de mídia, disco SBC com UNIT ATTENTION/UNMAP, hot-plug por eventos
+TRANSPORT_RESET); com UEFI ele sempre existe, logo depois dos discos virtio-blk, com um CD (vazio se não
+houver ISO). Assim dá para inserir/trocar ISOs e conectar discos com a VM ligada. Teste:
+`tests/media/run_media_arm_tests.sh`.
 
 **Disquete:** controlador 82078 com DMA ISA 8237, dois drives (160 KiB a 2,88 MiB), boot pelo disquete
 (`--fda`, `--boot a`).
@@ -102,7 +134,8 @@ SATA (hot-plug AHCI). Disco IDE não troca a quente. Com BIOS, o app sempre cria
   registradores de sistema, timer genérico, PSCI via HVC/SMC.
 - **AArch32 (ARMv7-A)**: ARM e Thumb-2 com blocos IT, multiplicações/divisão/saturação/SIMD
   paralelo, LDREX/STREX, bancos de registradores por modo, MMU de descritores curtos (seções,
-  páginas, domínios, AFE), CP15, VFPv3-D32 (+VFMA), timer genérico, PSCI.
+  páginas, domínios, AFE) e longos (LPAE: 3 níveis, TTBR de 64 bits, flag de acesso, permissões
+  hierárquicas), CP15, VFPv3-D32 (+VFMA), timer genérico, PSCI.
 - **x86 (i386 e x86-64 no mesmo núcleo)**: modo real, protegido 16/32 bits, modo longo e de
   compatibilidade; paginação 32 bits (PSE), PAE e 4 níveis com bits A/D, NX e WP; segmentação,
   TSS e troca de pilha por privilégio, IST, IRET/RETF entre anéis, SYSCALL/SYSRET,
@@ -110,6 +143,10 @@ SATA (hot-plug AHCI). Disco IDE não troca a quente. Com BIOS, o app sempre cria
   x87 (registradores em precisão dupla, formato de 80 bits na memória); SSE, SSE2, SSE3, SSSE3,
   SSE4.1, SSE4.2 (incluindo PCMPxSTRx e CRC32), POPCNT e MMX com regras de NaN do x86;
   FXSAVE/FXRSTOR.
+- **JIT ARM64 → AArch64** (`a64_jit.c`): instruções de dados copiadas quase literalmente com os
+  registradores do convidado remapeados, NZCV do convidado = NZCV do host, TLB em linha, loads/stores
+  e SIMD/FP base nativos (com FPCR padrão), LDXR/STXR nativos (com 1 CPU), encadeamento de blocos e
+  cache de saltos; o resto passa por um helper dentro do bloco. `MVM_JIT=0` volta ao interpretador.
 - **JIT x86 → AArch64** (`x86_jit.c`, `a64_asm.h`; só em hosts AArch64): traduz blocos de uma
   página com TLB em linha, flags preguiçosas no formato do interpretador e eliminação de flags
   mortas; registradores do convidado mantidos em registradores do host dentro do bloco;
@@ -259,6 +296,27 @@ mvm-cli -a x86_64 -m 1024 --bios android/app/src/main/assets/bios/OVMF_CODE.fd \
 O firmware é reconhecido pelo volume de firmware ("_FVH") no início da imagem. Com uma versão
 DEBUG do OVMF (`tools/build_ovmf.sh DEBUG`), o log do firmware sai pela porta 0x402 e aparece com
 `-v`.
+
+Boot por UEFI no ARM64 e no ARM 32 bits, com o edk2 ArmVirtQemu embutido no app (gerado por
+`tools/build_aavmf.sh`) ou o do sistema (`apt install qemu-efi-aarch64 qemu-efi-arm`, em
+`/usr/share/AAVMF`). Basta `--bios` sem `--kernel`; discos (`-d`/`-r`) vão como virtio-blk e CDs
+(`--cdrom`) no virtio-scsi. A resolução preferida da virtio-gpu vem de `--fb` (o app usa a proporção da
+tela do aparelho) e muda com a VM ligada pelo comando `display L A` do `--control`:
+
+```sh
+cp android/app/src/main/assets/bios/AAVMF_VARS.fd arm64.vars
+mvm-cli -a arm64 -m 1024 --bios android/app/src/main/assets/bios/AAVMF_CODE.fd \
+    --uefi-vars arm64.vars -r alpine-virt-3.24.2-aarch64.iso
+
+cp android/app/src/main/assets/bios/AAVMF32_VARS.fd arm.vars
+mvm-cli -a arm -m 1024 --bios android/app/src/main/assets/bios/AAVMF32_CODE.fd \
+    --uefi-vars arm.vars -r alpine-virt-3.24.2-armv7.iso
+```
+
+Sem `--uefi-vars`, as variáveis ficam numa flash só na memória. Um firmware de outra arquitetura é
+recusado (o edk2 começa com um desvio para 0x1000 em A64 ou em A32). A tela usa o tamanho de `--fb`
+(padrão 1024x768). Com o firmware do Debian (`/usr/share/AAVMF`), sem o patch, a tela e o teclado só
+funcionam depois que o Linux carrega os drivers; o firmware e o GRUB ficam na serial.
 
 ### Imagens de disco
 
@@ -410,6 +468,14 @@ live para em "Kernel panic ... deadlocked on memory"). No modo live, mais da met
 o desktop é o kernel descompactando o squashfs (xz); instalar o sistema num disco (virtio) evita
 isso.
 
+**Primeiro e segundo plano:** com a tela da VM aberta, as threads da VM (CPUs e E/S) rodam com
+prioridade de primeiro plano (nice -4, como `THREAD_PRIORITY_DISPLAY`), para o Android preferir os
+núcleos rápidos e não trocar a VM por tarefas de fundo; ao sair da tela voltam ao normal. Com a opção
+"Continuar rodando a VM em segundo plano" ligada, um serviço em primeiro plano com notificação fixa
+(Abrir, Pausar/Continuar, Parar) e um wake lock parcial mantêm a VM rodando com o app fora da tela;
+desligada, a VM pausa sozinha ao sair do app e continua ao voltar. Na CLI, `MVM_NICE=n` faz o mesmo
+ajuste de prioridade (API C: `mvm_set_priority`).
+
 O APK de release é assinado com a chave de debug (é só para testes).
 
 ### C
@@ -428,6 +494,7 @@ tests/linux/fetch_images.sh       # baixa kernels Alpine e busybox estático
 tests/linux/run_linux_tests.sh    # boota Linux nas 4 arquiteturas e testa o disco (raw, qcow2, MVD + TRIM)
 tests/img/run_img_tests.sh        # formatos de imagem contra o qemu-img (leitura, escrita, check, quedas)
 tests/uefi/run_uefi_tests.sh      # UEFI: live CD so-EFI, variaveis persistentes, poweroff e reboot
+tests/uefi/run_uefi_arm_tests.sh  # UEFI no ARM64 e ARMv7 (ISOs Alpine virt): EFI, variaveis, PSCI
 tools/pdb_publics.py              # simbolos publicos de PDBs antigos (MSF 7.00, ex.: Windows XP)
 tests/guest/build_bench.sh        # benchmark de CPU (out/bench-*.elf; imprime MIPS ao final)
 tools/prof_report.py PERFIL       # relatorio de MVM_PROF (perfil do host por amostragem)
@@ -450,11 +517,10 @@ tools/pdb_syms.py / pe_pdb_url.py # simbolos publicos de binarios do Windows (se
    flutuante e mais instruções no JIT); vídeo com driver próprio (WDDM/virtio-gpu); MSI no AHCI;
    Windows 11 x64 pelo UEFI (falta TPM 2.0 e Secure Boot) e UEFI no ARM64 (Windows on ARM, BSDs).
 2. **Desempenho**: SSE aritmético e x87 no JIT, mais instruções de sistema no bloco, JIT para
-   os convidados ARM.
+   o ARMv7 (o ARM64 já tem).
 3. **Rede e acesso remoto**: IPv6 no NAT; mouse absoluto (tablet USB/virtio) para o VNC.
-4. **Entrada no ARM**: virtio-input (teclado/mouse) e virtio-gpu.
-5. SMP, NEON no ARMv7, snapshots da VM inteira; imagens diferenciais de VDI/VMDK/VHDX e zstd no qcow2.
-6. Interface de usuário Android completa (já existe um app de teste simples em `android/app`).
+4. NEON no ARMv7, snapshots da VM inteira; imagens diferenciais de VDI/VMDK/VHDX e zstd no qcow2.
+5. Interface de usuário Android completa (já existe um app de teste simples em `android/app`).
 
 ## Licença
 

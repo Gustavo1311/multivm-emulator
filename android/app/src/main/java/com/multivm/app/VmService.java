@@ -60,6 +60,14 @@ public final class VmService extends Service {
         }
     }
 
+    /** servico ativo (so tocado na thread da UI) */
+    private static VmService instance;
+
+    /** Atualiza a notificacao (ex.: a tela da VM abriu ou fechou) se o servico ja estiver ativo. */
+    static void refreshIfRunning() {
+        if (instance != null && instance.vm != null) instance.refresh();
+    }
+
     private static boolean vmAlive() {
         VirtualMachine v = VmHolder.vm;
         if (v == null) return false;
@@ -71,6 +79,7 @@ public final class VmService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        instance = this;
         if (Build.VERSION.SDK_INT >= 26) {
             NotificationChannel ch = new NotificationChannel(CHANNEL, "VM em execução",
                     NotificationManager.IMPORTANCE_LOW);
@@ -163,7 +172,9 @@ public final class VmService extends Service {
                 | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         b.setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle(name)
-                .setContentText(paused ? "Pausada · toque para abrir" : "Rodando em segundo plano · toque para abrir")
+                .setContentText(paused ? "Pausada · toque para abrir"
+                        : VmHolder.screenVisible ? "Rodando em primeiro plano · tela da VM aberta"
+                        : "Rodando em segundo plano · toque para abrir")
                 .setOngoing(true)
                 .setShowWhen(false)
                 .setOnlyAlertOnce(true)
@@ -214,6 +225,7 @@ public final class VmService extends Service {
     @Override
     public void onDestroy() {
         super.onDestroy();
+        if (instance == this) instance = null;
         if (vm != null) vm.removeStateListener(listener);
         vm = null;
         if (wake.isHeld()) wake.release();

@@ -27,6 +27,7 @@
             <Button android:id="@+id/btnMedia" style="@style/ToolButton" android:drawableTop="@drawable/ic_media" android:text="Mídia" />
             <Button android:id="@+id/btnMouse" style="@style/ToolButton" android:drawableTop="@drawable/ic_mouse" android:text="Mouse 1x" />
             <Button android:id="@+id/btnTrackpad" style="@style/ToolButton" android:drawableTop="@drawable/ic_touchpad" android:text="Trackpad" />
+            <Button android:id="@+id/btnZoom" style="@style/ToolButton" android:drawableTop="@drawable/ic_zoom" android:text="Zoom" />
             <Button android:id="@+id/btnRotate" style="@style/ToolButton" android:drawableTop="@drawable/ic_rotate" android:text="Girar" />
             <Button android:id="@+id/btnSound" style="@style/ToolButton" android:drawableTop="@drawable/ic_volume" android:text="Som" />
             <Button android:id="@+id/btnPause" style="@style/ToolButton" android:drawableTop="@drawable/ic_pause" android:text="Pausar" />

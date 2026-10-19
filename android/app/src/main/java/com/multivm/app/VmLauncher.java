@@ -41,8 +41,9 @@ final class VmLauncher {
                 TerminalBuffer term = new TerminalBuffer();
                 vm.addSerialListener(term::feed);
                 VmHolder.set(vm, term, screen[0], s.id, s.name);
-                VmHolder.setMedia(media, AppFiles.isX86(AppFiles.ARCHS[Math.max(0, Math.min(AppFiles.ARCHS.length - 1, s.arch))])
-                        && s.bios && s.sata);
+                /* discos com a VM ligada: SATA no PC, virtio-scsi no ARM com UEFI */
+                boolean x86vm = AppFiles.isX86(AppFiles.ARCHS[Math.max(0, Math.min(AppFiles.ARCHS.length - 1, s.arch))]);
+                VmHolder.setMedia(media, x86vm ? s.bios && s.sata : s.bios && s.uefi);
                 vm.start();
                 String vncError = null;
                 if (s.vnc) {
@@ -94,10 +95,11 @@ final class VmLauncher {
             throw new IllegalArgumentException("memória inválida");
         }
         VmConfig.Builder b = VmConfig.builder(arch).ramMb(mb);
-        if (arch == Architecture.X86_64 || arch == Architecture.I386)
-            b.cpus(Math.max(1, Math.min(VmSettings.CPU_MAX, s.cpus)));
+        b.cpus(Math.max(1, Math.min(VmSettings.CPU_MAX, s.cpus)));
         boolean x86 = AppFiles.isX86(arch);
         boolean bios = x86 && s.bios;
+        /* ARM/ARM64 com firmware: UEFI do edk2 (ArmVirtQemu); a outra opcao e o kernel direto */
+        boolean armUefi = !x86 && s.bios && s.uefi;
         boolean useSata = bios && s.sata;
         List<VmSettings.Media> disks = s.disks();
         List<VmSettings.Media> cds = s.cdroms();
@@ -108,7 +110,7 @@ final class VmLauncher {
                 if (arch != Architecture.X86_64)
                     throw new IllegalArgumentException("UEFI só está disponível para x86-64");
                 b.firmware(new File(dir, "OVMF_CODE.fd").getAbsolutePath());
-                b.uefiVars(uefiVars(a, s, dir).getAbsolutePath());
+                b.uefiVars(uefiVars(a, s, dir, arch).getAbsolutePath());
             } else {
                 b.firmware(new File(dir, "bios-256k.bin").getAbsolutePath());
                 b.vgaBios(new File(dir, "vgabios-stdvga.bin").getAbsolutePath());
@@ -116,6 +118,19 @@ final class VmLauncher {
             if (s.bootOrder != null && !s.bootOrder.isEmpty()) b.bootOrder(s.bootOrder);
             if (disks.isEmpty() && cds.isEmpty() && fds.isEmpty())
                 throw new IllegalArgumentException("adicione uma ISO, um disco ou um disquete para dar boot");
+            screen[0] = true;
+        } else if (armUefi) {
+            File dir = installBios(a);
+            String fw = arch == Architecture.ARM64 ? "AAVMF_CODE.fd" : "AAVMF32_CODE.fd";
+            b.firmware(new File(dir, fw).getAbsolutePath());
+            b.uefiVars(uefiVars(a, s, dir, arch).getAbsolutePath());
+            if (disks.isEmpty() && cds.isEmpty())
+                throw new IllegalArgumentException("adicione uma ISO ou um disco para dar boot");
+            /* tela virtio-gpu (GOP do firmware, depois o driver virtio_gpu do Linux) com teclado e mouse virtio;
+             * a resolucao preferida tem o formato da tela do aparelho, para preencher a tela sem faixas */
+            AppSettings as = AppSettings.load(a);
+            int[] g = as.matchDisplay ? guestSize(a, as) : new int[]{1024, 768};
+            b.framebuffer(g[0], g[1]);
             screen[0] = true;
         } else {
             if (s.kernel == null) throw new IllegalArgumentException("escolha um kernel");
@@ -128,12 +143,7 @@ final class VmLauncher {
             if (addr < 0) throw new IllegalArgumentException("endereço de carga inválido: " + s.rawAddr);
             if (addr > 0) b.rawLoadAddress(addr);
             if (s.fb) {
-                String[] wh = s.fbSize.trim().toLowerCase(Locale.ROOT).split("x");
-                try {
-                    b.framebuffer(Integer.parseInt(wh[0].trim()), Integer.parseInt(wh[1].trim()));
-                } catch (Exception e) {
-                    throw new IllegalArgumentException("framebuffer inválido (use LARGURAxALTURA)");
-                }
+                framebuffer(b, s);
                 screen[0] = true;
             }
         }
@@ -141,7 +151,8 @@ final class VmLauncher {
         boolean useVirtio = bios && !useSata && s.virtio;
         DiskImage.Type hd = useSata ? DiskImage.Type.SATA : useVirtio ? DiskImage.Type.VIRTIO
                 : bios ? DiskImage.Type.IDE : DiskImage.Type.AUTO;
-        DiskImage.Type cd = useSata ? DiskImage.Type.SATA_CDROM : x86 ? DiskImage.Type.CDROM : DiskImage.Type.AUTO;
+        /* no ARM com UEFI os CDs ficam no virtio-scsi (troca de ISO com a VM ligada); no kernel direto, virtio-blk */
+        DiskImage.Type cd = useSata ? DiskImage.Type.SATA_CDROM : x86 || armUefi ? DiskImage.Type.CDROM : DiskImage.Type.AUTO;
         int nHd = 0, nCd = 0, nFd = 0;
         for (VmSettings.Media m : disks)
             if (m.uri != null) {
@@ -166,6 +177,8 @@ final class VmLauncher {
             b.addDisk(DiskImage.emptyCdrom(cd));
             media.get(VmSettings.KIND_CD).add(null);
         }
+        /* ARM com UEFI: o nucleo cria sozinho um CD SCSI vazio quando nao ha ISO */
+        if (armUefi && nCd == 0) media.get(VmSettings.KIND_CD).add(null);
         if (bios && nFd == 0) {
             b.addDisk(DiskImage.emptyFloppy());
             media.get(VmSettings.KIND_FLOPPY).add(null);
@@ -200,6 +213,53 @@ final class VmLauncher {
         return b.build();
     }
 
+    /**
+     * Resolucao do convidado no formato da tela do aparelho. Sempre deitada (paisagem), a nao ser com a
+     * orientacao "Retrato" nos Ajustes: nao depende de como o celular estava ao ligar a VM, e nao muda
+     * ao girar (o Debian ficava em pe quando a VM era ligada com o celular em pe).
+     */
+    static int[] guestSize(Activity a, AppSettings s) {
+        int[] d = displaySize(a);
+        int lo = Math.min(d[0], d[1]), hi = Math.max(d[0], d[1]);
+        return s.orientation == AppSettings.ORIENT_PORTRAIT ? guestSizeFor(lo, hi) : guestSizeFor(hi, lo);
+    }
+
+    /** Tamanho da tela do aparelho na orientacao atual, em pixels (inclui as barras do sistema). */
+    @SuppressWarnings("deprecation")
+    static int[] displaySize(Activity a) {
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            android.graphics.Rect r = a.getWindowManager().getMaximumWindowMetrics().getBounds();
+            return new int[]{r.width(), r.height()};
+        }
+        android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
+        a.getWindowManager().getDefaultDisplay().getRealMetrics(dm);
+        return new int[]{dm.widthPixels, dm.heightPixels};
+    }
+
+    /**
+     * Resolucao do convidado com a proporcao da tela (w x h): o lado menor fica em ate 768 pixels (texto
+     * legivel e pouco trabalho para a CPU emulada), largura multipla de 8.
+     */
+    static int[] guestSizeFor(int w, int h) {
+        if (w <= 0 || h <= 0) return new int[]{1024, 768};
+        int shortSide = Math.min(w, h);
+        float f = Math.max(1f, shortSide / 768f);
+        int gw = Math.round(w / f), gh = Math.round(h / f);
+        gw &= ~7;
+        if (gw < 640 && gw >= gh) gw = 640;
+        if (gh < 480 && gh >= gw) gh = 480;
+        return new int[]{Math.max(gw, 480), Math.max(gh, 480)};
+    }
+
+    private static void framebuffer(VmConfig.Builder b, VmSettings s) {
+        String[] wh = s.fbSize.trim().toLowerCase(Locale.ROOT).split("x");
+        try {
+            b.framebuffer(Integer.parseInt(wh[0].trim()), Integer.parseInt(wh[1].trim()));
+        } catch (Exception e) {
+            throw new IllegalArgumentException("framebuffer inválido (use LARGURAxALTURA)");
+        }
+    }
+
     private static boolean contains(int[] a, int v) {
         for (int x : a) if (x == v) return true;
         return false;
@@ -217,7 +277,8 @@ final class VmLauncher {
     static void checkRam(Activity a, VmSettings s, Runnable go, Runnable cancel) {
         Architecture arch = AppFiles.ARCHS[Math.max(0, Math.min(AppFiles.ARCHS.length - 1, s.arch))];
         List<String> isos = new ArrayList<>();
-        if (AppFiles.isX86(arch) && s.bios)
+        boolean armUefi = !AppFiles.isX86(arch) && s.bios && s.uefi;
+        if ((AppFiles.isX86(arch) && s.bios) || armUefi)
             for (VmSettings.Media m : s.cdroms()) if (m.uri != null) isos.add(m.uri);
         if (isos.isEmpty()) {
             checkRamOnly(a, s, go, cancel);
@@ -248,8 +309,13 @@ final class VmLauncher {
                         .setOnCancelListener(x -> cancel.run());
                 if (wantUefi && arch != Architecture.X86_64) {
                     d.setTitle("Este CD só dá boot por UEFI")
-                            .setMessage("A ISO só tem boot EFI, e o UEFI do MultiVM só existe para x86-64. Com BIOS ela "
-                                    + "vai parar em “Could not read from CDROM (code 0009)”. Mude a arquitetura da VM para x86-64.");
+                            .setMessage("A ISO só tem boot EFI, e o UEFI do MultiVM não existe para PC de 32 bits (i386). "
+                                    + "Com BIOS ela vai parar em “Could not read from CDROM (code 0009)”. Mude a arquitetura "
+                                    + "da VM para x86-64.");
+                } else if (armUefi) {
+                    d.setTitle("Este CD não tem boot UEFI")
+                            .setMessage("A ISO não tem boot EFI: o firmware UEFI não vai achar o que iniciar. Para ARM, "
+                                    + "use uma ISO com UEFI (ex.: Alpine “virt”, Debian) ou o modo Kernel Linux.");
                 } else if (wantUefi) {
                     d.setTitle("Este CD só dá boot por UEFI")
                             .setMessage("A ISO só tem boot EFI. Com BIOS ela vai parar em “Could not read from CDROM "
@@ -276,7 +342,7 @@ final class VmLauncher {
     private static void checkRamOnly(Activity a, VmSettings s, Runnable go, Runnable cancel) {
         List<String> isos = new ArrayList<>();
         boolean x86 = AppFiles.isX86(AppFiles.ARCHS[Math.max(0, Math.min(AppFiles.ARCHS.length - 1, s.arch))]);
-        if (x86 && s.bios)
+        if (s.bios && (x86 || s.uefi))
             for (VmSettings.Media m : s.cdroms()) if (m.uri != null) isos.add(m.uri);
         int mb;
         try {
@@ -382,15 +448,20 @@ final class VmLauncher {
     }
 
     /** Extrai a BIOS embutida (assets/bios) para o armazenamento do app. */
-    /** Variaveis UEFI da VM: na primeira vez, copia o modelo vazio (OVMF_VARS.fd). */
-    private static File uefiVars(Activity a, VmSettings s, File biosDir) throws IOException {
+    /**
+     * Variaveis UEFI da VM: na primeira vez, copia o modelo vazio da arquitetura (OVMF_VARS.fd no x86-64,
+     * AAVMF_VARS.fd no ARM64, AAVMF32_VARS.fd no ARM). Cada arquitetura tem o seu arquivo.
+     */
+    private static File uefiVars(Activity a, VmSettings s, File biosDir, Architecture arch) throws IOException {
         if (s.id == null) throw new IOException("salve a VM antes de iniciar com UEFI");
-        File f = VmSettings.uefiVarsFile(a, s.id);
+        File f = VmSettings.uefiVarsFile(a, s.id, arch);
+        String model = arch == Architecture.ARM64 ? "AAVMF_VARS.fd" : arch == Architecture.ARM ? "AAVMF32_VARS.fd"
+                : "OVMF_VARS.fd";
         if (f.isFile() && f.length() > 0) return f;
         File parent = f.getParentFile();
         if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new IOException("não consegui criar " + parent);
         File tmp = new File(parent, f.getName() + ".tmp");
-        try (InputStream in = new java.io.FileInputStream(new File(biosDir, "OVMF_VARS.fd"));
+        try (InputStream in = new java.io.FileInputStream(new File(biosDir, model));
              OutputStream os = new FileOutputStream(tmp)) {
             copy(in, os);
         }

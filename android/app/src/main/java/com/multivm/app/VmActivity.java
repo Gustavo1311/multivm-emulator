@@ -56,7 +56,7 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
     private int sensIdx;
     private MediaPanel mediaPanel;
     private TrackpadView trackpad;
-    private Button btnTrackpad, btnRotate, btnKeys;
+    private Button btnTrackpad, btnRotate, btnKeys, btnZoom;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final TerminalBuffer.Snapshot seen = new TerminalBuffer.Snapshot();
@@ -71,6 +71,10 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
     private AppSettings prefs;
     private int frameMs = 33;
     private long lastInsns, lastStatusTime;
+    /* teclado virtio (ARM): ultima contagem vista e o aviso a mostrar por alguns segundos */
+    private int kbdOk = -1, kbdDrop = -1;
+    private String kbdNote;
+    private long kbdNoteUntil;
     private boolean ended;
 
     private final VirtualMachine.StateListener stateListener = (v, state, reason) ->
@@ -106,7 +110,23 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
             return;
         }
         prefs = AppSettings.load(this);
+        /* em tela cheia a imagem tambem ocupa a area do entalhe da camera */
+        if (Build.VERSION.SDK_INT >= 28) {
+            WindowManager.LayoutParams lp = getWindow().getAttributes();
+            lp.layoutInDisplayCutoutMode = Build.VERSION.SDK_INT >= 30
+                    ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            getWindow().setAttributes(lp);
+        }
         setContentView(R.layout.activity_vm);
+        if (Build.VERSION.SDK_INT >= 30) {
+            /* em tela cheia o sistema nao encaixa mais o conteudo: o teclado virtual empurra a tela aqui */
+            findViewById(android.R.id.content).setOnApplyWindowInsetsListener((v, in) -> {
+                int ime = fullscreen ? in.getInsets(WindowInsets.Type.ime()).bottom : 0;
+                if (v.getPaddingBottom() != ime) v.setPadding(0, 0, 0, ime);
+                return in;
+            });
+        }
         if (prefs.orientation == AppSettings.ORIENT_LANDSCAPE)
             setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         else if (prefs.orientation == AppSettings.ORIENT_PORTRAIT)
@@ -172,6 +192,9 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
         findViewById(R.id.btnMedia).setOnClickListener(v -> mediaPanel.show());
         btnTrackpad = findViewById(R.id.btnTrackpad);
         btnTrackpad.setOnClickListener(v -> setTrackpad(trackpad == null));
+        btnZoom = findViewById(R.id.btnZoom);
+        btnZoom.setOnClickListener(v -> showZoomMenu());
+        screen.setZoomListener(z -> updateZoomLabel());
         btnRotate = findViewById(R.id.btnRotate);
         btnRotate.setOnClickListener(v -> rotate());
         btnRotate.setOnLongClickListener(v -> {
@@ -199,6 +222,7 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
         vm.addStateListener(stateListener);
         setTerminal(!VmHolder.hasScreen);
         if (prefs.startFullscreen) screen.post(() -> setFullscreen(true));
+        screen.post(this::sendDisplayHint);
         if (prefs.trackpadOnStart && VmHolder.hasScreen) screen.post(() -> setTrackpad(true));
         if (vm.getState() == VirtualMachine.State.STOPPED) onVmState(vm.getState(), vm.getLastExitReason());
     }
@@ -219,6 +243,7 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
         frameMs = 1000 / AppSettings.FPS[prefs.fps];
         screen.applySettings(prefs);
         applyMouseSpeed();
+        sendDisplayHint();
         if (prefs.keepScreenOn) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         /* a VM pode ter sido pausada/continuada pela tela inicial */
@@ -233,6 +258,34 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
         super.onPause();
         ui.removeCallbacks(frame);
         ui.removeCallbacks(statusTick);
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        setVmForeground(true);
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        /* rotacao recria a tela: a VM continua em primeiro plano */
+        if (!isChangingConfigurations()) setVmForeground(false);
+    }
+
+    /** Tela da VM visivel: threads da VM em prioridade de primeiro plano (e notificacao atualizada). */
+    private void setVmForeground(boolean fg) {
+        VmHolder.screenVisible = fg;
+        VirtualMachine v = VmHolder.vm;
+        if (v != null && (vm == null || v == vm)) {
+            try {
+                v.setForeground(fg);
+            } catch (RuntimeException ignored) {
+                /* VM fechando */
+            }
+        }
+        if (fg) VmService.sync(this);
+        else VmService.refreshIfRunning();
     }
 
     @Override
@@ -252,6 +305,66 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
     public void onConfigurationChanged(Configuration c) {
         super.onConfigurationChanged(c);
         if (trackpad != null) trackpad.keepInside();
+    }
+
+    /** Pede ao convidado uma resolucao com a proporcao da tela do aparelho (so a placa ARM com UEFI atende).
+     *  Nao acompanha a rotacao: o convidado fica sempre na mesma orientacao (ver VmLauncher.guestSize). */
+    private void sendDisplayHint() {
+        if (vm == null || prefs == null || !prefs.matchDisplay || ended) return;
+        int[] g = VmLauncher.guestSize(this, prefs);
+        try {
+            vm.setDisplayHint(g[0], g[1]);
+        } catch (RuntimeException ignored) {
+            /* VM ja fechada */
+        }
+    }
+
+    /* ---- zoom e escala ---- */
+
+    private void updateZoomLabel() {
+        float z = screen.zoom();
+        btnZoom.setText(z > 1.01f ? String.format(Locale.ROOT, "Zoom %.1fx", z).replace(".0x", "x") : "Zoom");
+    }
+
+    private void showZoomMenu() {
+        android.widget.PopupMenu pm = new android.widget.PopupMenu(this, btnZoom);
+        android.view.Menu m = pm.getMenu();
+        m.add(0, 1, 0, "Ampliar 2x");
+        m.add(0, 2, 1, "Ampliar 3x");
+        m.add(0, 3, 2, "Tamanho normal (sem zoom)").setEnabled(screen.zoom() > 1f);
+        String[] short_ = {"Ajustar à tela", "Esticar (preenche a tela)", "Múltiplo inteiro", "Tamanho original",
+                "Preencher a tela (corta as bordas)"};
+        for (int i = 0; i < short_.length; i++)
+            m.add(1, 10 + i, 10 + i, short_[i]).setCheckable(true).setChecked(prefs.scale == i);
+        m.setGroupCheckable(1, true, true);
+        m.add(2, 20, 20, "Como usar o zoom…");
+        pm.setOnMenuItemClickListener(it -> {
+            int id = it.getItemId();
+            float cx = screen.getWidth() / 2f, cy = screen.getHeight() / 2f;
+            if (id == 1) screen.setZoom(2f, cx, cy);
+            else if (id == 2) screen.setZoom(3f, cx, cy);
+            else if (id == 3) screen.resetZoom();
+            else if (id >= 10 && id < 10 + short_.length) {
+                prefs.scale = id - 10;
+                prefs.save(this);
+                screen.applySettings(prefs);
+                screen.resetZoom();
+            } else if (id == 20) {
+                new AlertDialog.Builder(this).setTitle("Zoom")
+                        .setMessage("• Pinça: afaste ou aproxime dois dedos para ampliar ou reduzir.\n"
+                                + "• Com os dois dedos ainda na tela, mova-os para andar pela imagem ampliada.\n"
+                                + "• Três dedos arrastam a imagem a qualquer momento.\n"
+                                + "• Dois dedos andando juntos continuam sendo a roda do mouse, e um toque com dois "
+                                + "dedos é o clique direito.\n\n"
+                                + "Para a imagem preencher a tela toda: use a tela cheia (botão Voltar) e escolha "
+                                + "“Esticar” ou “Preencher a tela” aqui. Na VM ARM com UEFI a resolução do sistema já "
+                                + "segue o formato da tela do aparelho.")
+                        .setPositiveButton("OK", null).show();
+            }
+            updateZoomLabel();
+            return true;
+        });
+        pm.show();
     }
 
     @Override
@@ -305,6 +418,10 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
     @SuppressWarnings("deprecation")
     private void applySystemBars() {
         if (Build.VERSION.SDK_INT >= 30) {
+            /* tela cheia: o conteudo vai ate as bordas (por baixo das barras escondidas e do entalhe) */
+            getWindow().setDecorFitsSystemWindows(!fullscreen);
+            View content = findViewById(android.R.id.content);
+            if (content != null) content.requestApplyInsets();
             WindowInsetsController c = getWindow().getInsetsController();
             if (c == null) return;
             if (fullscreen) {
@@ -316,7 +433,8 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
         } else {
             getWindow().getDecorView().setSystemUiVisibility(fullscreen
                     ? View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY : 0);
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE : 0);
         }
     }
 
@@ -354,10 +472,24 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
 
     /** Alterna paisagem/retrato (toque longo: volta a girar com o aparelho). */
     private void rotate() {
-        boolean landscape = getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
+        /* a Configuration do contexto do tema (AppSettings.wrap) fica presa na orientacao inicial:
+         * usa o ultimo pedido, ou o tamanho real da janela */
+        int req = getRequestedOrientation();
+        boolean landscape;
+        if (req == ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE) landscape = true;
+        else if (req == ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT) landscape = false;
+        else landscape = isLandscapeNow();
         setRequestedOrientation(landscape ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
                 : ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         btnRotate.setText(landscape ? "Retrato" : "Paisagem");
+    }
+
+    private boolean isLandscapeNow() {
+        View d = getWindow().getDecorView();
+        if (d.getWidth() > 0 && d.getHeight() > 0) return d.getWidth() > d.getHeight();
+        android.graphics.Point p = new android.graphics.Point();
+        getWindowManager().getDefaultDisplay().getRealSize(p);
+        return p.x > p.y;
     }
 
     private void confirm(String msg, Runnable action) {
@@ -447,6 +579,19 @@ public class VmActivity extends BaseActivity implements ScreenView.InputSink {
         String res = screen.resolution();
         if (res != null) sb.append("  ").append(res);
         if (vm.getConfig().hasMicrophone()) sb.append("  🎤");
+        int[] ks = vm.getKeyboardStats();
+        if (ks != null) {
+            if (kbdOk >= 0 && ks[1] != kbdDrop) {
+                kbdNote = "teclado: sem driver no convidado";
+                kbdNoteUntil = now + 8000;
+            } else if (kbdOk >= 0 && ks[0] != kbdOk) {
+                kbdNote = "teclado: " + ks[0] + " teclas entregues";
+                kbdNoteUntil = now + 8000;
+            }
+            kbdOk = ks[0];
+            kbdDrop = ks[1];
+            if (kbdNote != null && now < kbdNoteUntil) sb.append("  ").append(kbdNote);
+        }
         if (vm.isVncRunning()) {
             VmSettings s = VmSettings.find(this, VmHolder.vmId);
             String host = s != null && s.vncLan ? VmLauncher.lanAddress() : "127.0.0.1";

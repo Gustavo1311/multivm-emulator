@@ -200,7 +200,7 @@
                     <TextView
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:text="Para Linux, 2 processadores deixam o boot e o desktop bem mais rápidos (o boot de uma ISO live fica cerca de 40% mais curto). Use no máximo os núcleos rápidos do celular (normalmente 2 a 4); cada processador a mais deixa cada um um pouco mais lento, então para um programa só, 1 é melhor. Dica: uma ISO live descomprime o sistema a cada boot; instalado num disco virtual, o mesmo Linux inicia até 2,5 vezes mais rápido. Sistemas instalados com 1 processador (como o Windows XP) continuam usando 1."
+                        android:text="Para Linux, 2 processadores deixam o boot e o desktop bem mais rápidos (o boot de uma ISO live fica cerca de 40% mais curto). No ARM64, 4 processadores sobem a área de trabalho (Debian com Xfce) cerca de 2 vezes mais rápido. No ARM 32 bits, 4 tarefas em paralelo rodam cerca de 4 vezes mais rápido com 4 processadores. Use no máximo os núcleos rápidos do celular (normalmente 2 a 4); cada processador a mais deixa cada um um pouco mais lento, então para um programa só, 1 é melhor. Dica: uma ISO live descomprime o sistema a cada boot; instalado num disco virtual, o mesmo Linux inicia até 2,5 vezes mais rápido. Sistemas instalados com 1 processador (como o Windows XP) continuam usando 1."
                         android:textColor="@color/text2"
                         android:textSize="12sp" />
                 </LinearLayout>
@@ -372,25 +372,6 @@
                             android:orientation="horizontal" />
                     </HorizontalScrollView>
 
-                    <CheckBox
-                        android:id="@+id/fbEnable"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="Tela gráfica (framebuffer)" />
-
-                    <Spinner
-                        android:id="@+id/fbRes"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content" />
-
-                    <EditText
-                        android:id="@+id/fbSize"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:hint="LARGURAxALTURA"
-                        android:inputType="text"
-                        android:text="800x600" />
-
                     <!-- opcoes avancadas do boot direto (sobretudo ARM/ARM64) -->
                     <LinearLayout
                         android:id="@+id/dtbGroup"
@@ -420,6 +401,33 @@
                         android:fontFamily="monospace"
                         android:hint="ex.: 0x40080000"
                         android:inputType="text|textNoSuggestions" />
+                </LinearLayout>
+
+                <!-- tela grafica: boot direto de kernel e UEFI no ARM (o Linux usa o simple-framebuffer) -->
+                <LinearLayout
+                    android:id="@+id/fbGroup"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical">
+
+                    <CheckBox
+                        android:id="@+id/fbEnable"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Tela gráfica (framebuffer)" />
+
+                    <Spinner
+                        android:id="@+id/fbRes"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content" />
+
+                    <EditText
+                        android:id="@+id/fbSize"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:hint="LARGURAxALTURA"
+                        android:inputType="text"
+                        android:text="800x600" />
                 </LinearLayout>
             </LinearLayout>
 
