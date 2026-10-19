@@ -7,14 +7,27 @@ static inline uint16_t rd16(virtio_dev *d, uint64_t a) { return (uint16_t)space_
 static inline uint32_t rd32(virtio_dev *d, uint64_t a) { return (uint32_t)space_read(&d->vm->mem, a, 4); }
 static inline uint64_t rd64(virtio_dev *d, uint64_t a) { return space_read(&d->vm->mem, a, 8); }
 
+static void reset_locked(virtio_dev *d);
+
 void virtio_reset(virtio_dev *d)
+{
+    if (d->own_lock)
+        pthread_mutex_lock(&d->mu);
+    reset_locked(d);
+    if (d->own_lock)
+        pthread_mutex_unlock(&d->mu);
+    if (atomic_exchange(&d->irq_dirty, 0))
+        irq_set(&d->irq, __atomic_load_n(&d->isr, __ATOMIC_SEQ_CST) ? 1 : 0); /* quem reseta segura a bql */
+}
+
+static void reset_locked(virtio_dev *d)
 {
     d->status = 0;
     d->isr = 0;
     d->guest_features = 0;
     for (int i = 0; i < VIRTIO_MAX_QUEUES; i++) {
         virtq *q = &d->vq[i];
-        q->num = 0;
+        q->num = q->num_max; /* como no QEMU: o VirtioGpuDxe do edk2 nao grava QueueNum */
         q->ready = false;
         q->desc = q->avail = q->used = 0;
         q->last_avail = 0;
@@ -24,17 +37,44 @@ void virtio_reset(virtio_dev *d)
     virtio_update_irq(d);
 }
 
-void virtio_update_irq(virtio_dev *d) { irq_set(&d->irq, d->isr ? 1 : 0); }
+void virtio_update_irq(virtio_dev *d)
+{
+    if (d->own_lock && !vm_bql_held()) { /* com a trava do dispositivo: depois, com a bql */
+        atomic_store(&d->irq_dirty, 1);
+        return;
+    }
+    irq_set(&d->irq, __atomic_load_n(&d->isr, __ATOMIC_SEQ_CST) ? 1 : 0);
+}
+
+void virtio_set_own_lock(virtio_dev *d)
+{
+    pthread_mutex_init(&d->mu, NULL);
+    d->own_lock = true;
+}
+
+/* interrupcao adiada enquanto a trava do dispositivo estava presa */
+static void irq_flush(virtio_dev *d)
+{
+    if (!atomic_load(&d->irq_dirty))
+        return;
+    mvm_vm *vm = d->vm;
+    vm_bql_lock(vm);
+    if (atomic_exchange(&d->irq_dirty, 0))
+        irq_set(&d->irq, __atomic_load_n(&d->isr, __ATOMIC_SEQ_CST) ? 1 : 0);
+    vm_bql_unlock(vm);
+}
 
 void virtio_notify_irq(virtio_dev *d)
 {
-    d->isr |= 1;
+    __atomic_fetch_or(&d->isr, 1, __ATOMIC_SEQ_CST);
     virtio_update_irq(d);
 }
 
 bool virtq_pop(virtio_dev *d, int qi, virtq_elem *e)
 {
     virtq *q = &d->vq[qi];
+    if (!q->num && q->ready) /* fila ativada sem QueueNum (antes de qualquer reset): tamanho maximo */
+        q->num = q->num_max;
     if (!q->ready || !q->num)
         return false;
     uint16_t avail_idx = rd16(d, q->avail + 2);
@@ -148,7 +188,7 @@ typedef struct {
     uint32_t dev_feat_sel, drv_feat_sel, queue_sel;
 } vmmio;
 
-static uint64_t vmmio_read(void *opaque, uint64_t off, unsigned size)
+static uint64_t vmmio_read_l(void *opaque, uint64_t off, unsigned size)
 {
     vmmio *m = opaque;
     virtio_dev *d = m->d;
@@ -165,12 +205,16 @@ static uint64_t vmmio_read(void *opaque, uint64_t off, unsigned size)
     case 0x044: return q ? q->ready : 0;
     case 0x060: return d->isr;
     case 0x070: return d->status;
+    case 0x0b0: case 0x0b4: /* SHMLen: nenhuma regiao de memoria compartilhada (~0, como manda a especificacao) */
+        return 0xffffffffu;
+    case 0x0b8: case 0x0bc:
+        return 0xffffffffu;
     case 0x0fc: return d->cfg_gen;
     default: return 0;
     }
 }
 
-static void vmmio_write(void *opaque, uint64_t off, uint64_t val, unsigned size)
+static void vmmio_write_l(void *opaque, uint64_t off, uint64_t val, unsigned size)
 {
     vmmio *m = opaque;
     virtio_dev *d = m->d;
@@ -198,12 +242,12 @@ static void vmmio_write(void *opaque, uint64_t off, uint64_t val, unsigned size)
             d->notify(d, (int)v);
         break;
     case 0x064:
-        d->isr &= ~v;
+        __atomic_fetch_and(&d->isr, ~v, __ATOMIC_SEQ_CST);
         virtio_update_irq(d);
         break;
     case 0x070:
         if (v == 0) {
-            virtio_reset(d);
+            reset_locked(d);
             m->dev_feat_sel = m->drv_feat_sel = m->queue_sel = 0;
         } else {
             d->status = v;
@@ -217,6 +261,31 @@ static void vmmio_write(void *opaque, uint64_t off, uint64_t val, unsigned size)
     case 0x0a4: if (q) q->used = (q->used & 0xffffffffULL) | ((uint64_t)v << 32); break;
     default: break;
     }
+}
+
+static uint64_t vmmio_read(void *opaque, uint64_t off, unsigned size)
+{
+    virtio_dev *d = ((vmmio *)opaque)->d;
+    if (!d->own_lock)
+        return vmmio_read_l(opaque, off, size);
+    pthread_mutex_lock(&d->mu);
+    uint64_t v = vmmio_read_l(opaque, off, size);
+    pthread_mutex_unlock(&d->mu);
+    irq_flush(d);
+    return v;
+}
+
+static void vmmio_write(void *opaque, uint64_t off, uint64_t val, unsigned size)
+{
+    virtio_dev *d = ((vmmio *)opaque)->d;
+    if (!d->own_lock) {
+        vmmio_write_l(opaque, off, val, size);
+        return;
+    }
+    pthread_mutex_lock(&d->mu);
+    vmmio_write_l(opaque, off, val, size);
+    pthread_mutex_unlock(&d->mu);
+    irq_flush(d);
 }
 
 /* A maquina cria o estado do transporte com virtio_mmio_wrap(). */

@@ -195,10 +195,26 @@ void x86_tlb_flush(x86_cpu *c)
         x86_jit_tlb_flushed(c->jit);
 }
 
-/* paginas sujas de VRAM foram consumidas: as escritas nelas voltam ao caminho lento */
+/* paginas sujas de VRAM foram consumidas: as escritas nelas voltam ao caminho lento.
+ * Com SMP e chamada (pelo desenho, na thread da CPU 0) para TODAS as CPUs: a lista e as
+ * entradas de outra CPU mudam ao mesmo tempo, entao a leitura e o OR sao atomicos (como em
+ * x86_tlb_protect_page_remote); no pior caso uma entrada refeita agora escapa, mas ela
+ * nasce do caminho lento, que marca a pagina como suja de novo. */
 static void x86_tlb_protect(void *opaque, const uint8_t *host, size_t len)
 {
     x86_cpu *c = opaque;
+    if (c->smp) {
+        unsigned n = __atomic_load_n(&c->tlb_nused, __ATOMIC_ACQUIRE);
+        for (unsigned i = 0; i < n; i++) {
+            x86_tlbe *e = TLB_E(c, __atomic_load_n(&c->tlb_used[i], __ATOMIC_RELAXED));
+            uint64_t tw = __atomic_load_n(&e->tag_w, __ATOMIC_RELAXED);
+            uintptr_t addend = __atomic_load_n(&e->addend, __ATOMIC_RELAXED);
+            if (!(tw & (XTLB_INVALID | XTLB_IO)) &&
+                (addend + (tw & ~0xfffULL)) - (uintptr_t)host < len)
+                __atomic_fetch_or(&e->tag_w, (uint64_t)XTLB_IO, __ATOMIC_SEQ_CST);
+        }
+        return;
+    }
     for (unsigned n = 0; n < c->tlb_nused; n++) {
         x86_tlbe *e = TLB_E(c, c->tlb_used[n]);
         if (!(e->tag_w & (XTLB_INVALID | XTLB_IO)) &&

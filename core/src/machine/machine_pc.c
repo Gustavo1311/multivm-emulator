@@ -1131,7 +1131,7 @@ static void pc_input(mvm_vm *vm, const mvm_input_event *ev)
         i8042_key(m->kbd, ev->code, ev->pressed);
     else if (ev->type == 2)
         acpi_pm_power_button(m->pm);
-    else
+    else if (ev->type == 1)
         i8042_mouse(m->kbd, ev->dx, ev->dy, ev->dz, ev->buttons);
 }
 

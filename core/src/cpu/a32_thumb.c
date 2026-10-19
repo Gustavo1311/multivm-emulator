@@ -339,23 +339,12 @@ static void t32_dual_excl(a32_cpu *c, uint32_t h1, uint32_t h2)
     unsigned rn = BITS(h1, 3, 0), rt = BITS(h2, 15, 12), rt2 = BITS(h2, 11, 8), rd = BITS(h2, 3, 0);
     if (op1 == 0 && op2 == 0) { /* STREX */
         uint32_t addr = R(c, rn) + (h2 & 0xff) * 4;
-        uint32_t st = 1;
-        if (c->excl_valid && c->excl_addr == addr && c->excl_size == 4) {
-            a32_wr(c, addr, R(c, rt), 4);
-            st = 0;
-        }
-        c->excl_valid = false;
-        c->r[rt2] = st;
+        c->r[rt2] = a32_strex(c, addr, 4, R(c, rt), 0);
         return;
     }
     if (op1 == 0 && op2 == 1) { /* LDREX */
         uint32_t addr = R(c, rn) + (h2 & 0xff) * 4;
-        uint32_t v = a32_rd(c, addr, 4);
-        c->r[rt] = v;
-        c->excl_addr = addr;
-        c->excl_val = v;
-        c->excl_size = 4;
-        c->excl_valid = true;
+        c->r[rt] = a32_ldrex(c, addr, 4, NULL);
         return;
     }
     if ((op1 & 2) || op2 >= 2) { /* LDRD/STRD */
@@ -379,18 +368,8 @@ static void t32_dual_excl(a32_cpu *c, uint32_t h1, uint32_t h2)
     if (op1 == 1 && op2 == 0) { /* STREXB/H/D */
         unsigned sz = op3 == 4 ? 1 : op3 == 5 ? 2 : op3 == 7 ? 8 : 0;
         if (!sz) a32_undef(c);
-        uint32_t addr = R(c, rn), st = 1;
-        if (c->excl_valid && c->excl_addr == addr && c->excl_size == (int)sz) {
-            if (sz == 8) {
-                a32_wr(c, addr, R(c, rt), 4);
-                a32_wr(c, addr + 4, R(c, rt2), 4);
-            } else {
-                a32_wr(c, addr, R(c, rt), sz);
-            }
-            st = 0;
-        }
-        c->excl_valid = false;
-        c->r[rd] = st;
+        uint32_t addr = R(c, rn);
+        c->r[rd] = a32_strex(c, addr, sz, R(c, rt), sz == 8 ? R(c, rt2) : 0);
         return;
     }
     if (op1 == 1 && op2 == 1) {
@@ -402,20 +381,11 @@ static void t32_dual_excl(a32_cpu *c, uint32_t h1, uint32_t h2)
         }
         unsigned sz = op3 == 4 ? 1 : op3 == 5 ? 2 : op3 == 7 ? 8 : 0;
         if (!sz) a32_undef(c);
-        uint32_t addr = R(c, rn);
-        if (sz == 8) {
-            uint32_t lo = a32_rd(c, addr, 4), hi = a32_rd(c, addr + 4, 4);
-            c->r[rt] = lo;
+        uint32_t addr = R(c, rn), hi;
+        uint32_t lo = a32_ldrex(c, addr, sz, &hi);
+        c->r[rt] = lo;
+        if (sz == 8)
             c->r[rt2] = hi;
-            c->excl_val = ((uint64_t)hi << 32) | lo;
-        } else {
-            uint32_t v = a32_rd(c, addr, sz);
-            c->r[rt] = v;
-            c->excl_val = v;
-        }
-        c->excl_addr = addr;
-        c->excl_size = (int)sz;
-        c->excl_valid = true;
         return;
     }
     a32_undef(c);

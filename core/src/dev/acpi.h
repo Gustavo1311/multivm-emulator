@@ -34,6 +34,20 @@ typedef struct {
 } acpi_tables;
 
 void acpi_build(acpi_tables *t, const acpi_config *cfg);
+
+/* maquina ARM "virt" (ARM64 com UEFI): o edk2 entrega so o ACPI ao sistema, como no QEMU */
+#define ACPI_ARM_MAX_VIRTIO 32
+typedef struct {
+    uint64_t gicd, gicc;          /* GICv2: distribuidor e interface de CPU */
+    uint64_t uart;                /* PL011 */
+    uint32_t uart_gsiv;
+    uint64_t fw_cfg;              /* 0 = sem fw_cfg no DSDT */
+    uint64_t virtio_base;         /* slots virtio-mmio consecutivos */
+    uint32_t virtio_size, virtio_gsiv, nvirtio;
+    uint32_t timer_gsiv[4];       /* EL1 seguro, EL1 nao seguro, virtual, EL2 (PPIs) */
+    uint32_t ncpus;               /* processadores (MPIDR.Aff0 = 0..ncpus-1) */
+} acpi_arm_config;
+void acpi_build_arm(acpi_tables *t, const acpi_arm_config *cfg);
 void acpi_tables_free(acpi_tables *t);
 /* boot direto: grava as tabelas ja ligadas na RAM do convidado */
 void acpi_install(acpi_tables *t, uint8_t *ram, uint64_t rsdp_addr, uint64_t tables_addr);

@@ -724,13 +724,24 @@ static void render(vga *v, bool full)
     mvm_vm *vm = v->vm;
     int mode = cur_mode(v);
     bool any = false;
-    for (uint32_t i = 0; i < v->dirty_words; i++) {
-        v->snap[i] = __atomic_exchange_n(&v->dirty[i], 0, __ATOMIC_RELAXED);
-        any |= v->snap[i] != 0;
+    for (uint32_t i = 0; i < v->dirty_words && !any; i++)
+        any = __atomic_load_n(&v->dirty[i], __ATOMIC_RELAXED) != 0;
+    /* as proximas escritas nessas paginas precisam passar de novo pelo caminho lento, em
+     * TODAS as CPUs (antes so a CPU 0: com SMP as outras seguiam escrevendo direto sem marcar
+     * a pagina e a tela parava de atualizar o que elas desenhavam). Protege ANTES de zerar
+     * os bits: uma escrita rapida que chegue antes ainda cai numa pagina marcada, desenhada
+     * agora; depois da protecao, as escritas marcam a pagina para o proximo quadro. */
+    if (any && vm->cpu_ops && vm->cpu_ops->tlb_protect) {
+        int n = vm->ncpus > 0 ? vm->ncpus : 1;
+        for (int i = 0; i < n; i++) {
+            void *cpu = n > 1 ? vm->vcpu[i].cpu : vm->cpu;
+            if (cpu)
+                vm->cpu_ops->tlb_protect(cpu, v->vram, v->vram_size);
+        }
     }
-    /* as proximas escritas nessas paginas precisam passar de novo pelo caminho lento */
-    if (any && vm->cpu_ops && vm->cpu_ops->tlb_protect)
-        vm->cpu_ops->tlb_protect(vm->cpu, v->vram, v->vram_size);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    for (uint32_t i = 0; i < v->dirty_words; i++)
+        v->snap[i] = __atomic_exchange_n(&v->dirty[i], 0, __ATOMIC_RELAXED);
     if (mode != v->drawn_mode)
         full = true;
     const uint64_t *snap = full ? NULL : v->snap;

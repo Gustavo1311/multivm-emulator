@@ -24,6 +24,7 @@ set(MVM_CORE_SOURCES
   ${CMAKE_CURRENT_LIST_DIR}/src/loader.c
   ${CMAKE_CURRENT_LIST_DIR}/src/cpu/arm_common.c
   ${CMAKE_CURRENT_LIST_DIR}/src/cpu/cpu_arm64.c
+  ${CMAKE_CURRENT_LIST_DIR}/src/cpu/a64_jit.c
   ${CMAKE_CURRENT_LIST_DIR}/src/cpu/a64_simd.c
   ${CMAKE_CURRENT_LIST_DIR}/src/cpu/cpu_arm32.c
   ${CMAKE_CURRENT_LIST_DIR}/src/cpu/a32_thumb.c
@@ -45,7 +46,10 @@ set(MVM_CORE_SOURCES
   ${CMAKE_CURRENT_LIST_DIR}/src/dev/pflash.c
   ${CMAKE_CURRENT_LIST_DIR}/src/dev/eeprom93.c
   ${CMAKE_CURRENT_LIST_DIR}/src/dev/virtio_net.c
+  ${CMAKE_CURRENT_LIST_DIR}/src/dev/virtio_input.c
+  ${CMAKE_CURRENT_LIST_DIR}/src/dev/virtio_gpu.c
   ${CMAKE_CURRENT_LIST_DIR}/src/dev/virtio_snd.c
+  ${CMAKE_CURRENT_LIST_DIR}/src/dev/virtio_scsi.c
   ${CMAKE_CURRENT_LIST_DIR}/src/dev/rtl8139.c
   ${CMAKE_CURRENT_LIST_DIR}/src/dev/e1000.c
   ${CMAKE_CURRENT_LIST_DIR}/src/net/net.c

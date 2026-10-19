@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <strings.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <time.h>
 
 int64_t timers_run(mvm_vm *vm);
@@ -105,10 +108,6 @@ mvm_vm *mvm_create(const mvm_config *cfg, char *err, size_t errlen)
         snprintf(err, errlen, "arquitetura invalida");
         return NULL;
     }
-    if (cfg->cpus > 1 && cfg->arch != MVM_ARCH_X86_64 && cfg->arch != MVM_ARCH_I386) {
-        snprintf(err, errlen, "varios processadores so no x86 (por enquanto)");
-        return NULL;
-    }
     if (cfg->cpus > MVM_MAX_CPUS) {
         snprintf(err, errlen, "processadores demais (%u; maximo %d)", cfg->cpus, MVM_MAX_CPUS);
         return NULL;
@@ -120,6 +119,7 @@ mvm_vm *mvm_create(const mvm_config *cfg, char *err, size_t errlen)
 
     mvm_vm *vm = calloc(1, sizeof(*vm));
     vm->cfg = *cfg;
+    atomic_init(&vm->prio, MVM_PRIO_KEEP);
     vm->s_kernel = dupstr(cfg->kernel);
     vm->s_initrd = dupstr(cfg->initrd);
     vm->s_cmdline = dupstr(cfg->cmdline);
@@ -369,6 +369,8 @@ void vm_bql_unlock(mvm_vm *vm)
     pthread_mutex_unlock(&vm->bql);
 }
 
+bool vm_bql_held(void) { return tls_bql_depth > 0; }
+
 int vm_cpu_index(mvm_vm *vm) { return tls_cpu_vm == vm ? tls_cpu_idx : -1; }
 
 bool vm_is_cpu_thread(mvm_vm *vm, int idx)
@@ -382,6 +384,12 @@ int vm_add_cpu(mvm_vm *vm, void *cpu)
     struct vm_vcpu *v = &vm->vcpu[i];
     v->cpu = cpu;
     pthread_mutex_init(&v->work_lock, NULL);
+    pthread_mutex_init(&v->wait_lock, NULL);
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC); /* vcpu_wait calcula o prazo nesse relogio */
+    pthread_cond_init(&v->wait_cond, &ca);
+    pthread_condattr_destroy(&ca);
     if (i == 0)
         vm->cpu = cpu;
     return i;
@@ -395,12 +403,37 @@ void vm_cpu_kick(mvm_vm *vm, int idx)
         vm_kick(vm, true);
         return;
     }
-    atomic_store(&vm->vcpu[idx].exit_req, 1);
+    struct vm_vcpu *v = &vm->vcpu[idx];
+    atomic_store(&v->exit_req, 1);
+    atomic_store(&v->wake, 1);
+    if (!atomic_load(&v->sleeping))
+        return; /* rodando: a marca de saida basta */
     atomic_fetch_add(&st_cpukick, 1);
-    pthread_mutex_lock(&vm->lock);
-    atomic_store(&vm->vcpu[idx].wake, 1);
-    pthread_cond_broadcast(&vm->cond);
-    pthread_mutex_unlock(&vm->lock);
+    pthread_mutex_lock(&v->wait_lock);
+    pthread_cond_signal(&v->wait_cond);
+    pthread_mutex_unlock(&v->wait_lock);
+}
+
+/* CPU extra parada (HLT/WFI, desligada, pausa): dorme ate o prazo ou ate vm_cpu_kick */
+static void vcpu_wait(struct vm_vcpu *v, int64_t host_deadline)
+{
+    int64_t delta = host_deadline - host_clock_ns();
+    if (delta < 0)
+        delta = 0;
+    if (delta > 1000000000LL)
+        delta = 1000000000LL;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t abs_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec + delta;
+    struct timespec ts = {.tv_sec = abs_ns / 1000000000LL, .tv_nsec = abs_ns % 1000000000LL};
+    atomic_fetch_add(&st_wait, 1);
+    pthread_mutex_lock(&v->wait_lock);
+    atomic_store(&v->sleeping, 1);
+    if (!atomic_exchange(&v->wake, 0))
+        pthread_cond_timedwait(&v->wait_cond, &v->wait_lock, &ts);
+    atomic_store(&v->sleeping, 0);
+    atomic_store(&v->wake, 0);
+    pthread_mutex_unlock(&v->wait_lock);
 }
 
 /* todas as CPUs saem da fatia (parada, reset, desligamento) */
@@ -718,7 +751,7 @@ int mvm_media_list(mvm_vm *vm, mvm_media_info *out, int max)
         o->present = m->blk != NULL;
         o->readonly = m->blk ? m->blk->readonly : false;
         o->changeable = vm->machine->media_change &&
-                        (m->kind != MVM_MEDIA_HDD || m->bus == MVM_BUS_SATA);
+                        (m->kind != MVM_MEDIA_HDD || m->bus == MVM_BUS_SATA || m->bus == MVM_BUS_SCSI);
         snprintf(o->name, sizeof(o->name), "%s", m->name); /* slots nunca sao liberados: indice = slot */
     }
     pthread_mutex_unlock(&vm->media_lock);
@@ -769,6 +802,32 @@ static int run_loop(mvm_vm *vm);
  * timers e dispositivos ficam com a CPU 0 e a thread de E/S. */
 struct ap_arg { mvm_vm *vm; int idx; };
 
+/* aplica a prioridade pedida na thread 'tid' (falha silenciosa: sem permissao fica como esta) */
+static void prio_apply(mvm_vm *vm, int tid)
+{
+    int p = atomic_load(&vm->prio);
+    if (tid > 0 && p != MVM_PRIO_KEEP)
+        setpriority(PRIO_PROCESS, (id_t)tid, p);
+}
+
+/* registra a thread atual no slot e ja aplica a prioridade pedida */
+static void prio_register(mvm_vm *vm, _Atomic int *slot)
+{
+    int tid = (int)syscall(SYS_gettid);
+    atomic_store(slot, tid);
+    prio_apply(vm, tid);
+}
+
+void mvm_set_priority(mvm_vm *vm, int nice)
+{
+    if (nice != MVM_PRIO_KEEP)
+        nice = nice < -20 ? -20 : nice > 19 ? 19 : nice;
+    atomic_store(&vm->prio, nice);
+    for (int i = 0; i < MVM_MAX_CPUS; i++)
+        prio_apply(vm, atomic_load(&vm->vcpu[i].tid));
+    prio_apply(vm, atomic_load(&vm->io_tid));
+}
+
 static void *ap_loop(void *arg)
 {
     struct ap_arg *aa = arg;
@@ -778,6 +837,7 @@ static void *ap_loop(void *arg)
     struct vm_vcpu *v = &vm->vcpu[idx];
     tls_cpu_vm = vm;
     tls_cpu_idx = idx;
+    prio_register(vm, &v->tid);
     /* sem a bql: o trabalho entre as fatias (TLB, JIT, A20) e privado desta CPU; os
      * acessos a dispositivos durante a execucao tomam a trava na dispatch */
     while (!atomic_load(&vm->aps_quit)) {
@@ -786,7 +846,7 @@ static void *ap_loop(void *arg)
         if (atomic_load(&vm->pause_req) || __atomic_load_n(&vm->shutdown, __ATOMIC_RELAXED) ||
             __atomic_load_n(&vm->fatal, __ATOMIC_RELAXED) || atomic_load(&vm->stop_req) || vm->cpu_ops->halted(v->cpu)) {
             int64_t t0 = host_clock_ns();
-            wait_flag(vm, &v->wake, t0 + 10000000LL);
+            vcpu_wait(v, t0 + 10000000LL);
             v->st_halt += host_clock_ns() - t0;
             continue;
         }
@@ -796,6 +856,7 @@ static void *ap_loop(void *arg)
         v->st_insns += (uint64_t)n;
         atomic_fetch_add_explicit(&vm->insn_count, (uint64_t)n, memory_order_relaxed);
     }
+    atomic_store(&v->tid, 0);
     tls_cpu_vm = NULL;
     tls_cpu_idx = -1;
     return NULL;
@@ -805,6 +866,7 @@ static void *ap_loop(void *arg)
 static void *io_loop(void *arg)
 {
     mvm_vm *vm = arg;
+    prio_register(vm, &vm->io_tid);
     while (!atomic_load(&vm->io_quit)) {
         if (!atomic_load(&vm->io_active)) { /* desligada em tempo de execucao */
             wait_flag(vm, &vm->io_kick, host_clock_ns() + 10000000LL);
@@ -821,6 +883,7 @@ static void *io_loop(void *arg)
         bool busy = chr_has_input(&vm->serial) || (vm->net && net_rx_peek(vm->net));
         wait_flag(vm, &vm->io_kick, host_clock_ns() + (busy ? 1000000LL : 10000000LL));
     }
+    atomic_store(&vm->io_tid, 0);
     return NULL;
 }
 
@@ -829,6 +892,7 @@ int mvm_run(mvm_vm *vm)
     atomic_store(&vm->running, 1);
     tls_cpu_vm = vm;
     tls_cpu_idx = 0;
+    prio_register(vm, &vm->vcpu[0].tid);
     if (vm->iothread) {
         atomic_store(&vm->io_quit, 0);
         atomic_store(&vm->io_active, 1);
@@ -865,6 +929,7 @@ int mvm_run(mvm_vm *vm)
     for (int i = 0; i < vm->ncpus; i++)
         work_run(vm, i);
     vm_bql_unlock(vm);
+    atomic_store(&vm->vcpu[0].tid, 0);
     tls_cpu_vm = NULL;
     tls_cpu_idx = -1;
     if (vm->fb_flush) /* a ultima imagem fica disponivel depois da execucao */
@@ -1106,11 +1171,14 @@ bool vm_fb_watched(mvm_vm *vm, int64_t ms)
 
 void vm_fb_rows_changed(mvm_vm *vm, uint32_t y0, uint32_t y1)
 {
+    /* gen da entrada so vale g depois de y0/y1 gravados; quem ve gen != g copia tudo */
     uint32_t g = atomic_fetch_add(&vm->fb_gen, 1) + 1;
     unsigned n = sizeof(vm->fb_log) / sizeof(vm->fb_log[0]);
-    vm->fb_log[g % n].gen = g;
+    __atomic_store_n(&vm->fb_log[g % n].gen, 0, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     vm->fb_log[g % n].y0 = y0;
     vm->fb_log[g % n].y1 = y1;
+    __atomic_store_n(&vm->fb_log[g % n].gen, g, __ATOMIC_RELEASE);
 }
 
 static void copy_row(uint32_t *d, const uint32_t *s, uint32_t w, mvm_fb_copy_fmt fmt)
@@ -1159,7 +1227,7 @@ int mvm_fb_copy_rows(mvm_vm *vm, void *dst, uint32_t dst_w, uint32_t dst_h, size
         a = UINT32_MAX;
         b = 0;
         for (uint32_t g = *since + 1; g != cur + 1; g++) {
-            if (vm->fb_log[g % n].gen != g) {
+            if (__atomic_load_n(&vm->fb_log[g % n].gen, __ATOMIC_ACQUIRE) != g) {
                 a = 0;
                 b = fi.height;
                 break;
@@ -1244,6 +1312,32 @@ void mvm_pointer_event(mvm_vm *vm, int dx, int dy, int dz, uint32_t buttons)
     mvm_input_event ev = {.type = 1, .dx = (int16_t)dx, .dy = (int16_t)dy, .dz = (int16_t)dz,
                           .buttons = buttons};
     push_input(vm, &ev);
+}
+
+bool mvm_cursor_position(mvm_vm *vm, int *x, int *y)
+{
+    if (!atomic_load(&vm->cursor_on))
+        return false;
+    *x = atomic_load(&vm->cursor_x);
+    *y = atomic_load(&vm->cursor_y);
+    return true;
+}
+
+void mvm_display_hint(mvm_vm *vm, int width, int height)
+{
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192)
+        return;
+    mvm_input_event ev = {.type = 3, .dx = (int16_t)width, .dy = (int16_t)height};
+    push_input(vm, &ev);
+}
+
+bool mvm_keyboard_stats(mvm_vm *vm, uint32_t *delivered, uint32_t *dropped)
+{
+    if (delivered)
+        *delivered = atomic_load(&vm->kbd_delivered);
+    if (dropped)
+        *dropped = atomic_load(&vm->kbd_dropped);
+    return vm->kbd_stats;
 }
 
 uint64_t mvm_instruction_count(mvm_vm *vm) { return atomic_load(&vm->insn_count); }

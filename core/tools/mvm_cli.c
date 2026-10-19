@@ -405,13 +405,17 @@ static void *control_thread(void *arg)
                 mvm_pointer_event(g_vm, 0, 0, 0, 1);
                 usleep(80000);
                 mvm_pointer_event(g_vm, 0, 0, 0, 0);
+            } else if (!strncmp(line, "display ", 8)) { /* display L A: resolucao preferida (ARM UEFI) */
+                int w = 0, h = 0;
+                if (sscanf(line + 8, "%d %d", &w, &h) == 2)
+                    mvm_display_hint(g_vm, w, h);
             } else if (!strncmp(line, "media", 5)) { /* media list|insert N ARQ|eject N|add ARQ */
                 char err[256] = {0}, arg[3000] = {0};
                 int slot = -1, r = 0;
                 if (!strcmp(line, "media list")) {
                     mvm_media_info mi[MVM_MAX_MEDIA];
                     int n = mvm_media_list(g_vm, mi, MVM_MAX_MEDIA);
-                    static const char *kinds[] = {"disco", "cd", "disquete"}, *buses[] = {"ide", "sata", "fdc", "virtio"};
+                    static const char *kinds[] = {"disco", "cd", "disquete"}, *buses[] = {"ide", "sata", "fdc", "virtio", "scsi"};
                     for (int i = 0; i < n; i++)
                         fprintf(stderr, "[media] %d: %s %s:%d %s%s%s\n", i, kinds[mi[i].kind], buses[mi[i].bus], mi[i].unit,
                                 mi[i].present ? mi[i].name : "(vazio)", mi[i].readonly ? " ro" : "",
@@ -426,6 +430,10 @@ static void *control_thread(void *arg)
                         fprintf(stderr, "[media] disco conectado no drive %d\n", r);
                 }
                 fprintf(stderr, "[media] %s%s\n", r < 0 ? "erro: " : "ok", r < 0 ? err : "");
+            } else if (!strcmp(line, "kbdstats")) { /* apertos entregues ao driver / descartados */
+                uint32_t ok = 0, drop = 0;
+                bool has = mvm_keyboard_stats(g_vm, &ok, &drop);
+                fprintf(stderr, "[mvm-cli] teclado: %s entregues=%u descartados=%u\n", has ? "virtio" : "sem contagem", ok, drop);
             } else if (!strcmp(line, "power")) {
                 mvm_power_button(g_vm);
             } else if (!strcmp(line, "reset")) {
@@ -701,18 +709,18 @@ static void usage(void)
             "      --vnc-password S  senha do VNC (ate 8 caracteres)\n"
             "      --ide             discos -d/-r no controlador IDE (padrao com --bios)\n"
             "      --virtio          discos -d/-r em virtio-blk tambem com --bios (Linux; o SeaBIOS da boot por eles)\n"
-            "      --smp N           processadores do convidado (x86: ate 8)\n"
+            "      --smp N           processadores do convidado (ate 8)\n"
             "      --boot ORDEM      ordem de boot com BIOS: c=disco d=CD a=disquete (ex.: dca)\n"
             "      --vgabios ARQ     ROM de video (padrao: vgabios-stdvga.bin ao lado da BIOS)\n"
             "      --text            imprime a tela em modo texto ao sair\n"
             "      --type SEG:TEXTO  digita TEXTO no teclado apos SEG segundos (\\n = Enter, \\wN = espera N s, \\Sc = Alt+SysRq+c, \\P = botao de energia, \\kN = tecla evdev N)\n"
             "      --sata            discos (-d/-r) e CD-ROMs (--cdrom) no controlador SATA AHCI\n      --no-reboot       encerra quando o convidado reinicia (codigo de saida 3)\n      --rtc DATA        data inicial do relogio (AAAA-MM-DD[THH:MM:SS], UTC); padrao: a do host\n"
             "      --control FIFO    comandos em tempo de execucao: type TXT, text ARQ, shot ARQ, mouse DX DY [B], wheel DZ, click, power, reset, quit,\n"
-            "                        media list | media insert N ARQ | media eject N | media add ARQ\n"
+            "                        media list | media insert N ARQ | media eject N | media add ARQ | display L A\n"
             "      --type-after TXT  so comeca a contar SEG depois que TXT aparecer na tela de texto\n"
             "      --dtb ARQ         device tree externo (ARM)\n"
-            "      --bios ARQ        firmware (x86): SeaBIOS ou UEFI (OVMF.fd ou OVMF_CODE.fd)\n"
-            "      --uefi-vars ARQ   variaveis UEFI gravaveis (copia do OVMF_VARS.fd; use com OVMF_CODE.fd)\n"
+            "      --bios ARQ        firmware: x86 SeaBIOS ou UEFI (OVMF.fd/OVMF_CODE.fd); ARM UEFI (AAVMF_CODE.fd/QEMU_EFI.fd)\n"
+            "      --uefi-vars ARQ   variaveis UEFI gravaveis (copia do OVMF_VARS.fd ou AAVMF_VARS.fd)\n"
             "      --load-addr HEX   endereco de carga para binario bruto\n"
             "      --fb WxH          framebuffer\n"
             "      --fb-dump ARQ     grava o framebuffer (PPM) ao sair\n"
@@ -928,6 +936,8 @@ int main(int argc, char **argv)
     g_vm = mvm_create(&cfg, err, sizeof(err));
     if (g_vm && no_reboot)
         mvm_set_no_reboot(g_vm, true);
+    if (g_vm && getenv("MVM_NICE")) /* prioridade das threads da VM (como o app em primeiro plano) */
+        mvm_set_priority(g_vm, atoi(getenv("MVM_NICE")));
     if (g_vm)
         install_crash_handler();
     if (!g_vm) {

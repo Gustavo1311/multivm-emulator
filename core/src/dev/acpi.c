@@ -257,6 +257,258 @@ void acpi_build(acpi_tables *t, const acpi_config *cfg)
     add_cksum(t, F_RSDP, 0, 36, 32);  /* checksum estendido */
 }
 
+/* ------------------------------------------------------------ ARM (virt) */
+
+/* AML minimo para o DSDT do ARM, montado de dentro para fora num buffer */
+typedef struct {
+    uint8_t *b;
+    uint32_t len, cap;
+} aml;
+
+static void aml_put(aml *a, const void *p, uint32_t n)
+{
+    if (a->len + n > a->cap) {
+        a->cap = (a->len + n) * 2 + 256;
+        a->b = realloc(a->b, a->cap);
+    }
+    memcpy(a->b + a->len, p, n);
+    a->len += n;
+}
+
+static void aml_byte(aml *a, uint8_t v) { aml_put(a, &v, 1); }
+
+/* PkgLength (inclui os proprios bytes de tamanho) */
+static void aml_pkglen(aml *a, uint32_t body)
+{
+    uint32_t n = body + 1;
+    if (n < 0x40) {
+        aml_byte(a, (uint8_t)n);
+        return;
+    }
+    n = body + 2;
+    if (n < 0x1000) {
+        aml_byte(a, (uint8_t)(0x40 | (n & 0xf)));
+        aml_byte(a, (uint8_t)(n >> 4));
+        return;
+    }
+    n = body + 3;
+    aml_byte(a, (uint8_t)(0x80 | (n & 0xf)));
+    aml_byte(a, (uint8_t)(n >> 4));
+    aml_byte(a, (uint8_t)(n >> 12));
+}
+
+static void aml_int(aml *a, uint32_t v)
+{
+    if (v == 0) { aml_byte(a, 0x00); return; }
+    if (v == 1) { aml_byte(a, 0x01); return; }
+    if (v <= 0xff) { aml_byte(a, 0x0a); aml_byte(a, (uint8_t)v); return; }
+    if (v <= 0xffff) { aml_byte(a, 0x0b); aml_byte(a, (uint8_t)v); aml_byte(a, (uint8_t)(v >> 8)); return; }
+    aml_byte(a, 0x0c);
+    for (int i = 0; i < 4; i++)
+        aml_byte(a, (uint8_t)(v >> (8 * i)));
+}
+
+static void aml_name_int(aml *a, const char *seg, uint32_t v)
+{
+    aml_byte(a, 0x08);
+    aml_put(a, seg, 4);
+    aml_int(a, v);
+}
+
+static void aml_name_str(aml *a, const char *seg, const char *str)
+{
+    aml_byte(a, 0x08);
+    aml_put(a, seg, 4);
+    aml_byte(a, 0x0d);
+    aml_put(a, str, (uint32_t)strlen(str) + 1);
+}
+
+/* Name(_CRS, ResourceTemplate { Memory32Fixed(RW, base, len); Interrupt(Consumer, Level, ActiveHigh, Exclusive) {gsiv} }) */
+static void aml_crs(aml *a, uint32_t base, uint32_t len, uint32_t gsiv)
+{
+    uint8_t rt[32];
+    uint32_t n = 0;
+    rt[n++] = 0x86; rt[n++] = 9; rt[n++] = 0; rt[n++] = 1; /* Memory32Fixed, leitura e escrita */
+    st_le(rt + n, base, 4); n += 4;
+    st_le(rt + n, len, 4); n += 4;
+    if (gsiv) {
+        rt[n++] = 0x89; rt[n++] = 6; rt[n++] = 0;  /* Extended Interrupt */
+        rt[n++] = 0x01;                            /* consumidor, nivel, ativo alto, exclusivo */
+        rt[n++] = 1;
+        st_le(rt + n, gsiv, 4); n += 4;
+    }
+    rt[n++] = 0x79; rt[n++] = 0;                   /* End Tag */
+    aml body = {0};
+    aml_int(&body, n);
+    aml_put(&body, rt, n);
+    aml_byte(a, 0x08);
+    aml_put(a, "_CRS", 4);
+    aml_byte(a, 0x11); /* Buffer */
+    aml_pkglen(a, body.len);
+    aml_put(a, body.b, body.len);
+    free(body.b);
+}
+
+/* Device(seg) { corpo } */
+static void aml_device(aml *a, const char *seg, const aml *body)
+{
+    aml_byte(a, 0x5b);
+    aml_byte(a, 0x82);
+    aml_pkglen(a, 4 + body->len);
+    aml_put(a, seg, 4);
+    aml_put(a, body->b, body->len);
+}
+
+static void gas_mem(uint8_t *g, uint8_t bits, uint64_t addr)
+{
+    g[0] = 0; /* memoria */
+    g[1] = bits;
+    g[2] = 0;
+    g[3] = bits == 8 ? 1 : bits == 16 ? 2 : bits == 32 ? 3 : 4;
+    st_le(g + 4, addr, 8);
+}
+
+void acpi_build_arm(acpi_tables *t, const acpi_arm_config *cfg)
+{
+    memset(t, 0, sizeof(*t));
+
+    /* DSDT */
+    aml sb = {0};
+    for (unsigned i = 0; i < (cfg->ncpus ? cfg->ncpus : 1) && i < 8; i++) { /* processadores (UID = MADT) */
+        aml d = {0};
+        aml_name_str(&d, "_HID", "ACPI0007");
+        aml_name_int(&d, "_UID", i);
+        char nm[5];
+        snprintf(nm, sizeof(nm), "C%03X", i);
+        aml_device(&sb, nm, &d);
+        free(d.b);
+    }
+    {
+        aml d = {0};
+        aml_name_str(&d, "_HID", "ARMH0011"); /* PL011 (SBSA) */
+        aml_name_int(&d, "_UID", 0);
+        aml_crs(&d, (uint32_t)cfg->uart, 0x1000, cfg->uart_gsiv);
+        aml_device(&sb, "COM0", &d);
+        free(d.b);
+    }
+    if (cfg->fw_cfg) {
+        aml d = {0};
+        aml_name_str(&d, "_HID", "QEMU0002");
+        aml_name_int(&d, "_STA", 0xb);
+        aml_name_int(&d, "_CCA", 1);
+        aml_crs(&d, (uint32_t)cfg->fw_cfg, 0x18, 0);
+        aml_device(&sb, "FWCF", &d);
+        free(d.b);
+    }
+    for (uint32_t i = 0; i < cfg->nvirtio && i < ACPI_ARM_MAX_VIRTIO; i++) {
+        aml d = {0};
+        char seg[5];
+        snprintf(seg, sizeof(seg), "VR%02X", i);
+        aml_name_str(&d, "_HID", "LNRO0005"); /* virtio-mmio */
+        aml_name_int(&d, "_UID", i);
+        aml_name_int(&d, "_CCA", 1);
+        aml_crs(&d, (uint32_t)(cfg->virtio_base + (uint64_t)cfg->virtio_size * i), cfg->virtio_size,
+                cfg->virtio_gsiv + i);
+        aml_device(&sb, seg, &d);
+        free(d.b);
+    }
+    aml dsdt = {0};
+    uint8_t hdr[36] = {0};
+    aml_put(&dsdt, hdr, 36);
+    aml_byte(&dsdt, 0x10); /* Scope(\_SB) */
+    aml_pkglen(&dsdt, 5 + sb.len);
+    aml_put(&dsdt, "\\_SB_", 5);
+    aml_put(&dsdt, sb.b, sb.len);
+    free(sb.b);
+    header(dsdt.b, "DSDT", dsdt.len, 2);
+    memcpy(dsdt.b + 16, "MVMVIRT ", 8);
+    uint32_t dsdt_off = add_table(t, dsdt.b, dsdt.len);
+    free(dsdt.b);
+
+    /* FADT (ACPI 6.3, hardware reduzido, PSCI por HVC) */
+    uint8_t fadt[276] = {0};
+    header(fadt, "FACP", sizeof(fadt), 6);
+    st_le(fadt + 40, dsdt_off, 4);
+    st_le(fadt + 112, 1u << 20, 4);      /* HW_REDUCED_ACPI */
+    st_le(fadt + 129, 0x3, 2);           /* ARM_BOOT_ARCH: PSCI_COMPLIANT | PSCI_USE_HVC */
+    fadt[131] = 3;                       /* versao menor */
+    st_le(fadt + 140, dsdt_off, 8);      /* X_DSDT */
+    memcpy(fadt + 268, "MULTIVM ", 8);   /* hypervisor vendor */
+    uint32_t fadt_off = add_table(t, fadt, sizeof(fadt));
+    add_ptr(t, F_TABLES, fadt_off + 40, 4, F_TABLES);
+    add_ptr(t, F_TABLES, fadt_off + 140, 8, F_TABLES);
+
+    /* MADT: uma GICC por CPU e o distribuidor GICv2 */
+    unsigned ncpu = cfg->ncpus ? cfg->ncpus : 1;
+    if (ncpu > 8)
+        ncpu = 8;
+    uint8_t madt[44 + 8 * 80 + 24] = {0};
+    size_t madt_len = 44 + ncpu * 80 + 24;
+    for (unsigned i = 0; i < ncpu; i++) {
+        uint8_t *g = madt + 44 + 80 * i;
+        g[0] = 0x0b; g[1] = 80;
+        st_le(g + 4, i, 4);              /* numero da interface de CPU */
+        st_le(g + 8, i, 4);              /* UID do processador */
+        st_le(g + 12, 1, 4);             /* habilitada */
+        st_le(g + 32, cfg->gicc, 8);
+        st_le(g + 68, i, 8);             /* MPIDR (Aff0) */
+    }
+    uint8_t *g = madt + 44 + 80 * ncpu;
+    g[0] = 0x0c; g[1] = 24;
+    st_le(g + 8, cfg->gicd, 8);
+    g[20] = 2;                           /* GICv2 */
+    header(madt, "APIC", (uint32_t)madt_len, 4);
+    uint32_t madt_off = add_table(t, madt, madt_len);
+
+    /* GTDT: timer generico (sem registradores CNTControl/CNTRead em memoria) */
+    uint8_t gtdt[96] = {0};
+    header(gtdt, "GTDT", sizeof(gtdt), 2);
+    st_le(gtdt + 36, ~0ULL, 8);
+    for (int i = 0; i < 4; i++) {
+        st_le(gtdt + 48 + 8 * i, cfg->timer_gsiv[i], 4);
+        st_le(gtdt + 52 + 8 * i, 4, 4);  /* nivel, ativo alto, sempre ligado */
+    }
+    st_le(gtdt + 80, ~0ULL, 8);
+    st_le(gtdt + 92, 96, 4);             /* sem timers de plataforma */
+    uint32_t gtdt_off = add_table(t, gtdt, sizeof(gtdt));
+
+    /* SPCR: console na PL011 (o Linux a usa como console preferido desde o inicio) */
+    uint8_t spcr[80] = {0};
+    header(spcr, "SPCR", sizeof(spcr), 2);
+    spcr[36] = 3;                        /* ARM PL011 */
+    gas_mem(spcr + 40, 32, cfg->uart);
+    spcr[52] = 8;                        /* interrupcao do GIC */
+    st_le(spcr + 54, cfg->uart_gsiv, 4);
+    spcr[58] = 7;                        /* 115200 */
+    spcr[60] = 1;                        /* 1 bit de parada */
+    spcr[62] = 3;                        /* ANSI */
+    st_le(spcr + 64, 0xffff, 2);
+    st_le(spcr + 66, 0xffff, 2);
+    uint32_t spcr_off = add_table(t, spcr, sizeof(spcr));
+
+    uint32_t tabs[4] = {fadt_off, madt_off, gtdt_off, spcr_off};
+    unsigned nt = 4;
+    uint8_t xsdt[36 + 8 * 4] = {0};
+    uint32_t xlen = 36 + 8 * nt;
+    header(xsdt, "XSDT", xlen, 1);
+    for (unsigned i = 0; i < nt; i++)
+        st_le(xsdt + 36 + 8 * i, tabs[i], 8);
+    uint32_t xsdt_off = add_table(t, xsdt, xlen);
+    for (unsigned i = 0; i < nt; i++)
+        add_ptr(t, F_TABLES, xsdt_off + 36 + 8 * i, 8, F_TABLES);
+
+    /* RSDP 2.0 so com XSDT */
+    uint8_t *r = t->rsdp;
+    memcpy(r, "RSD PTR ", 8);
+    memcpy(r + 9, "MULTVM", 6);
+    r[15] = 2;
+    st_le(r + 20, 36, 4);
+    st_le(r + 24, xsdt_off, 8);
+    add_ptr(t, F_RSDP, 24, 8, F_TABLES);
+    add_cksum(t, F_RSDP, 0, 20, 8);
+    add_cksum(t, F_RSDP, 0, 36, 32);
+}
+
 void acpi_tables_free(acpi_tables *t)
 {
     free(t->data);

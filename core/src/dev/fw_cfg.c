@@ -2,6 +2,9 @@
  * fw_cfg: interface de configuracao de firmware compativel com a do QEMU
  * (seletor 0x510, dados 0x511, DMA 0x514). Usada pelo SeaBIOS para obter
  * tamanho de RAM, mapa e820, ordem de boot, ROMs e tabelas.
+ * Na maquina ARM "virt" (com UEFI) vale a variante MMIO do QEMU: dados em +0, seletor em +8
+ * (16 bits, big-endian), DMA em +16 (64 bits, big-endian). O edk2 le as tabelas ACPI e grava a
+ * configuracao da ramfb ("etc/ramfb") por DMA.
  */
 #include "devices.h"
 
@@ -24,6 +27,8 @@ typedef struct {
     uint8_t *data;
     uint32_t len;
     char name[56]; /* vazio para chaves legadas */
+    fw_cfg_write_cb on_write; /* != NULL: o convidado pode gravar (DMA) */
+    void *opaque;
 } fw_item;
 
 struct fw_cfg {
@@ -112,6 +117,17 @@ void fw_cfg_add_file(fw_cfg *f, const char *name, const void *data, uint32_t len
     rebuild_dir(f);
 }
 
+void fw_cfg_add_file_rw(fw_cfg *f, const char *name, const void *data, uint32_t len, fw_cfg_write_cb cb,
+                        void *opaque)
+{
+    fw_cfg_add_file(f, name, data, len);
+    for (int i = 0; i < f->nitems; i++)
+        if (f->items[i].name[0] && !strncmp(f->items[i].name, name, 55)) {
+            f->items[i].on_write = cb;
+            f->items[i].opaque = opaque;
+        }
+}
+
 fw_cfg *fw_cfg_new(mvm_vm *vm)
 {
     fw_cfg *f = calloc(1, sizeof(*f));
@@ -165,7 +181,14 @@ static void do_dma(fw_cfg *f)
         select_key(f, (uint16_t)(ctl >> 16));
     uint32_t status = 0;
     if (ctl & DMA_CTL_WRITE) {
-        status = DMA_CTL_ERROR; /* escrita nao suportada */
+        fw_item *it = f->cur >= 0 ? &f->items[f->cur] : NULL;
+        if (!it || !it->on_write || f->offset + (uint64_t)len > it->len) {
+            status = DMA_CTL_ERROR; /* item somente leitura */
+        } else {
+            space_memread(mem, addr, it->data + f->offset, len);
+            f->offset += len;
+            it->on_write(it->opaque, it->data, it->len);
+        }
     } else if (ctl & (DMA_CTL_READ | DMA_CTL_SKIP)) {
         fw_item *it = f->cur >= 0 ? &f->items[f->cur] : NULL;
         uint32_t avail = it && f->offset < it->len ? it->len - f->offset : 0;
@@ -225,3 +248,36 @@ static void fwcfg_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
 }
 
 const mvm_io_ops fw_cfg_ops = {fwcfg_read, fwcfg_write};
+
+/* variante MMIO (maquina ARM "virt" do QEMU) */
+static uint64_t fwcfg_mmio_read(void *opaque, uint64_t off, unsigned size)
+{
+    fw_cfg *f = opaque;
+    if (off < 8) { /* dados: os bytes saem na ordem do fluxo */
+        uint64_t v = 0;
+        for (unsigned i = 0; i < size; i++)
+            v |= (uint64_t)read_byte(f) << (8 * i);
+        return v;
+    }
+    return 0;
+}
+
+static void fwcfg_mmio_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
+{
+    fw_cfg *f = opaque;
+    if (off == 8 && size == 2) {
+        select_key(f, (uint16_t)((v >> 8) | (v << 8)));
+    } else if (off == 16 && size == 8) {
+        f->dma_addr = bswap64(v);
+        do_dma(f);
+        f->dma_addr = 0;
+    } else if (off == 16 && size == 4) {
+        f->dma_addr = (f->dma_addr & 0xffffffffULL) | ((uint64_t)bswap32((uint32_t)v) << 32);
+    } else if (off == 20 && size == 4) {
+        f->dma_addr = (f->dma_addr & ~0xffffffffULL) | bswap32((uint32_t)v);
+        do_dma(f);
+        f->dma_addr = 0;
+    }
+}
+
+const mvm_io_ops fw_cfg_mmio_ops = {fwcfg_mmio_read, fwcfg_mmio_write};

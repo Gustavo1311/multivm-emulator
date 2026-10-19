@@ -219,11 +219,51 @@ void blk_close(mvm_blk *b)
 
 const char *blk_format(const mvm_blk *b) { return b->drv ? b->drv->name : "raw"; }
 
-int blk_read(mvm_blk *b, uint64_t off, void *buf, size_t len)
+/* MVM_IO_STATS=1: tempo gasto lendo/gravando/sincronizando discos (mostrado ao sair) */
+int64_t host_clock_ns(void);
+static int io_stats = -1;
+static _Atomic uint64_t io_ns[3], io_n[3], io_bytes[3];
+
+static void io_stats_print(void)
+{
+    static const char *nm[3] = {"leitura", "gravacao", "sincronizacao"};
+    for (int i = 0; i < 3; i++)
+        LOGI("disco: %s %llu chamadas, %llu MiB, %.2f s", nm[i], (unsigned long long)io_n[i],
+             (unsigned long long)(io_bytes[i] >> 20), (double)io_ns[i] / 1e9);
+}
+
+static inline bool io_on(void)
+{
+    if (io_stats < 0) {
+        io_stats = getenv("MVM_IO_STATS") != NULL;
+        if (io_stats)
+            atexit(io_stats_print);
+    }
+    return io_stats;
+}
+
+static inline void io_add(int k, int64_t t0, size_t len)
+{
+    io_ns[k] += (uint64_t)(host_clock_ns() - t0);
+    io_n[k]++;
+    io_bytes[k] += len;
+}
+
+static int blk_read_raw(mvm_blk *b, uint64_t off, void *buf, size_t len)
 {
     if (b->drv)
         return b->drv->read(b->st, off, buf, len);
     return img_pread(b->fd, buf, len, off);
+}
+
+int blk_read(mvm_blk *b, uint64_t off, void *buf, size_t len)
+{
+    if (!io_on())
+        return blk_read_raw(b, off, buf, len);
+    int64_t t0 = host_clock_ns();
+    int r = blk_read_raw(b, off, buf, len);
+    io_add(0, t0, len);
+    return r;
 }
 
 /*
@@ -263,7 +303,19 @@ static bool raw_write_forbidden(mvm_blk *b, uint64_t off, const uint8_t *p, size
     return hit;
 }
 
+static int blk_write_raw(mvm_blk *b, uint64_t off, const void *buf, size_t len);
+
 int blk_write(mvm_blk *b, uint64_t off, const void *buf, size_t len)
+{
+    if (!io_on())
+        return blk_write_raw(b, off, buf, len);
+    int64_t t0 = host_clock_ns();
+    int r = blk_write_raw(b, off, buf, len);
+    io_add(1, t0, len);
+    return r;
+}
+
+static int blk_write_raw(mvm_blk *b, uint64_t off, const void *buf, size_t len)
 {
     if (b->readonly)
         return -1;
@@ -278,9 +330,11 @@ int blk_write(mvm_blk *b, uint64_t off, const void *buf, size_t len)
 
 int blk_flush(mvm_blk *b)
 {
-    if (b->drv)
-        return b->drv->flush(b->st);
-    return b->readonly ? 0 : fdatasync(b->fd);
+    int64_t t0 = io_on() ? host_clock_ns() : 0;
+    int r = b->drv ? b->drv->flush(b->st) : b->readonly ? 0 : fdatasync(b->fd);
+    if (t0)
+        io_add(2, t0, 0);
+    return r;
 }
 
 int blk_discard(mvm_blk *b, uint64_t off, uint64_t len)

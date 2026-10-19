@@ -6,7 +6,7 @@
 
 #include <setjmp.h>
 
-#define A64_TLB_BITS 9
+#define A64_TLB_BITS 10
 #define A64_TLB_SIZE (1u << A64_TLB_BITS)
 
 #define TLB_INVALID 1ULL
@@ -28,6 +28,7 @@ typedef union {
 } a64_vreg;
 
 enum { ACC_READ = 0, ACC_WRITE = 1, ACC_EXEC = 2 };
+enum { A64_ON = 0, A64_OFF = 1, A64_ON_PENDING = 2 };
 
 typedef struct a64_cpu {
     uint64_t x[32]; /* x[31] sempre 0 (XZR) */
@@ -58,6 +59,21 @@ typedef struct a64_cpu {
     bool halted;
     jmp_buf jb;
 
+    /* varios processadores */
+    int index;               /* indice na VM (MPIDR.Aff0) */
+    _Atomic int *exit_flag;  /* sair da fatia (vm_cpu_exit_flag: vm->cpu_exit na CPU 0) */
+    _Atomic int power;       /* PSCI: A64_ON, A64_OFF ou A64_ON_PENDING (CPU_ON a caminho) */
+    uint64_t on_entry, on_ctx; /* CPU_ON: endereco de entrada e x0 */
+    _Atomic int tlbi_left;   /* TLBIs compartilhados enviados a outras CPUs e ainda nao feitos */
+    bool smp;                /* a VM tem mais de uma CPU: atomicos e barreiras de verdade */
+
+    /* JIT (a64_jit.c): NULL = so o interpretador */
+    struct a64_jit *jit;
+    void *jit_exit;      /* registro da saida encadeavel usada por ultimo (ou NULL) */
+    int64_t jit_budget;  /* instrucoes que ainda podem rodar no codigo traduzido */
+    uint32_t jit_why;    /* motivo da ultima saida (estatisticas) */
+    a64_tlbe *jit_tlb;   /* TLB do EL atual (a64_jit_next atualiza x25) */
+
     a64_tlbe tlb[2][A64_TLB_SIZE];
     uint64_t fetch_page;
     uint8_t *fetch_host;
@@ -72,6 +88,22 @@ void a64_write_slow(a64_cpu *c, uint64_t va, uint64_t val, unsigned size, int el
 _Noreturn void a64_undef(a64_cpu *c);
 bool a64_fp_enabled(a64_cpu *c);
 _Noreturn void a64_fp_trap(a64_cpu *c);
+
+/* JIT (a64_jit.c) */
+struct a64_jit *a64_jit_new(a64_cpu *c);
+void a64_jit_free(struct a64_jit *j);
+void a64_jit_reset(struct a64_jit *j); /* esvazia (reset da maquina) */
+/* roda blocos traduzidos a partir de c->pc; retorna as instrucoes executadas (0 = interpretar uma) */
+int64_t a64_jit_run(struct a64_jit *j, int64_t budget);
+/* entrada da TLB de execucao para va (preenche; pode gerar falta com longjmp) */
+a64_tlbe *a64_tlb_exec(a64_cpu *c, uint64_t va);
+void a64_exec_helper(a64_cpu *c, uint32_t insn);
+void a64_svc_helper(a64_cpu *c, uint32_t insn); /* SVC sem longjmp */
+/* varias CPUs: pagina fisica ppage passou a ter codigo traduzido por outra CPU -> escritas
+ * desta CPU nela vao pelo caminho lento (pode ser chamada de outra thread) */
+void a64_tlb_protect_remote(a64_cpu *c, uint64_t ppage);
+/* DSB: espera os TLBIs compartilhados que esta CPU mandou para as outras */
+void a64_tlbi_wait(a64_cpu *c);
 
 /* SIMD/FP (a64_simd.c) */
 void a64_simd_fp(a64_cpu *c, uint32_t insn);

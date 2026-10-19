@@ -88,11 +88,17 @@ uint16_t f32_to_f16(float f);
 void *arm64_cpu_new(mvm_vm *vm, const arm_hooks *hooks);
 void arm64_set_irq(void *cpu, int line, int level);
 void arm64_set_entry(void *cpu, uint64_t pc, uint64_t x0);
+/* a maquina informa o indice da CPU (depois de vm_add_cpu) e quantas CPUs a VM tem */
+void arm64_set_index(void *cpu, int index, int ncpus);
+/* CPU extra desligada (espera o PSCI CPU_ON), ou ligada */
+void arm64_set_powered(void *cpu, bool on);
 extern const mvm_cpu_ops arm64_cpu_ops;
 
 void *arm32_cpu_new(mvm_vm *vm, const arm_hooks *hooks);
 void arm32_set_irq(void *cpu, int line, int level);
 void arm32_set_entry(void *cpu, uint32_t pc, uint32_t r0, uint32_t r1, uint32_t r2);
+void arm32_set_index(void *cpu, int index, int ncpus);
+void arm32_set_powered(void *cpu, bool on);
 extern const mvm_cpu_ops arm32_cpu_ops;
 
 #endif

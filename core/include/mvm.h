@@ -44,7 +44,7 @@ typedef enum {
     MVM_DISK_AUTO = 0,   /* virtio-blk no boot direto; IDE quando ha BIOS (x86) */
     MVM_DISK_VIRTIO = 1,
     MVM_DISK_IDE = 2,    /* disco ATA (somente x86) */
-    MVM_DISK_CDROM = 3,  /* CD-ROM ATAPI com imagem ISO (somente x86) */
+    MVM_DISK_CDROM = 3,  /* CD-ROM com imagem ISO: ATAPI no IDE (x86) ou virtio-scsi (ARM virt) */
     MVM_DISK_SATA = 4,   /* disco SATA no controlador AHCI (somente x86) */
     MVM_DISK_SATA_CDROM = 5, /* CD-ROM ATAPI no AHCI (somente x86) */
     MVM_DISK_FLOPPY = 6, /* disquete no controlador 82078 (somente x86, ate 2) */
@@ -183,12 +183,13 @@ int mvm_vnc_clients(mvm_vnc *v);
 #define MVM_MAX_MEDIA 16
 
 typedef enum { MVM_MEDIA_HDD = 0, MVM_MEDIA_CD = 1, MVM_MEDIA_FLOPPY = 2 } mvm_media_kind;
-typedef enum { MVM_BUS_IDE = 0, MVM_BUS_SATA = 1, MVM_BUS_FDC = 2, MVM_BUS_VIRTIO = 3 } mvm_media_bus;
+typedef enum { MVM_BUS_IDE = 0, MVM_BUS_SATA = 1, MVM_BUS_FDC = 2, MVM_BUS_VIRTIO = 3,
+               MVM_BUS_SCSI = 4 /* virtio-scsi (ARM virt) */ } mvm_media_bus;
 
 typedef struct {
     mvm_media_kind kind;
     mvm_media_bus bus;
-    int unit;           /* IDE: barramento*2+unidade; SATA: porta; FDC: drive */
+    int unit;           /* IDE: barramento*2+unidade; SATA: porta; FDC: drive; SCSI: alvo */
     bool present;       /* tem midia */
     bool readonly;
     bool changeable;    /* aceita troca com a VM ligada */
@@ -210,6 +211,12 @@ int mvm_media_add_disk(mvm_vm *vm, const char *path, int fd, bool readonly, cons
 void mvm_pause(mvm_vm *vm);
 void mvm_resume(mvm_vm *vm);
 bool mvm_is_paused(mvm_vm *vm);
+
+/* Prioridade (nice do Linux, -20..19) das threads da VM: CPUs e E/S. Vale para as threads que
+ * ja rodam e para as que iniciarem depois. O app usa negativo com a tela da VM aberta (primeiro
+ * plano) e 0 fora dela. MVM_PRIO_KEEP (padrao) deixa a prioridade herdada. */
+#define MVM_PRIO_KEEP 1000
+void mvm_set_priority(mvm_vm *vm, int nice);
 
 /* Console serial (UART principal). O callback e chamado na thread da VM. */
 void mvm_set_serial_output(mvm_vm *vm, mvm_serial_cb cb, void *opaque);
@@ -248,7 +255,16 @@ size_t mvm_text_screen(mvm_vm *vm, char *buf, size_t len);
 void mvm_key_event(mvm_vm *vm, uint32_t keycode, bool pressed);
 /* Botao de energia ACPI (x86): o sistema convidado normalmente se desliga. */
 void mvm_power_button(mvm_vm *vm);
+/* Tamanho de tela que o app gostaria (ex.: a tela do celular). A placa ARM com UEFI (virtio-gpu) passa a
+ * oferecer essa resolucao como preferida e avisa o convidado; nas outras maquinas nao faz nada. */
+void mvm_display_hint(mvm_vm *vm, int width, int height);
+/* Posicao do ponteiro do mouse na tela do convidado, quando a placa de video sabe (cursor de hardware
+ * da virtio-gpu, ARM com UEFI). false = desconhecida. */
+bool mvm_cursor_position(mvm_vm *vm, int *x, int *y);
 void mvm_pointer_event(mvm_vm *vm, int dx, int dy, int dz, uint32_t buttons);
+/* Teclas entregues ao driver do convidado e descartadas (sem driver ou fila cheia), contando
+ * so apertos. Retorna false se a maquina nao tem como saber (PS/2 do PC). */
+bool mvm_keyboard_stats(mvm_vm *vm, uint32_t *delivered, uint32_t *dropped);
 
 /* Estatisticas */
 uint64_t mvm_instruction_count(mvm_vm *vm);

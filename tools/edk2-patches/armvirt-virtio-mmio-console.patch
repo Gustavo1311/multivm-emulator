@@ -1,0 +1,116 @@
+diff --git a/ArmVirtPkg/ArmVirtQemuFvMain.fdf.inc b/ArmVirtPkg/ArmVirtQemuFvMain.fdf.inc
+index 622409a..6eeed6d 100644
+--- a/ArmVirtPkg/ArmVirtQemuFvMain.fdf.inc
++++ b/ArmVirtPkg/ArmVirtQemuFvMain.fdf.inc
+@@ -162,6 +162,7 @@ READ_LOCK_STATUS   = TRUE
+   #
+   INF OvmfPkg/QemuRamfbDxe/QemuRamfbDxe.inf
+   INF OvmfPkg/VirtioGpuDxe/VirtioGpu.inf
++  INF OvmfPkg/VirtioKeyboardDxe/VirtioKeyboard.inf
+   INF OvmfPkg/PlatformDxe/Platform.inf
+ 
+   #
+diff --git a/OvmfPkg/Library/PlatformBootManagerLibLight/PlatformBm.c b/OvmfPkg/Library/PlatformBootManagerLibLight/PlatformBm.c
+index 8e93f3c..756ae16 100644
+--- a/OvmfPkg/Library/PlatformBootManagerLibLight/PlatformBm.c
++++ b/OvmfPkg/Library/PlatformBootManagerLibLight/PlatformBm.c
+@@ -11,6 +11,7 @@
+ 
+ #include <IndustryStandard/Pci22.h>
+ #include <IndustryStandard/Virtio095.h>
++#include <IndustryStandard/Virtio10.h>
+ #include <Library/BootLogoLib.h>
+ #include <Library/DevicePathLib.h>
+ #include <Library/PcdLib.h>
+@@ -328,6 +329,33 @@ IsVirtioSerial (
+   return IsVirtio (Handle, ReportText, VIRTIO_SUBSYSTEM_CONSOLE);
+ }
+ 
++/**
++  MultiVM: virtio-gpu and virtio-input on virtio-mmio (no PCI on the "virt"
++  board). They are connected before the console variables are built, so the
++  GOP and the keyboard become part of ConOut / ConIn.
++**/
++STATIC
++BOOLEAN
++EFIAPI
++IsVirtioGpu (
++  IN EFI_HANDLE    Handle,
++  IN CONST CHAR16  *ReportText
++  )
++{
++  return IsVirtio (Handle, ReportText, VIRTIO_SUBSYSTEM_GPU_DEVICE);
++}
++
++STATIC
++BOOLEAN
++EFIAPI
++IsVirtioInput (
++  IN EFI_HANDLE    Handle,
++  IN CONST CHAR16  *ReportText
++  )
++{
++  return IsVirtio (Handle, ReportText, VIRTIO_SUBSYSTEM_INPUT);
++}
++
+ /**
+   This function checks if a handle corresponds to the Virtio Device ID given
+   at the EFI_PCI_IO_PROTOCOL level.
+@@ -565,6 +593,33 @@ AddOutput (
+     ));
+ }
+ 
++/**
++  MultiVM: add the device path of a handle with SimpleTextIn (virtio keyboard)
++  to ConIn.
++**/
++STATIC
++VOID
++EFIAPI
++AddInput (
++  IN EFI_HANDLE    Handle,
++  IN CONST CHAR16  *ReportText
++  )
++{
++  EFI_DEVICE_PATH_PROTOCOL  *DevicePath;
++  VOID                      *Txt;
++
++  if (EFI_ERROR (gBS->HandleProtocol (Handle, &gEfiSimpleTextInProtocolGuid, &Txt))) {
++    return;
++  }
++
++  DevicePath = DevicePathFromHandle (Handle);
++  if (DevicePath == NULL) {
++    return;
++  }
++
++  EfiBootManagerUpdateConsoleVariable (ConIn, DevicePath, NULL);
++}
++
+ /**
+   This CALLBACK_FUNCTION retrieves the EFI_DEVICE_PATH_PROTOCOL from
+   the handle, appends serial, uart and terminal nodes, finally updates
+@@ -1023,6 +1078,13 @@ PlatformBootManagerBeforeConsole (
+   //
+   FilterAndProcess (&gEfiPciIoProtocolGuid, IsPciDisplay, Connect);
+ 
++  //
++  // MultiVM: virtio-mmio display and keyboard (see IsVirtioGpu).
++  //
++  FilterAndProcess (&gVirtioDeviceProtocolGuid, IsVirtioGpu, Connect);
++  FilterAndProcess (&gVirtioDeviceProtocolGuid, IsVirtioInput, Connect);
++  FilterAndProcess (&gVirtioDeviceProtocolGuid, IsVirtioInput, AddInput);
++
+   //
+   // Now add the device path of all handles with GOP on them to ConOut and
+   // ErrOut.
+diff --git a/OvmfPkg/Library/PlatformBootManagerLibLight/PlatformBootManagerLib.inf b/OvmfPkg/Library/PlatformBootManagerLibLight/PlatformBootManagerLib.inf
+index 8e7cd56..ae1dad2 100644
+--- a/OvmfPkg/Library/PlatformBootManagerLibLight/PlatformBootManagerLib.inf
++++ b/OvmfPkg/Library/PlatformBootManagerLibLight/PlatformBootManagerLib.inf
+@@ -76,4 +76,5 @@
+   gEfiGraphicsOutputProtocolGuid
+   gEfiMemoryAttributeProtocolGuid
+   gEfiPciRootBridgeIoProtocolGuid
++  gEfiSimpleTextInProtocolGuid
+   gVirtioDeviceProtocolGuid

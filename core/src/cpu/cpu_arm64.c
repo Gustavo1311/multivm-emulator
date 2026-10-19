@@ -5,6 +5,8 @@
  */
 #include "cpu_arm64.h"
 
+#include <pthread.h>
+
 #include <stdlib.h>
 
 #define XR(n) (c->x[n])
@@ -32,6 +34,24 @@ static void tlb_flush(a64_cpu *c)
             c->tlb[el][i].tag_r = TLB_INVALID;
             c->tlb[el][i].tag_w = TLB_INVALID;
             c->tlb[el][i].tag_x = TLB_INVALID;
+        }
+    c->fetch_page = 1;
+}
+
+static uint64_t tlbstat[8]; /* MVM_JIT_STATS: 0 sctlr 1 ttbr1 2 tcr 3 tlbi tudo 4 tlbi va 5 asid */
+
+/* so as entradas de enderecos da metade baixa (TTBR0, VA[55] = 0) */
+static void tlb_flush_user(a64_cpu *c)
+{
+    for (int el = 0; el < 2; el++)
+        for (unsigned i = 0; i < A64_TLB_SIZE; i++) {
+            a64_tlbe *e = &c->tlb[el][i];
+            uint64_t t = !(e->tag_r & TLB_INVALID) ? e->tag_r : !(e->tag_w & TLB_INVALID) ? e->tag_w : e->tag_x;
+            if (!(t & TLB_INVALID) && !((t >> 55) & 1)) {
+                e->tag_r = TLB_INVALID;
+                e->tag_w = TLB_INVALID;
+                e->tag_x = TLB_INVALID;
+            }
         }
     c->fetch_page = 1;
 }
@@ -219,11 +239,19 @@ static a64_tlbe *tlb_fill(a64_cpu *c, uint64_t va, int el, int acc)
                         ? reg->host + (ppage - reg->base) : NULL;
     uint64_t io = host ? 0 : TLB_IO;
     e->tag_r = (perm & 1) ? page | io : TLB_INVALID;
-    e->tag_w = (perm & 2) ? page | ((host && !reg->readonly && !reg->dirty_gen) ? 0 : TLB_IO)
+    /* paginas com codigo traduzido pelo JIT: escrita pelo caminho lento (space_write invalida) */
+    e->tag_w = (perm & 2) ? page | ((host && !reg->readonly && !reg->dirty_gen && !space_is_code(c->mem, ppage)) ? 0 : TLB_IO)
                           : TLB_INVALID;
     e->tag_x = (perm & 4) ? page | io : TLB_INVALID;
     e->addend = host ? (uintptr_t)host - (uintptr_t)page : 0;
-    e->pa = ppage;
+    __atomic_store_n(&e->pa, ppage, __ATOMIC_RELEASE);
+    /* varias CPUs: outra pode ter traduzido codigo nesta pagina enquanto a entrada era feita
+     * (ela marca o mapa e depois procura a pagina nas TLBs; aqui, grava a pagina e confere o mapa) */
+    if (c->smp && !(e->tag_w & (TLB_INVALID | TLB_IO))) {
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (space_is_code(c->mem, ppage))
+            __atomic_fetch_or(&e->tag_w, (uint64_t)TLB_IO, __ATOMIC_SEQ_CST);
+    }
     return e;
 }
 
@@ -266,6 +294,14 @@ void a64_write_slow(a64_cpu *c, uint64_t va, uint64_t val, unsigned size, int el
         return;
     }
     space_write(c->mem, e->pa | (va & 0xfff), val, size);
+}
+
+a64_tlbe *a64_tlb_exec(a64_cpu *c, uint64_t va)
+{
+    a64_tlbe *e = &c->tlb[c->el][(va >> 12) & (A64_TLB_SIZE - 1)];
+    if (!tag_hit(e->tag_x, va & ~0xfffULL))
+        e = tlb_fill(c, va, c->el, ACC_EXEC);
+    return e;
 }
 
 static uint32_t fetch_slow(a64_cpu *c, uint64_t pc)
@@ -754,6 +790,91 @@ static inline uint64_t ld_ext(a64_cpu *c, uint64_t addr, unsigned size, bool sig
     return v;
 }
 
+/* ---- atomicos com varias CPUs: operacoes atomicas do host na RAM do convidado ----
+ * Com uma CPU basta ler e gravar. Com varias, CAS/SWP/LD<op> usam atomicos do host e o par
+ * LDXR/STXR vira compare-and-swap do valor lido (como no QEMU: o problema ABA e aceito). */
+
+/* ponteiro do host para um acesso atomico: RAM gravavel, alinhado, pagina sem codigo traduzido.
+ * NULL = usa o caminho comum (E/S, pagina de codigo, desalinhado). Pode gerar falta (escrita). */
+static void *atomic_ptr(a64_cpu *c, uint64_t va, unsigned size)
+{
+    if (va & (size - 1))
+        return NULL;
+    a64_tlbe *e = &c->tlb[c->el][(va >> 12) & (A64_TLB_SIZE - 1)];
+    if (!tag_hit(e->tag_w, va & ~0xfffULL))
+        e = tlb_fill(c, va, c->el, ACC_WRITE);
+    if ((e->tag_w & TLB_IO) || !tag_hit(e->tag_r, va & ~0xfffULL))
+        return NULL;
+    return (void *)(e->addend + va);
+}
+
+/* compare-and-swap de 1..8 bytes; *exp recebe o valor encontrado */
+static bool cas_n(void *p, unsigned size, uint64_t *exp, uint64_t nv)
+{
+    switch (size) {
+    case 1: { uint8_t e = (uint8_t)*exp; bool ok = __atomic_compare_exchange_n((uint8_t *)p, &e, (uint8_t)nv, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *exp = e; return ok; }
+    case 2: { uint16_t e = (uint16_t)*exp; bool ok = __atomic_compare_exchange_n((uint16_t *)p, &e, (uint16_t)nv, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *exp = e; return ok; }
+    case 4: { uint32_t e = (uint32_t)*exp; bool ok = __atomic_compare_exchange_n((uint32_t *)p, &e, (uint32_t)nv, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *exp = e; return ok; }
+    default: { uint64_t e = *exp; bool ok = __atomic_compare_exchange_n((uint64_t *)p, &e, nv, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); *exp = e; return ok; }
+    }
+}
+
+/* CAS de 16 bytes (pares de 64 bits); lo/hi esperados recebem o valor encontrado */
+static bool cas_16(void *p, uint64_t *elo, uint64_t *ehi, uint64_t nlo, uint64_t nhi)
+{
+#if defined(__aarch64__)
+    /* LDAXP/STLXP: sem libatomic; quando difere, regrava o par lido (leitura atomica dos 16 bytes) */
+    uint64_t lo, hi;
+    uint32_t fail;
+    __asm__ volatile("1: ldaxp %0, %1, [%3]\n"
+                     "   cmp %0, %4\n"
+                     "   ccmp %1, %5, #0, eq\n"
+                     "   b.ne 2f\n"
+                     "   stlxp %w2, %6, %7, [%3]\n"
+                     "   cbnz %w2, 1b\n"
+                     "   b 3f\n"
+                     "2: stlxp %w2, %0, %1, [%3]\n"
+                     "   cbnz %w2, 1b\n"
+                     "   mov %w2, #1\n"
+                     "3:\n"
+                     : "=&r"(lo), "=&r"(hi), "=&r"(fail)
+                     : "r"(p), "r"(*elo), "r"(*ehi), "r"(nlo), "r"(nhi)
+                     : "cc", "memory");
+    *elo = lo;
+    *ehi = hi;
+    return fail == 0;
+#else
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    uint64_t *q = p;
+    bool ok = q[0] == *elo && q[1] == *ehi;
+    *elo = q[0];
+    *ehi = q[1];
+    if (ok) {
+        q[0] = nlo;
+        q[1] = nhi;
+    }
+    pthread_mutex_unlock(&mu);
+    return ok;
+#endif
+}
+
+static inline uint64_t load_n(void *p, unsigned size)
+{
+    switch (size) {
+    case 1: return __atomic_load_n((uint8_t *)p, __ATOMIC_SEQ_CST);
+    case 2: return __atomic_load_n((uint16_t *)p, __ATOMIC_SEQ_CST);
+    case 4: return __atomic_load_n((uint32_t *)p, __ATOMIC_SEQ_CST);
+    default: return __atomic_load_n((uint64_t *)p, __ATOMIC_SEQ_CST);
+    }
+}
+
+static inline void smp_fence(a64_cpu *c)
+{
+    if (c->smp)
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
 static void ldst_exclusive(a64_cpu *c, uint32_t insn)
 {
     unsigned size = BITS(insn, 31, 30), o2 = BIT(insn, 23), L = BIT(insn, 22), o1 = BIT(insn, 21);
@@ -764,9 +885,16 @@ static void ldst_exclusive(a64_cpu *c, uint32_t insn)
     if (o2 && o1) { /* CAS */
         uint64_t cmp = XR(rs), newv = XR(rt);
         uint64_t m = mask64(bytes * 8);
-        uint64_t old = a64_rd(c, addr, bytes);
-        if (old == (cmp & m))
-            a64_wr(c, addr, newv, bytes);
+        void *p = c->smp ? atomic_ptr(c, addr, bytes) : NULL;
+        uint64_t old;
+        if (p) {
+            old = cmp & m;
+            cas_n(p, bytes, &old, newv);
+        } else {
+            old = a64_rd(c, addr, bytes);
+            if (old == (cmp & m))
+                a64_wr(c, addr, newv, bytes);
+        }
         setx(c, rs, old);
         return;
     }
@@ -775,26 +903,45 @@ static void ldst_exclusive(a64_cpu *c, uint32_t insn)
             a64_undef(c);
         unsigned eb = size == 0 ? 4 : 8;
         uint64_t m = mask64(eb * 8);
-        uint64_t o0v = a64_rd(c, addr, eb), o1v = a64_rd(c, addr + eb, eb);
-        if (o0v == (XR(rs) & m) && o1v == (XR(rs + 1) & m)) {
-            a64_wr(c, addr, XR(rt), eb);
-            a64_wr(c, addr + eb, XR(rt + 1), eb);
+        void *p = c->smp ? atomic_ptr(c, addr, 2 * eb) : NULL;
+        uint64_t o0v, o1v;
+        if (p && eb == 4) {
+            uint64_t e = (XR(rs) & m) | ((XR(rs + 1) & m) << 32);
+            cas_n(p, 8, &e, (XR(rt) & m) | ((XR(rt + 1) & m) << 32));
+            o0v = (uint32_t)e;
+            o1v = e >> 32;
+        } else if (p) {
+            o0v = XR(rs);
+            o1v = XR(rs + 1);
+            cas_16(p, &o0v, &o1v, XR(rt), XR(rt + 1));
+        } else {
+            o0v = a64_rd(c, addr, eb);
+            o1v = a64_rd(c, addr + eb, eb);
+            if (o0v == (XR(rs) & m) && o1v == (XR(rs + 1) & m)) {
+                a64_wr(c, addr, XR(rt), eb);
+                a64_wr(c, addr + eb, XR(rt + 1), eb);
+            }
         }
         setx(c, rs, o0v);
         setx(c, rs + 1, o1v);
         return;
     }
     if (o2) { /* LDAR/STLR (e variantes LO) */
-        if (L)
+        if (L) {
             setx(c, rt, a64_rd(c, addr, bytes));
-        else
+            smp_fence(c);
+        } else {
+            smp_fence(c);
             a64_wr(c, addr, XR(rt), bytes);
+            smp_fence(c);
+        }
         return;
     }
     bool pair = o1;
     if (L) {
         if (pair) {
             unsigned eb = size == 2 ? 4 : 8;
+            /* duas leituras: se outra CPU mudar o par no meio, o CAS do STXP falha e o convidado repete */
             uint64_t a = a64_rd(c, addr, eb), b = a64_rd(c, addr + eb, eb);
             c->excl_val[0] = a;
             c->excl_val[1] = b;
@@ -809,6 +956,7 @@ static void ldst_exclusive(a64_cpu *c, uint32_t insn)
         }
         c->excl_addr = addr;
         c->excl_valid = true;
+        smp_fence(c);
         return;
     }
     /* STXR/STXP: Rs = status */
@@ -817,17 +965,47 @@ static void ldst_exclusive(a64_cpu *c, uint32_t insn)
         if (pair) {
             unsigned eb = size == 2 ? 4 : 8;
             if (c->excl_size == (int)eb * 2) {
-                a64_wr(c, addr, XR(rt), eb);
-                a64_wr(c, addr + eb, XR(rt2), eb);
-                status = 0;
+                void *p = c->smp ? atomic_ptr(c, addr, 2 * eb) : NULL;
+                if (p && eb == 4) {
+                    uint64_t e = (c->excl_val[0] & 0xffffffffu) | (c->excl_val[1] << 32);
+                    status = !cas_n(p, 8, &e, (XR(rt) & 0xffffffffu) | (XR(rt2) << 32));
+                } else if (p) {
+                    uint64_t lo = c->excl_val[0], hi = c->excl_val[1];
+                    status = !cas_16(p, &lo, &hi, XR(rt), XR(rt2));
+                } else {
+                    a64_wr(c, addr, XR(rt), eb);
+                    a64_wr(c, addr + eb, XR(rt2), eb);
+                    status = 0;
+                }
             }
         } else if (c->excl_size == (int)bytes) {
-            a64_wr(c, addr, XR(rt), bytes);
-            status = 0;
+            void *p = c->smp ? atomic_ptr(c, addr, bytes) : NULL;
+            if (p) {
+                uint64_t e = c->excl_val[0];
+                status = !cas_n(p, bytes, &e, XR(rt));
+            } else {
+                a64_wr(c, addr, XR(rt), bytes);
+                status = 0;
+            }
         }
     }
     c->excl_valid = false;
     setx(c, rs, status);
+}
+
+static uint64_t atomic_op(unsigned opc, uint64_t old, uint64_t s, unsigned bits)
+{
+    int64_t so = (int64_t)sext64(old, bits), ss = (int64_t)sext64(s, bits);
+    switch (opc) {
+    case 0: return old + s;
+    case 1: return old & ~s;
+    case 2: return old ^ s;
+    case 3: return old | s;
+    case 4: return so > ss ? old : s;
+    case 5: return so < ss ? old : s;
+    case 6: return old > s ? old : s;
+    default: return old < s ? old : s;
+    }
 }
 
 static void ldst_atomic(a64_cpu *c, uint32_t insn)
@@ -836,32 +1014,27 @@ static void ldst_atomic(a64_cpu *c, uint32_t insn)
     unsigned rs = BITS(insn, 20, 16), rn = BITS(insn, 9, 5), rt = insn & 31;
     unsigned bytes = 1u << size, bits = bytes * 8;
     uint64_t addr = xsp(c, rn);
-    if (o3) {
-        if (opc == 0) { /* SWP */
-            uint64_t old = a64_rd(c, addr, bytes);
-            a64_wr(c, addr, XR(rs), bytes);
-            setx(c, rt, old);
-            return;
-        }
-        if (opc == 4) { /* LDAPR */
-            setx(c, rt, a64_rd(c, addr, bytes));
-            return;
-        }
+    if (o3 && opc == 4) { /* LDAPR */
+        setx(c, rt, a64_rd(c, addr, bytes));
+        smp_fence(c);
+        return;
+    }
+    if (o3 && opc != 0)
         a64_undef(c);
+    uint64_t m = mask64(bits), s = XR(rs) & m;
+    void *p = c->smp ? atomic_ptr(c, addr, bytes) : NULL;
+    if (p) {
+        uint64_t old = load_n(p, bytes);
+        for (;;) {
+            uint64_t r = o3 ? s : atomic_op(opc, old, s, bits) & m; /* o3: SWP */
+            if (cas_n(p, bytes, &old, r))
+                break;
+        }
+        setx(c, rt, old);
+        return;
     }
-    uint64_t old = a64_rd(c, addr, bytes), s = XR(rs) & mask64(bits), r;
-    int64_t so = (int64_t)sext64(old, bits), ss = (int64_t)sext64(s, bits);
-    switch (opc) {
-    case 0: r = old + s; break;
-    case 1: r = old & ~s; break;
-    case 2: r = old ^ s; break;
-    case 3: r = old | s; break;
-    case 4: r = so > ss ? old : s; break;
-    case 5: r = so < ss ? old : s; break;
-    case 6: r = old > s ? old : s; break;
-    default: r = old < s ? old : s; break;
-    }
-    a64_wr(c, addr, r, bytes);
+    uint64_t old = a64_rd(c, addr, bytes);
+    a64_wr(c, addr, o3 ? XR(rs) : atomic_op(opc, old, s, bits), bytes);
     setx(c, rt, old);
 }
 
@@ -1123,7 +1296,7 @@ static uint64_t sysreg_read(a64_cpu *c, uint32_t key)
 {
     switch (key) {
     case SR(3, 0, 0, 0, 0): return 0x410fd034; /* MIDR: Cortex-A53 */
-    case SR(3, 0, 0, 0, 5): return 0x80000000; /* MPIDR */
+    case SR(3, 0, 0, 0, 5): return 0x80000000ULL | (uint64_t)c->index; /* MPIDR: Aff0 = indice da CPU */
     case SR(3, 0, 0, 0, 6): return 0;          /* REVIDR */
     case SR(3, 0, 0, 4, 0): return 0x11;       /* ID_AA64PFR0: EL0/EL1 AArch64, FP+AdvSIMD */
     case SR(3, 0, 0, 5, 0): return 0x6;        /* ID_AA64DFR0 */
@@ -1189,13 +1362,36 @@ static void sysreg_write(a64_cpu *c, uint32_t key, uint64_t v)
     switch (key) {
     case SR(3, 0, 1, 0, 0):
         c->sctlr = v;
+        tlbstat[0]++;
         tlb_flush(c);
         break;
     case SR(3, 0, 1, 0, 1): c->actlr = v; break;
     case SR(3, 0, 1, 0, 2): c->cpacr = v; break;
-    case SR(3, 0, 2, 0, 0): c->ttbr0 = v; tlb_flush(c); break;
-    case SR(3, 0, 2, 0, 1): c->ttbr1 = v; tlb_flush(c); break;
-    case SR(3, 0, 2, 0, 2): c->tcr = v; tlb_flush(c); break;
+    /* TTBR: a TLB e marcada por ASID na arquitetura, entao trocar a tabela sem mudar o ASID nao
+     * exige esvaziar (o Linux sem PAN troca o TTBR0 a cada entrada no kernel; quem reaproveita
+     * ASID faz TLBI). ASID novo: some a metade de usuario (TTBR0). */
+    case SR(3, 0, 2, 0, 0): {
+        uint64_t old = c->ttbr0;
+        c->ttbr0 = v;
+        if (!((c->tcr >> 22) & 1) && (old >> 48) != (v >> 48)) {
+            tlbstat[5]++;
+            tlb_flush_user(c);
+        }
+        break;
+    }
+    case SR(3, 0, 2, 0, 1): {
+        uint64_t old = c->ttbr1;
+        c->ttbr1 = v;
+        if ((old & 0x0000fffffffffffeULL) != (v & 0x0000fffffffffffeULL)) {
+            tlbstat[1]++;
+            tlb_flush(c);
+        } else if (((c->tcr >> 22) & 1) && (old >> 48) != (v >> 48)) {
+            tlbstat[5]++;
+            tlb_flush_user(c);
+        }
+        break;
+    }
+    case SR(3, 0, 2, 0, 2): c->tcr = v; tlbstat[2]++; tlb_flush(c); break;
     case SR(3, 2, 0, 0, 0): c->csselr = v; break;
     case SR(3, 0, 4, 0, 0): c->spsr = v; break;
     case SR(3, 0, 4, 0, 1): c->elr = v; break;
@@ -1234,6 +1430,76 @@ static void sysreg_write(a64_cpu *c, uint32_t key, uint64_t v)
     }
 }
 
+/* ---- TLB com varias CPUs ---- */
+
+static void tlbi_page(a64_cpu *c, uint64_t va)
+{
+    unsigned idx = (unsigned)(va >> 12) & (A64_TLB_SIZE - 1);
+    for (int el = 0; el < 2; el++) {
+        c->tlb[el][idx].tag_r = TLB_INVALID;
+        c->tlb[el][idx].tag_w = TLB_INVALID;
+        c->tlb[el][idx].tag_x = TLB_INVALID;
+    }
+    c->fetch_page = 1;
+}
+
+struct tlbi_req {
+    a64_cpu *from, *to;
+    bool all;
+    uint64_t va;
+};
+
+/* thread da CPU destino */
+static void tlbi_work(mvm_vm *vm, void *arg)
+{
+    (void)vm;
+    struct tlbi_req *r = arg;
+    if (r->all)
+        tlb_flush(r->to);
+    else
+        tlbi_page(r->to, r->va);
+    r->to->fetch_page = 1;
+    atomic_fetch_sub(&r->from->tlbi_left, 1);
+}
+
+static void tlbi_broadcast(a64_cpu *c, bool all, uint64_t va)
+{
+    mvm_vm *vm = c->vm;
+    for (int i = 0; i < vm->ncpus; i++) {
+        a64_cpu *o = vm->vcpu[i].cpu;
+        if (!o || o == c)
+            continue;
+        struct tlbi_req *r = malloc(sizeof(*r));
+        *r = (struct tlbi_req){c, o, all, va};
+        atomic_fetch_add(&c->tlbi_left, 1);
+        vm_run_on_cpu(vm, i, tlbi_work, r);
+    }
+}
+
+void a64_tlbi_wait(a64_cpu *c)
+{
+    while (atomic_load(&c->tlbi_left) > 0) {
+        vm_cpu_work_now(c->vm); /* pedidos das outras CPUs para esta (evita espera mutua) */
+        if (atomic_load(&c->vm->aps_quit))
+            break; /* a VM esta parando */
+#if defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+    }
+}
+
+/* outra CPU traduziu codigo na pagina fisica ppage: escritas desta CPU nela vao pelo caminho
+ * lento (chamada de outra thread: so liga o bit de E/S das entradas de escrita) */
+void a64_tlb_protect_remote(a64_cpu *c, uint64_t ppage)
+{
+    for (int el = 0; el < 2; el++)
+        for (unsigned i = 0; i < A64_TLB_SIZE; i++) {
+            a64_tlbe *e = &c->tlb[el][i];
+            if (__atomic_load_n(&e->pa, __ATOMIC_RELAXED) == ppage)
+                __atomic_fetch_or(&e->tag_w, (uint64_t)TLB_IO, __ATOMIC_SEQ_CST);
+        }
+}
+
 static void system_insn(a64_cpu *c, uint32_t insn)
 {
     unsigned L = BIT(insn, 21), op0 = BITS(insn, 20, 19), op1 = BITS(insn, 18, 16);
@@ -1251,10 +1517,15 @@ static void system_insn(a64_cpu *c, uint32_t insn)
             return; /* NOP, YIELD, WFE, SEV, BTI, PAC*SP, ... */
         }
         if (crn == 3 && op1 == 3) { /* barreiras */
-            if (op2 == 2)
+            if (op2 == 2) {
                 c->excl_valid = false; /* CLREX */
-            else if (op2 == 6)
+            } else if (op2 == 6) {
                 c->fetch_page = 1; /* ISB */
+            } else if (op2 == 4 || op2 == 5) { /* DSB / DMB */
+                if (op2 == 4 && atomic_load_explicit(&c->tlbi_left, memory_order_relaxed))
+                    a64_tlbi_wait(c); /* DSB conclui os TLBIs compartilhados */
+                smp_fence(c);
+            }
             return;
         }
         if (crn == 4) { /* MSR (imediato) PSTATE */
@@ -1298,7 +1569,23 @@ static void system_insn(a64_cpu *c, uint32_t insn)
         if (crn == 8) { /* TLBI */
             if (c->el == 0)
                 a64_undef(c);
+            /* por VA (VAE1, VAAE1, VALE1, VAALE1; IS/OS/local): so a pagina. A TLB nao guarda
+             * ASID, entao as formas por ASID/tudo esvaziam tudo. */
+            /* formas IS/OS (CRm 3/1) valem para todas as CPUs: as outras recebem o pedido e o
+             * proximo DSB desta CPU espera elas concluirem */
+            bool shared = c->smp && (crm == 3 || crm == 1);
+            if (op1 == 0 && (crm == 7 || crm == 3 || crm == 1) && (op2 == 1 || op2 == 3 || op2 == 5 || op2 == 7)) {
+                uint64_t va = sext64((v & 0xfffffffffffULL) << 12, 56);
+                tlbi_page(c, va);
+                tlbstat[4]++;
+                if (shared)
+                    tlbi_broadcast(c, false, va);
+                return;
+            }
+            tlbstat[3]++;
             tlb_flush(c);
+            if (shared)
+                tlbi_broadcast(c, true, 0);
             return;
         }
         return;
@@ -1310,6 +1597,82 @@ static void system_insn(a64_cpu *c, uint32_t insn)
         setx(c, rt, sysreg_read(c, key));
     else
         sysreg_write(c, key, XR(rt));
+}
+
+/* ---------------------------------------------------------- PSCI (varias CPUs) */
+
+#define PSCI_E_INVALID (-2)
+#define PSCI_E_ALREADY_ON (-4)
+#define PSCI_E_ON_PENDING (-5)
+
+static int64_t psci_cpu_on(a64_cpu *c, uint64_t target, uint64_t entry, uint64_t ctx)
+{
+    mvm_vm *vm = c->vm;
+    if (target & ~0xffULL & 0xff00ffffffULL) /* so Aff0 */
+        return PSCI_E_INVALID;
+    int idx = (int)(target & 0xff);
+    if (idx >= vm->ncpus || !vm->vcpu[idx].cpu)
+        return PSCI_E_INVALID;
+    a64_cpu *t = vm->vcpu[idx].cpu;
+    vm_bql_lock(vm); /* a CPU destino le entrada/contexto com a trava ao ligar */
+    int64_t r = 0;
+    if (t->power == A64_ON) {
+        r = PSCI_E_ALREADY_ON;
+    } else if (t->power == A64_ON_PENDING) {
+        r = PSCI_E_ON_PENDING;
+    } else {
+        t->on_entry = entry;
+        t->on_ctx = ctx;
+        atomic_store(&t->power, A64_ON_PENDING);
+    }
+    vm_bql_unlock(vm);
+    if (!r)
+        vm_cpu_kick(vm, idx);
+    return r;
+}
+
+static int64_t psci_call(a64_cpu *c, uint32_t fn, bool *handled)
+{
+    mvm_vm *vm = c->vm;
+    *handled = true;
+    if (vm->ncpus > 1) {
+        switch (fn) {
+        case PSCI_CPU_ON_32:
+            return psci_cpu_on(c, (uint32_t)c->x[1], (uint32_t)c->x[2], (uint32_t)c->x[3]);
+        case PSCI_CPU_ON_64:
+            return psci_cpu_on(c, c->x[1], c->x[2], c->x[3]);
+        case PSCI_CPU_OFF: /* esta CPU para ate um novo CPU_ON */
+            atomic_store(&c->power, A64_OFF);
+            c->halted = true;
+            atomic_store(c->exit_flag, 1);
+            return 0;
+        case PSCI_AFFINITY_INFO_32:
+        case PSCI_AFFINITY_INFO_64: {
+            uint64_t t = fn == PSCI_AFFINITY_INFO_32 ? (uint32_t)c->x[1] : c->x[1];
+            if ((t & ~0xffULL & 0xff00ffffffULL) || (int)(t & 0xff) >= vm->ncpus || c->x[2] != 0)
+                return PSCI_E_INVALID;
+            a64_cpu *o = vm->vcpu[t & 0xff].cpu;
+            int p = atomic_load(&o->power);
+            return p == A64_ON ? 0 : p == A64_OFF ? 1 : 2;
+        }
+        default:
+            break;
+        }
+    }
+    return arm_psci_call(vm, fn, c->x[1], handled);
+}
+
+/* CPU_ON chegou (thread desta CPU): estado de reset, MMU desligada, entrada com x0 = contexto */
+static void core_reset(a64_cpu *c);
+static void psci_start(a64_cpu *c)
+{
+    vm_bql_lock(c->vm);
+    core_reset(c);
+    gt_reset(&c->gt);
+    c->pc = c->on_entry;
+    c->x[0] = c->on_ctx;
+    atomic_store(&c->power, A64_ON);
+    vm_bql_unlock(c->vm);
 }
 
 /* ---------------------------------------------------------- desvios */
@@ -1376,8 +1739,8 @@ static void branch_sys(a64_cpu *c, uint32_t insn)
         if (opc == 0 && (ll == 2 || ll == 3)) { /* HVC/SMC -> PSCI */
             if (c->el == 0)
                 a64_undef(c);
-            bool handled;
-            int64_t r = arm_psci_call(c->vm, (uint32_t)c->x[0], c->x[1], &handled);
+            bool handled = true;
+            int64_t r = psci_call(c, (uint32_t)c->x[0], &handled);
             if (!handled)
                 LOGD("a64: chamada %s 0x%llx desconhecida", ll == 2 ? "HVC" : "SMC",
                      (unsigned long long)c->x[0]);
@@ -1452,10 +1815,24 @@ static void a64_exec(a64_cpu *c, uint32_t insn)
     }
 }
 
+/* SVC chamado pelo JIT: toma a excecao e volta (o JIT segue para o vetor sem longjmp) */
+void a64_svc_helper(a64_cpu *c, uint32_t insn)
+{
+    take_exception(c, 0, (0x15u << 26) | (1u << 25) | BITS(insn, 20, 5), c->pc);
+}
+
+/* uma instrucao chamada pelo JIT (c->cur/c->pc/c->nzcv ja gravados) */
+void a64_exec_helper(a64_cpu *c, uint32_t insn) { a64_exec(c, insn); }
+
 static int64_t a64_run(void *opaque, int64_t budget)
 {
     a64_cpu *c = opaque;
     volatile int64_t n = 0;
+    if (unlikely(atomic_load_explicit(&c->power, memory_order_acquire) != A64_ON)) {
+        if (atomic_load(&c->power) == A64_OFF)
+            return 0; /* desligada (PSCI): espera o CPU_ON */
+        psci_start(c);
+    }
     if (c->halted) {
         if (!c->irq_line && !c->fiq_line)
             return 0;
@@ -1466,8 +1843,15 @@ static int64_t a64_run(void *opaque, int64_t budget)
         if (unlikely((c->irq_line && !(c->daif & 2)) || (c->fiq_line && !(c->daif & 1)))) {
             take_exception(c, (c->fiq_line && !(c->daif & 1)) ? 2 : 1, 0, c->pc);
         }
-        if (unlikely(c->halted || atomic_load_explicit(&c->vm->cpu_exit, memory_order_relaxed)))
+        if (unlikely(c->halted || atomic_load_explicit(c->exit_flag, memory_order_relaxed)))
             break;
+        if (c->jit) {
+            int64_t r = a64_jit_run(c->jit, budget - n);
+            if (r > 0) {
+                n += r;
+                continue;
+            }
+        }
         uint64_t pc = c->pc;
         c->cur = pc;
         uint32_t insn = fetch(c, pc);
@@ -1481,12 +1865,15 @@ static int64_t a64_run(void *opaque, int64_t budget)
 static bool a64_halted(void *opaque)
 {
     a64_cpu *c = opaque;
-    return c->halted && !c->irq_line && !c->fiq_line;
+    int p = atomic_load_explicit(&c->power, memory_order_acquire);
+    if (p == A64_ON_PENDING)
+        return false; /* CPU_ON chegou: precisa rodar para ligar */
+    return p == A64_OFF || (c->halted && !c->irq_line && !c->fiq_line);
 }
 
-static void a64_reset(void *opaque)
+/* registradores e sistema no estado de reset (sem timer nem JIT) */
+static void core_reset(a64_cpu *c)
 {
-    a64_cpu *c = opaque;
     memset(c->x, 0, sizeof(c->x));
     memset(c->v, 0, sizeof(c->v));
     c->sp[0] = c->sp[1] = 0;
@@ -1506,8 +1893,16 @@ static void a64_reset(void *opaque)
     c->pmuserenr = 0;
     c->excl_valid = false;
     c->halted = false;
-    gt_reset(&c->gt);
     tlb_flush(c);
+}
+
+static void a64_reset(void *opaque)
+{
+    a64_cpu *c = opaque;
+    core_reset(c);
+    gt_reset(&c->gt);
+    if (c->jit)
+        a64_jit_reset(c->jit);
 }
 
 static void a64_dump(void *opaque, FILE *f)
@@ -1530,6 +1925,12 @@ static void a64_destroy(void *opaque)
     a64_cpu *c = opaque;
     c->gt.irq = NULL; /* a maquina (GIC) ja pode ter sido liberada */
     gt_reset(&c->gt);
+    if (c->jit)
+        a64_jit_free(c->jit);
+    if (getenv("MVM_JIT_STATS"))
+        LOGI("a64 TLB: esvaziamentos sctlr %llu ttbr1 %llu tcr %llu tlbi-tudo %llu; tlbi-va %llu; asid %llu",
+             (unsigned long long)tlbstat[0], (unsigned long long)tlbstat[1], (unsigned long long)tlbstat[2],
+             (unsigned long long)tlbstat[3], (unsigned long long)tlbstat[4], (unsigned long long)tlbstat[5]);
     free(c);
 }
 
@@ -1550,10 +1951,12 @@ void *arm64_cpu_new(mvm_vm *vm, const arm_hooks *hooks)
     c->vm = vm;
     c->mem = &vm->mem;
     c->hooks = *hooks;
+    c->exit_flag = &vm->cpu_exit;
     gt_init(&c->gt, vm);
     c->gt.irq = hooks->timer_irq;
     c->gt.opaque = hooks->opaque;
     a64_reset(c);
+    c->jit = a64_jit_new(c);
     return c;
 }
 
@@ -1565,7 +1968,23 @@ void arm64_set_irq(void *opaque, int line, int level)
     else
         __atomic_store_n(&c->fiq_line, level, __ATOMIC_RELEASE);
     if (level)
-        vm_cpu_signal(c->vm); /* vinda de outra thread: a CPU sai da fatia e olha a linha */
+        vm_cpu_kick(c->vm, c->index); /* vinda de outra thread: a CPU sai da fatia e olha a linha */
+}
+
+void arm64_set_index(void *opaque, int index, int ncpus)
+{
+    a64_cpu *c = opaque;
+    c->index = index;
+    c->exit_flag = vm_cpu_exit_flag(c->vm, index);
+    c->smp = ncpus > 1;
+}
+
+void arm64_set_powered(void *opaque, bool on)
+{
+    a64_cpu *c = opaque;
+    atomic_store(&c->power, on ? A64_ON : A64_OFF);
+    if (!on)
+        c->halted = true;
 }
 
 void arm64_set_entry(void *opaque, uint64_t pc, uint64_t x0)

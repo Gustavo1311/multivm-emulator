@@ -182,7 +182,7 @@ const char *blk_format(const mvm_blk *b);
 
 /* ---- entrada ---- */
 typedef struct {
-    uint8_t type;   /* 0 = tecla, 1 = ponteiro, 2 = botao de energia */
+    uint8_t type;   /* 0 = tecla, 1 = ponteiro, 2 = botao de energia, 3 = tamanho de tela preferido (dx x dy) */
     uint8_t pressed;
     uint16_t code;
     int16_t dx, dy, dz;
@@ -286,6 +286,13 @@ struct mvm_vm {
     void (*fb_flush)(void *opaque); /* desenha o que estiver pendente (thread da VM) */
     void *fb_flush_opaque;
 
+    /* teclado virtio: apertos entregues ao convidado / descartados (kbd_stats = ha contagem) */
+    _Atomic uint32_t kbd_delivered, kbd_dropped;
+    bool kbd_stats;
+    /* ponteiro do mouse na tela, quando a placa de video sabe (cursor de hardware da virtio-gpu) */
+    _Atomic int32_t cursor_x, cursor_y;
+    _Atomic bool cursor_on;
+
     /* entrada (produtor: threads externas; consumidor: thread da VM) */
     pthread_mutex_t in_lock;
     mvm_input_event inq[INPUT_QUEUE];
@@ -312,6 +319,9 @@ struct mvm_vm {
     bool io_started;
     _Atomic int io_active;      /* 0: a thread de E/S fica parada e a CPU faz o servico (depuracao) */
     pthread_t io_thread;
+    _Atomic int io_tid;         /* tid do Linux da thread de E/S (0 = nao rodando) */
+    /* prioridade (nice) pedida para as threads da VM; MVM_PRIO_KEEP = nao mexer */
+    _Atomic int prio;
     _Atomic int io_quit;
     _Atomic int io_kick;        /* acorda a thread de E/S */
     /* CPUs (a 0 roda na thread de mvm_run; as outras em threads proprias) */
@@ -320,12 +330,17 @@ struct mvm_vm {
         void *cpu;
         pthread_t thread;
         bool started;
+        _Atomic int tid; /* tid do Linux da thread desta CPU (0 = nao rodando) */
         /* trabalho pedido por outras threads que precisa rodar na thread desta CPU */
         pthread_mutex_t work_lock;
         struct vm_work *work_head, *work_tail;
         _Atomic int work_pending;
         _Atomic int exit_req; /* sair da fatia ja (a CPU 0 usa cpu_exit) */
         _Atomic int wake;     /* acordar do HLT (a CPU 0 usa kick) */
+        /* espera propria das CPUs extras: so quem esta dormindo recebe sinal (sem acordar todas) */
+        pthread_mutex_t wait_lock;
+        pthread_cond_t wait_cond;
+        _Atomic int sleeping;
         /* estatistica (MVM_SMP_STATS): ns executando, parada em HLT e esperando a bql */
         int64_t st_run, st_halt, st_bql;
         uint64_t st_insns;
@@ -341,6 +356,7 @@ typedef struct mvm_vm mvm_vm;
  * nas chamadas diretas da CPU a dispositivos (PIC/APIC, GIC, timers). */
 void vm_bql_lock(mvm_vm *vm);
 void vm_bql_unlock(mvm_vm *vm);
+bool vm_bql_held(void); /* esta thread segura a bql */
 /* indice da CPU que roda nesta thread (-1 = outra thread: E/S, app...) */
 int vm_cpu_index(mvm_vm *vm);
 /* esta thread pode mexer no estado privado da CPU idx (TLB, JIT)? Tambem com a VM parada. */

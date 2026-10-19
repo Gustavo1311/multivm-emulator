@@ -169,25 +169,88 @@ static void tlb_flush(a32_cpu *c)
     c->fetch_page = 1;
 }
 
+static void tlb_flush_page(a32_cpu *c, uint32_t va)
+{
+    unsigned idx = (va >> 12) & (A32_TLB_SIZE - 1);
+    for (int p = 0; p < 2; p++)
+        c->tlb[p][idx].tag_r = c->tlb[p][idx].tag_w = c->tlb[p][idx].tag_x = A32_TLB_INVALID;
+    c->fetch_page = 1;
+}
+
+/* ---- TLB com varias CPUs: as variantes IS (inner shareable) valem para todas ---- */
+
+struct tlbi_req {
+    a32_cpu *from, *to;
+    bool all;
+    uint32_t va;
+};
+
+/* thread da CPU destino */
+static void tlbi_work(mvm_vm *vm, void *arg)
+{
+    (void)vm;
+    struct tlbi_req *r = arg;
+    if (r->all)
+        tlb_flush(r->to);
+    else
+        tlb_flush_page(r->to, r->va);
+    atomic_fetch_sub(&r->from->tlbi_left, 1); /* r e liberado pela fila de trabalho */
+}
+
+static void tlbi_broadcast(a32_cpu *c, bool all, uint32_t va)
+{
+    mvm_vm *vm = c->vm;
+    for (int i = 0; i < vm->ncpus; i++) {
+        a32_cpu *o = vm->vcpu[i].cpu;
+        if (!o || o == c)
+            continue;
+        struct tlbi_req *r = malloc(sizeof(*r));
+        *r = (struct tlbi_req){c, o, all, va};
+        atomic_fetch_add(&c->tlbi_left, 1);
+        vm_run_on_cpu(vm, i, tlbi_work, r);
+    }
+}
+
+/* DSB: espera as outras CPUs concluirem os TLBIs compartilhados desta */
+static void tlbi_wait(a32_cpu *c)
+{
+    while (atomic_load(&c->tlbi_left) > 0) {
+        vm_cpu_work_now(c->vm); /* pedidos das outras CPUs para esta (evita espera mutua) */
+        if (atomic_load(&c->vm->aps_quit))
+            break;
+#if defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+    }
+}
+
+/* MCR p15, 0, Rt, c8, crm, opc2: TLBIALL/MVA/ASID/MVAA (crm 3 = IS, 5/6/7 = local) */
+static void tlb_maint(a32_cpu *c, unsigned crm, unsigned opc2, uint32_t v)
+{
+    bool page = opc2 == 1 || opc2 == 3 || opc2 == 5 || opc2 == 7; /* MVA, MVAA (e as "L" do v8) */
+    uint32_t va = v & ~0xfffu;
+    if (page)
+        tlb_flush_page(c, va);
+    else
+        tlb_flush(c);
+    if (c->smp && crm == 3)
+        tlbi_broadcast(c, !page, va);
+}
+
 static uint32_t phys_rd32(a32_cpu *c, uint32_t pa)
 {
     uint8_t *p = space_ram_ptr(c->mem, pa, 4, false);
     return p ? (uint32_t)ld_le(p, 4) : (uint32_t)space_read(c->mem, pa, 4);
 }
 
-/* Retorna 0 em sucesso; senao FSR (FS + dominio em 7:4). */
-static uint32_t translate(a32_cpu *c, uint32_t va, int priv, uint32_t *pa_out, int *perm_out)
+/* Descritores curtos (TTBCR.EAE = 0). Retorna 0 em sucesso; senao 0x10000 | FSR (FS + dominio em 7:4). */
+static uint32_t translate_short(a32_cpu *c, uint32_t va, int priv, uint32_t *pa_out, int *perm_out)
 {
-    if (!(c->sctlr & 1)) {
-        *pa_out = va;
-        *perm_out = 7;
-        return 0;
-    }
     uint32_t n = c->ttbcr & 7, table;
     if (n && (va >> (32 - n)))
-        table = c->ttbr1 & 0xffffc000u;
+        table = (uint32_t)c->ttbr1 & 0xffffc000u;
     else
-        table = c->ttbr0 & (0xffffc000u >> n);
+        table = (uint32_t)c->ttbr0 & (0xffffc000u >> n);
     uint32_t d1 = phys_rd32(c, table | ((va >> 20) << 2));
     uint32_t type = d1 & 3;
     uint32_t dom = (d1 >> 5) & 15;
@@ -254,6 +317,113 @@ static uint32_t translate(a32_cpu *c, uint32_t va, int priv, uint32_t *pa_out, i
     return 0;
 }
 
+
+static uint64_t phys_rd64(a32_cpu *c, uint64_t pa)
+{
+    if (pa >> 32)
+        return 0; /* fora do espaco fisico da maquina: tratado como descritor invalido */
+    uint8_t *p = space_ram_ptr(c->mem, (uint32_t)pa, 8, false);
+    return p ? ld_le(p, 8) : space_read(c->mem, (uint32_t)pa, 8);
+}
+
+#define LPAE_FAULT(st) (0x20000u | (st))
+
+/*
+ * Descritores longos (LPAE, TTBCR.EAE = 1), estagio 1 do VMSAv7: tabelas de 3 niveis com descritores
+ * de 64 bits, enderecos fisicos de 40 bits (aqui so os 4 GiB baixos existem). Os dominios nao valem;
+ * as permissoes vem de AP[2:1], XN/PXN e dos limites hierarquicos APTable/XNTable/PXNTable.
+ * Retorna 0 ou LPAE_FAULT(status do DFSR/IFSR longo); em sucesso, perm_out tem rwx e o nivel em 17:16
+ * (para o codigo da falta de permissao).
+ */
+static uint32_t translate_lpae(a32_cpu *c, uint32_t va, int priv, uint64_t *pa_out, int *perm_out)
+{
+    uint32_t t0sz = c->ttbcr & 7, t1sz = (c->ttbcr >> 16) & 7;
+    int sel;
+    if (t0sz && !(va >> (32 - t0sz)))
+        sel = 0;
+    else if (t1sz && !((~va) >> (32 - t1sz)))
+        sel = 1;
+    else if (!t0sz)
+        sel = 0;
+    else if (!t1sz)
+        sel = 1;
+    else
+        return LPAE_FAULT(0x04 | 1); /* falta de traducao, nivel 1 */
+    uint32_t tsz = sel ? t1sz : t0sz;
+    if ((c->ttbcr >> (sel ? 23 : 7)) & 1) /* EPD0/EPD1: caminhada desabilitada */
+        return LPAE_FAULT(0x04 | 1);
+    uint64_t ttbr = sel ? c->ttbr1 : c->ttbr0;
+    /* com TxSZ >= 2 a regiao tem no maximo 1 GiB e a busca comeca no nivel 2 */
+    int level = tsz >= 2 ? 2 : 1;
+    unsigned x = tsz >= 2 ? 14 - tsz : 5 - tsz;
+    uint64_t table = ttbr & 0xffffffffffull & ~((1ull << x) - 1);
+    bool ap_noel0 = false, ap_ro = false, xn_t = false, pxn_t = false;
+    for (;;) {
+        unsigned shift = level == 1 ? 30 : level == 2 ? 21 : 12;
+        uint32_t idx = level == 1 ? (va >> 30) & ((1u << (2 - tsz)) - 1) : (va >> shift) & 0x1ff;
+        if (level == 2 && tsz >= 2)
+            idx &= (1u << (32 - tsz - 21)) - 1;
+        uint64_t d = phys_rd64(c, table + idx * 8ull);
+        unsigned type = d & 3;
+        if (!(type & 1) || (level == 3 && type != 3))
+            return LPAE_FAULT(0x04 | level);
+        if (level < 3 && type == 3) { /* tabela */
+            ap_noel0 |= (d >> 61) & 1;
+            ap_ro |= (d >> 62) & 1;
+            xn_t |= (d >> 60) & 1;
+            pxn_t |= (d >> 59) & 1;
+            table = d & 0xfffffff000ull;
+            level++;
+            continue;
+        }
+        /* bloco (niveis 1 e 2) ou pagina (nivel 3) */
+        uint64_t mask = (1ull << shift) - 1;
+        uint64_t pa = (d & 0xfffffff000ull & ~mask) | (va & mask);
+        if (!((d >> 10) & 1)) /* AF */
+            return LPAE_FAULT(0x08 | level);
+        bool el0 = ((d >> 6) & 1) && !ap_noel0;
+        bool ro = ((d >> 7) & 1) || ap_ro;
+        bool xn = ((d >> 54) & 1) || xn_t;
+        bool pxn = ((d >> 53) & 1) || pxn_t;
+        int perm;
+        if (priv) {
+            perm = 1 | (ro ? 0 : 2);
+            if (!xn && !pxn)
+                perm |= 4;
+        } else {
+            perm = el0 ? (1 | (ro ? 0 : 2)) : 0;
+            if (el0 && !xn)
+                perm |= 4;
+        }
+        if ((c->sctlr >> 19) & 1 && (perm & 2)) /* WXN */
+            perm &= ~4;
+        if (pa >> 32)
+            return LPAE_FAULT(0x10); /* aborto externo: nao ha nada acima de 4 GiB */
+        *pa_out = pa;
+        *perm_out = perm | (level << 16) | (1 << 18);
+        return 0;
+    }
+}
+
+static inline bool lpae_on(const a32_cpu *c) { return c->ttbcr >> 31; }
+
+/* Retorna 0 em sucesso; senao 0x10000 | FSR curto ou LPAE_FAULT(status longo). */
+static uint32_t translate(a32_cpu *c, uint32_t va, int priv, uint32_t *pa_out, int *perm_out)
+{
+    if (!(c->sctlr & 1)) {
+        *pa_out = va;
+        *perm_out = 7;
+        return 0;
+    }
+    if (lpae_on(c)) {
+        uint64_t pa = 0;
+        uint32_t f = translate_lpae(c, va, priv, &pa, perm_out);
+        *pa_out = (uint32_t)pa;
+        return f;
+    }
+    return translate_short(c, va, priv, pa_out, perm_out);
+}
+
 static void exception(a32_cpu *c, uint32_t off, uint32_t mode, uint32_t lr)
 {
     uint32_t cpsr = a32_get_cpsr(c);
@@ -307,10 +477,15 @@ void a32_exc_return(a32_cpu *c, uint32_t pc)
 
 static _Noreturn void mem_abort(a32_cpu *c, uint32_t va, uint32_t fsr, int acc)
 {
-    uint32_t fs = fsr & 0xf, dom = (fsr >> 4) & 0xf;
-    uint32_t v = fs | (dom << 4); /* nenhuma das nossas faltas usa FS[4] */
+    uint32_t v;
+    if (fsr & 0x20000) {
+        v = (fsr & 0x3f) | (1u << 9); /* formato longo: STATUS[5:0] + bit LPAE */
+    } else {
+        uint32_t fs = fsr & 0xf, dom = (fsr >> 4) & 0xf;
+        v = fs | (dom << 4); /* nenhuma das nossas faltas usa FS[4] */
+    }
     if (acc == 2) {
-        c->ifsr = v & ~0xf0u;
+        c->ifsr = (fsr & 0x20000) ? v : v & ~0xf0u;
         c->ifar = va;
         raise_exc(c, 0x0c, M_ABT, c->cur + 4);
     }
@@ -327,9 +502,11 @@ static a32_tlbe *tlb_fill(a32_cpu *c, uint32_t va, int priv, int acc)
     int perm;
     uint32_t f = translate(c, va, priv, &pa, &perm);
     if (f)
-        mem_abort(c, va, f & 0xffff, acc);
+        mem_abort(c, va, f & 0x2ffff, acc);
     int need = acc == 0 ? 1 : acc == 1 ? 2 : 4;
     if (!(perm & need)) {
+        if ((perm >> 18) & 1) /* LPAE: falta de permissao no nivel da folha */
+            mem_abort(c, va, LPAE_FAULT(0x0c | ((perm >> 16) & 3)), acc);
         bool page = (perm >> 8) & 1;
         uint32_t dom = (uint32_t)(perm >> 12) & 15;
         mem_abort(c, va, (page ? 0xf : 0xd) | (dom << 4), acc);
@@ -420,6 +597,101 @@ static inline uint32_t fetch32(a32_cpu *c, uint32_t pc)
 }
 
 /* ------------------------------------------------------------ operacoes */
+
+/* ---- exclusivos e SWP ----
+ * Com uma CPU basta ler e gravar. Com varias, SWP vira troca atomica do host e STREX vira
+ * compare-and-swap do valor lido pelo LDREX (como no ARM64 e no QEMU: o problema ABA e aceito). */
+
+/* ponteiro do host para um acesso atomico: RAM, alinhado; NULL = caminho comum. Pode gerar falta. */
+static void *atomic_ptr(a32_cpu *c, uint32_t va, unsigned size, bool write)
+{
+    if (va & (size - 1))
+        return NULL;
+    int p = a32_priv(c);
+    a32_tlbe *e = &c->tlb[p][(va >> 12) & (A32_TLB_SIZE - 1)];
+    uint32_t page = va & ~0xfffu;
+    if (write) {
+        if (!hit(e->tag_w, page))
+            e = tlb_fill(c, va, p, 1);
+        if ((e->tag_w & A32_TLB_IO) || !hit(e->tag_r, page))
+            return NULL;
+    } else {
+        if (!hit(e->tag_r, page))
+            e = tlb_fill(c, va, p, 0);
+        if (e->tag_r & A32_TLB_IO)
+            return NULL;
+    }
+    return (void *)(e->addend + va);
+}
+
+static bool cas_n(void *p, unsigned size, uint64_t exp, uint64_t nv)
+{
+    switch (size) {
+    case 1: { uint8_t e = (uint8_t)exp; return __atomic_compare_exchange_n((uint8_t *)p, &e, (uint8_t)nv, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
+    case 2: { uint16_t e = (uint16_t)exp; return __atomic_compare_exchange_n((uint16_t *)p, &e, (uint16_t)nv, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
+    case 4: { uint32_t e = (uint32_t)exp; return __atomic_compare_exchange_n((uint32_t *)p, &e, (uint32_t)nv, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
+    default: { uint64_t e = exp; return __atomic_compare_exchange_n((uint64_t *)p, &e, nv, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
+    }
+}
+
+uint32_t a32_ldrex(a32_cpu *c, uint32_t addr, unsigned sz, uint32_t *hi)
+{
+    uint64_t v;
+    void *p = c->smp ? atomic_ptr(c, addr, sz, false) : NULL;
+    if (p) {
+        switch (sz) {
+        case 1: v = __atomic_load_n((uint8_t *)p, __ATOMIC_SEQ_CST); break;
+        case 2: v = __atomic_load_n((uint16_t *)p, __ATOMIC_SEQ_CST); break;
+        case 4: v = __atomic_load_n((uint32_t *)p, __ATOMIC_SEQ_CST); break;
+        default: v = __atomic_load_n((uint64_t *)p, __ATOMIC_SEQ_CST); break;
+        }
+    } else if (sz == 8) {
+        uint32_t lo = a32_rd(c, addr, 4);
+        v = lo | ((uint64_t)a32_rd(c, addr + 4, 4) << 32);
+    } else {
+        v = a32_rd(c, addr, sz);
+    }
+    c->excl_addr = addr;
+    c->excl_val = v;
+    c->excl_size = (int)sz;
+    c->excl_valid = true;
+    if (hi)
+        *hi = (uint32_t)(v >> 32);
+    return (uint32_t)v;
+}
+
+uint32_t a32_strex(a32_cpu *c, uint32_t addr, unsigned sz, uint32_t lo, uint32_t hi)
+{
+    uint32_t status = 1;
+    if (c->excl_valid && c->excl_addr == addr && c->excl_size == (int)sz) {
+        uint64_t nv = sz == 8 ? lo | ((uint64_t)hi << 32) : lo;
+        void *p = c->smp ? atomic_ptr(c, addr, sz, true) : NULL;
+        if (p) {
+            status = !cas_n(p, sz, c->excl_val, nv);
+        } else {
+            if (sz == 8) {
+                a32_wr(c, addr, lo, 4);
+                a32_wr(c, addr + 4, hi, 4);
+            } else {
+                a32_wr(c, addr, lo, sz);
+            }
+            status = 0;
+        }
+    }
+    c->excl_valid = false;
+    return status;
+}
+
+uint32_t a32_swp(a32_cpu *c, uint32_t addr, unsigned sz, uint32_t v)
+{
+    void *p = c->smp ? atomic_ptr(c, addr, sz, true) : NULL;
+    if (p)
+        return sz == 1 ? __atomic_exchange_n((uint8_t *)p, (uint8_t)v, __ATOMIC_SEQ_CST)
+                       : __atomic_exchange_n((uint32_t *)p, v, __ATOMIC_SEQ_CST);
+    uint32_t old = a32_rd(c, addr, sz);
+    a32_wr(c, addr, v, sz);
+    return old;
+}
 
 static inline uint32_t add_c(uint32_t a, uint32_t b, uint32_t cin, uint32_t *cout, uint32_t *vout)
 {
@@ -554,11 +826,75 @@ void a32_ldm_stm(a32_cpu *c, bool load, bool inc, bool before, unsigned rn, bool
     }
 }
 
+#define PSCI_E_INVALID (-2)
+#define PSCI_E_ALREADY_ON (-4)
+#define PSCI_E_ON_PENDING (-5)
+
+static int64_t psci_cpu_on(a32_cpu *c, uint64_t target, uint32_t entry, uint32_t ctx)
+{
+    mvm_vm *vm = c->vm;
+    if (target & ~0xffULL & 0xff00ffffffULL) /* so Aff0 */
+        return PSCI_E_INVALID;
+    int idx = (int)(target & 0xff);
+    if (idx >= vm->ncpus || !vm->vcpu[idx].cpu)
+        return PSCI_E_INVALID;
+    a32_cpu *t = vm->vcpu[idx].cpu;
+    vm_bql_lock(vm); /* a CPU destino le entrada/contexto com a trava ao ligar */
+    int64_t r = 0;
+    if (t->power == A32_ON) {
+        r = PSCI_E_ALREADY_ON;
+    } else if (t->power == A32_ON_PENDING) {
+        r = PSCI_E_ON_PENDING;
+    } else {
+        t->on_entry = entry;
+        t->on_ctx = ctx;
+        atomic_store(&t->power, A32_ON_PENDING);
+    }
+    vm_bql_unlock(vm);
+    if (!r)
+        vm_cpu_kick(vm, idx);
+    return r;
+}
+
 void a32_psci(a32_cpu *c)
 {
-    bool handled;
-    int64_t r = arm_psci_call(c->vm, c->r[0], c->r[1], &handled);
+    mvm_vm *vm = c->vm;
+    uint32_t fn = c->r[0];
+    int64_t r;
+    if (vm->ncpus > 1 && (fn == PSCI_CPU_ON_32 || fn == PSCI_CPU_ON_64)) {
+        r = psci_cpu_on(c, c->r[1], c->r[2], c->r[3]);
+    } else if (vm->ncpus > 1 && fn == PSCI_CPU_OFF) { /* esta CPU para ate um novo CPU_ON */
+        atomic_store(&c->power, A32_OFF);
+        c->halted = true;
+        atomic_store(c->exit_flag, 1);
+        r = 0;
+    } else if (vm->ncpus > 1 && (fn == PSCI_AFFINITY_INFO_32 || fn == PSCI_AFFINITY_INFO_64)) {
+        uint32_t t = c->r[1];
+        if ((t & ~0xffu & 0xffffffu) || (int)(t & 0xff) >= vm->ncpus || c->r[2] != 0) {
+            r = PSCI_E_INVALID;
+        } else {
+            a32_cpu *o = vm->vcpu[t & 0xff].cpu;
+            int p = atomic_load(&o->power);
+            r = p == A32_ON ? 0 : p == A32_OFF ? 1 : 2;
+        }
+    } else {
+        bool handled;
+        r = arm_psci_call(vm, fn, c->r[1], &handled);
+    }
     c->r[0] = (uint32_t)r;
+}
+
+/* CPU_ON chegou (thread desta CPU): estado de reset (SVC, MMU desligada), entrada com r0 = contexto */
+static void a32_reset(void *opaque);
+static void psci_start(a32_cpu *c)
+{
+    vm_bql_lock(c->vm);
+    a32_reset(c);
+    c->thumb = c->on_entry & 1;
+    c->npc = c->on_entry & ~1u;
+    c->r[0] = c->on_ctx;
+    atomic_store(&c->power, A32_ON);
+    vm_bql_unlock(c->vm);
 }
 
 void a32_hint(a32_cpu *c, unsigned hint)
@@ -569,10 +905,15 @@ void a32_hint(a32_cpu *c, unsigned hint)
 
 void a32_barrier(a32_cpu *c, unsigned op)
 {
-    if (op == 1)
+    if (op == 1) {
         c->excl_valid = false; /* CLREX */
-    else if (op == 6)
+    } else if (op == 6) {
         c->fetch_page = 1; /* ISB */
+    } else if (c->smp && (op == 4 || op == 5)) { /* DSB / DMB */
+        if (op == 4 && atomic_load_explicit(&c->tlbi_left, memory_order_relaxed))
+            tlbi_wait(c); /* DSB conclui os TLBIs compartilhados */
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    }
 }
 
 /* --------------------------------------------------------------- CP15 */
@@ -598,6 +939,15 @@ static void ats1(a32_cpu *c, uint32_t va, int priv, bool write)
     uint32_t pa;
     int perm;
     uint32_t f = translate(c, va, priv, &pa, &perm);
+    if (lpae_on(c)) { /* PAR de 64 bits: PA[39:12], bit 11 = formato longo; falta: F + FST[6:1] */
+        if (!f && (perm & (write ? 2 : 1))) {
+            c->par = (pa & 0xfffff000u) | (1u << 11);
+            return;
+        }
+        uint32_t st = f ? f & 0x3f : 0x0c | ((perm >> 16) & 3);
+        c->par = 1 | (st << 1) | (1u << 11);
+        return;
+    }
     if (!f && (perm & (write ? 2 : 1))) {
         c->par = pa & 0xfffff000u;
         return;
@@ -614,13 +964,13 @@ static uint32_t cp15_read(a32_cpu *c, uint32_t key)
     case CP(0, 0, 0, 1): return 0x8444c004;  /* CTR */
     case CP(0, 0, 0, 2): return 0;           /* TCMTR */
     case CP(0, 0, 0, 3): return 0;           /* TLBTR */
-    case CP(0, 0, 0, 5): return 0x80000000;  /* MPIDR */
+    case CP(0, 0, 0, 5): return 0x80000000u | (uint32_t)c->index; /* MPIDR: Aff0 = indice da CPU */
     case CP(0, 0, 0, 6): return 0;           /* REVIDR */
     case CP(0, 0, 1, 0): return 0x00000031;  /* ID_PFR0: ARM + Thumb-2 */
     case CP(0, 0, 1, 1): return 0x00010001;  /* ID_PFR1: timer generico */
     case CP(0, 0, 1, 2): return 0;           /* ID_DFR0 */
     case CP(0, 0, 1, 3): return 0;
-    case CP(0, 0, 1, 4): return 0x10101103;  /* ID_MMFR0: VMSAv7 */
+    case CP(0, 0, 1, 4): return 0x10101105;  /* ID_MMFR0: VMSAv7 com LPAE */
     case CP(0, 0, 1, 5): return 0x40000000;
     case CP(0, 0, 1, 6): return 0x01240000;
     case CP(0, 0, 1, 7): return 0x02102211;
@@ -637,8 +987,8 @@ static uint32_t cp15_read(a32_cpu *c, uint32_t key)
     case CP(0, 1, 0, 0): return c->sctlr;
     case CP(0, 1, 0, 1): return c->actlr;
     case CP(0, 1, 0, 2): return c->cpacr;
-    case CP(0, 2, 0, 0): return c->ttbr0;
-    case CP(0, 2, 0, 1): return c->ttbr1;
+    case CP(0, 2, 0, 0): return (uint32_t)c->ttbr0;
+    case CP(0, 2, 0, 1): return (uint32_t)c->ttbr1;
     case CP(0, 2, 0, 2): return c->ttbcr;
     case CP(0, 3, 0, 0): return c->dacr;
     case CP(0, 5, 0, 0): return c->dfsr;
@@ -647,7 +997,7 @@ static uint32_t cp15_read(a32_cpu *c, uint32_t key)
     case CP(0, 5, 1, 1): return c->aifsr;
     case CP(0, 6, 0, 0): return c->dfar;
     case CP(0, 6, 0, 2): return c->ifar;
-    case CP(0, 7, 4, 0): return c->par;
+    case CP(0, 7, 4, 0): return (uint32_t)c->par;
     case CP(0, 9, 14, 0): return c->pmuserenr;
     case CP(0, 10, 2, 0): return c->prrr;
     case CP(0, 10, 2, 1): return c->nmrr;
@@ -679,7 +1029,10 @@ static void cp15_write(a32_cpu *c, uint32_t key, uint32_t v)
     case CP(0, 1, 0, 2): c->cpacr = v & 0x00f00000u; break;
     case CP(0, 2, 0, 0): c->ttbr0 = v; tlb_flush(c); break;
     case CP(0, 2, 0, 1): c->ttbr1 = v; tlb_flush(c); break;
-    case CP(0, 2, 0, 2): c->ttbcr = v & 7; tlb_flush(c); break;
+    case CP(0, 2, 0, 2): /* com EAE: T0SZ, EPD0, IRGN/ORGN/SH, T1SZ, A1, EPD1 (cache/compartilhamento ignorados) */
+        c->ttbcr = (v >> 31) ? v & 0xb7f7f7f7u : v & 0x37;
+        tlb_flush(c);
+        break;
     case CP(0, 3, 0, 0): c->dacr = v; tlb_flush(c); break;
     case CP(0, 5, 0, 0): c->dfsr = v; break;
     case CP(0, 5, 0, 1): c->ifsr = v; break;
@@ -690,6 +1043,8 @@ static void cp15_write(a32_cpu *c, uint32_t key, uint32_t v)
     case CP(0, 7, 0, 4): a32_hint(c, 3); break; /* WFI legado */
     case CP(0, 7, 4, 0): c->par = v; break;
     case CP(0, 7, 5, 4): c->fetch_page = 1; break;       /* CP15ISB */
+    case CP(0, 7, 10, 4): a32_barrier(c, 4); break;      /* CP15DSB */
+    case CP(0, 7, 10, 5): a32_barrier(c, 5); break;      /* CP15DMB */
     case CP(0, 7, 8, 0): ats1(c, v, 1, false); break;
     case CP(0, 7, 8, 1): ats1(c, v, 1, true); break;
     case CP(0, 7, 8, 2): ats1(c, v, 0, false); break;
@@ -710,7 +1065,7 @@ static void cp15_write(a32_cpu *c, uint32_t key, uint32_t v)
     case CP(0, 14, 3, 1): gt_ctl_write(&c->gt, GT_VIRT, v); break;
     default:
         if ((key >> 8 & 15) == 8) { /* TLB */
-            tlb_flush(c);
+            tlb_maint(c, (key >> 4) & 15, key & 7, v);
             break;
         }
         if ((key >> 8 & 15) == 7) /* cache: nada a fazer */
@@ -775,14 +1130,23 @@ void a32_coproc(a32_cpu *c, uint32_t insn)
         }
         if (!a32_priv(c))
             a32_undef(c);
-        if (crm == 2) { /* TTBR0/1 de 64 bits (LPAE): usa a parte baixa */
+        if (crm == 2 && opc1 <= 1) { /* TTBR0/1 de 64 bits (LPAE): BADDR[39:x] e ASID[55:48] */
+            uint64_t *t = opc1 ? &c->ttbr1 : &c->ttbr0;
             if (read) {
-                c->r[rt] = opc1 ? c->ttbr1 : c->ttbr0;
-                c->r[rt2] = 0;
+                c->r[rt] = (uint32_t)*t;
+                c->r[rt2] = (uint32_t)(*t >> 32);
             } else {
-                if (opc1) c->ttbr1 = c->r[rt];
-                else c->ttbr0 = c->r[rt];
+                *t = ((uint64_t)c->r[rt2] << 32) | c->r[rt];
                 tlb_flush(c);
+            }
+            return;
+        }
+        if (crm == 7 && opc1 == 0) { /* PAR de 64 bits */
+            if (read) {
+                c->r[rt] = (uint32_t)c->par;
+                c->r[rt2] = (uint32_t)(c->par >> 32);
+            } else {
+                c->par = ((uint64_t)c->r[rt2] << 32) | c->r[rt];
             }
             return;
         }
@@ -1143,40 +1507,19 @@ static void arm_sync(a32_cpu *c, uint32_t insn)
     uint32_t addr = R(c, rn);
     if (!(op & 8)) { /* SWP/SWPB */
         unsigned sz = BIT(insn, 22) ? 1 : 4;
-        uint32_t old = a32_rd(c, addr, sz);
-        a32_wr(c, addr, R(c, rt), sz);
-        c->r[rd] = old;
+        c->r[rd] = a32_swp(c, addr, sz, R(c, rt));
         return;
     }
     static const unsigned sizes[4] = {4, 8, 1, 2};
     unsigned sz = sizes[(op >> 1) & 3];
     if (op & 1) { /* LDREX* */
-        if (sz == 8) {
-            uint32_t lo = a32_rd(c, addr, 4), hi = a32_rd(c, addr + 4, 4);
-            c->r[rd] = lo;
+        uint32_t hi;
+        uint32_t lo = a32_ldrex(c, addr, sz, &hi);
+        c->r[rd] = lo;
+        if (sz == 8)
             c->r[rd + 1] = hi;
-            c->excl_val = ((uint64_t)hi << 32) | lo;
-        } else {
-            uint32_t v = a32_rd(c, addr, sz);
-            c->r[rd] = v;
-            c->excl_val = v;
-        }
-        c->excl_addr = addr;
-        c->excl_size = (int)sz;
-        c->excl_valid = true;
     } else { /* STREX*: Rd = status, Rt = valor */
-        uint32_t status = 1;
-        if (c->excl_valid && c->excl_addr == addr && c->excl_size == (int)sz) {
-            if (sz == 8) {
-                a32_wr(c, addr, R(c, rt), 4);
-                a32_wr(c, addr + 4, R(c, rt + 1), 4);
-            } else {
-                a32_wr(c, addr, R(c, rt), sz);
-            }
-            status = 0;
-        }
-        c->excl_valid = false;
-        c->r[rd] = status;
+        c->r[rd] = a32_strex(c, addr, sz, R(c, rt), sz == 8 ? R(c, rt + 1) : 0);
     }
 }
 
@@ -1537,6 +1880,11 @@ static int64_t a32_run(void *opaque, int64_t budget)
 {
     a32_cpu *c = opaque;
     volatile int64_t n = 0;
+    if (unlikely(atomic_load_explicit(&c->power, memory_order_acquire) != A32_ON)) {
+        if (atomic_load(&c->power) == A32_OFF)
+            return 0; /* desligada (PSCI): espera o CPU_ON */
+        psci_start(c);
+    }
     if (c->halted) {
         if (!c->irq_line && !c->fiq_line)
             return 0;
@@ -1548,7 +1896,7 @@ static int64_t a32_run(void *opaque, int64_t budget)
             exception(c, 0x1c, M_FIQ, c->npc + 4);
         else if (unlikely(c->irq_line && !c->irq_dis))
             exception(c, 0x18, M_IRQ, c->npc + 4);
-        if (unlikely(c->halted || atomic_load_explicit(&c->vm->cpu_exit, memory_order_relaxed)))
+        if (unlikely(c->halted || atomic_load_explicit(c->exit_flag, memory_order_relaxed)))
             break;
         uint32_t pc = c->npc;
         c->cur = pc;
@@ -1569,7 +1917,10 @@ static int64_t a32_run(void *opaque, int64_t budget)
 static bool a32_halted(void *opaque)
 {
     a32_cpu *c = opaque;
-    return c->halted && !c->irq_line && !c->fiq_line;
+    int p = atomic_load_explicit(&c->power, memory_order_acquire);
+    if (p == A32_ON_PENDING)
+        return false; /* CPU_ON chegou: precisa rodar para ligar */
+    return p == A32_OFF || (c->halted && !c->irq_line && !c->fiq_line);
 }
 
 static void a32_reset(void *opaque)
@@ -1609,8 +1960,8 @@ static void a32_dump(void *opaque, FILE *f)
     fprintf(f, "PC=%08x %s CPSR=%08x\n", c->cur, c->thumb ? "Thumb" : "ARM", a32_get_cpsr(c));
     for (int i = 0; i < 15; i++)
         fprintf(f, "r%-2d=%08x%s", i, c->r[i], (i % 4 == 3) ? "\n" : " ");
-    fprintf(f, "\nSCTLR=%08x TTBR0=%08x TTBR1=%08x TTBCR=%x DACR=%08x\n", c->sctlr, c->ttbr0, c->ttbr1,
-            c->ttbcr, c->dacr);
+    fprintf(f, "\nSCTLR=%08x TTBR0=%016llx TTBR1=%016llx TTBCR=%x DACR=%08x\n", c->sctlr,
+            (unsigned long long)c->ttbr0, (unsigned long long)c->ttbr1, c->ttbcr, c->dacr);
     fprintf(f, "DFSR=%08x DFAR=%08x IFSR=%08x IFAR=%08x\n", c->dfsr, c->dfar, c->ifsr, c->ifar);
 }
 
@@ -1639,6 +1990,7 @@ void *arm32_cpu_new(mvm_vm *vm, const arm_hooks *hooks)
     c->vm = vm;
     c->mem = &vm->mem;
     c->hooks = *hooks;
+    c->exit_flag = &vm->cpu_exit;
     gt_init(&c->gt, vm);
     c->gt.irq = hooks->timer_irq;
     c->gt.opaque = hooks->opaque;
@@ -1654,7 +2006,23 @@ void arm32_set_irq(void *opaque, int line, int level)
     else
         __atomic_store_n(&c->fiq_line, level, __ATOMIC_RELEASE);
     if (level)
-        vm_cpu_signal(c->vm); /* vinda de outra thread: a CPU sai da fatia e olha a linha */
+        vm_cpu_kick(c->vm, c->index); /* vinda de outra thread: a CPU sai da fatia e olha a linha */
+}
+
+void arm32_set_index(void *opaque, int index, int ncpus)
+{
+    a32_cpu *c = opaque;
+    c->index = index;
+    c->exit_flag = vm_cpu_exit_flag(c->vm, index);
+    c->smp = ncpus > 1;
+}
+
+void arm32_set_powered(void *opaque, bool on)
+{
+    a32_cpu *c = opaque;
+    atomic_store(&c->power, on ? A32_ON : A32_OFF);
+    if (!on)
+        c->halted = true;
 }
 
 void arm32_set_entry(void *opaque, uint32_t pc, uint32_t r0, uint32_t r1, uint32_t r2)

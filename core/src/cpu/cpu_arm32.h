@@ -17,6 +17,7 @@ typedef struct {
     uint32_t pa;
 } a32_tlbe;
 
+enum { A32_ON = 0, A32_OFF = 1, A32_ON_PENDING = 2 };
 enum { M_USR = 0x10, M_FIQ = 0x11, M_IRQ = 0x12, M_SVC = 0x13, M_ABT = 0x17, M_UND = 0x1b, M_SYS = 0x1f };
 enum { B_USR = 0, B_FIQ, B_IRQ, B_SVC, B_ABT, B_UND, B_COUNT };
 
@@ -47,8 +48,10 @@ typedef struct a32_cpu {
     uint32_t fpscr, fpexc, fpinst, fpinst2;
 
     /* CP15 */
-    uint32_t sctlr, actlr, cpacr, ttbr0, ttbr1, ttbcr, dacr;
-    uint32_t dfsr, ifsr, dfar, ifar, adfsr, aifsr, par;
+    uint32_t sctlr, actlr, cpacr, ttbcr, dacr;
+    uint64_t ttbr0, ttbr1; /* 64 bits com LPAE (MCRR); MCR acessa so a parte baixa */
+    uint32_t dfsr, ifsr, dfar, ifar, adfsr, aifsr;
+    uint64_t par;          /* 64 bits no formato LPAE */
     uint32_t prrr, nmrr, vbar, fcseidr, contextidr, tpidrurw, tpidruro, tpidrprw, csselr;
     uint32_t pmuserenr;
 
@@ -63,6 +66,14 @@ typedef struct a32_cpu {
     int irq_line, fiq_line;
     bool halted;
     jmp_buf jb;
+
+    /* varias CPUs */
+    int index;               /* indice na VM (MPIDR.Aff0) */
+    _Atomic int *exit_flag;  /* pedido de saida da fatia desta CPU */
+    _Atomic int power;       /* PSCI: A32_ON, A32_OFF ou A32_ON_PENDING (CPU_ON a caminho) */
+    uint32_t on_entry, on_ctx;
+    _Atomic int tlbi_left;   /* TLBIs compartilhados enviados a outras CPUs e ainda nao feitos */
+    bool smp;                /* a VM tem mais de uma CPU: atomicos e barreiras de verdade */
 
     a32_tlbe tlb[2][A32_TLB_SIZE];
     uint32_t fetch_page;
@@ -130,6 +141,10 @@ uint32_t a32_sat_u(a32_cpu *c, int64_t v, unsigned bits);
 void a32_hint(a32_cpu *c, unsigned hint);
 void a32_barrier(a32_cpu *c, unsigned op);
 void a32_psci(a32_cpu *c);
+/* exclusivos e SWP (atomicos de verdade com varias CPUs); sz = 1, 2, 4 ou 8 (par lo/hi) */
+uint32_t a32_ldrex(a32_cpu *c, uint32_t addr, unsigned sz, uint32_t *hi);
+uint32_t a32_strex(a32_cpu *c, uint32_t addr, unsigned sz, uint32_t lo, uint32_t hi);
+uint32_t a32_swp(a32_cpu *c, uint32_t addr, unsigned sz, uint32_t v);
 
 /* Thumb (a32_thumb.c) */
 void a32_exec_thumb(a32_cpu *c);

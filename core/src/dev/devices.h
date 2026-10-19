@@ -66,7 +66,13 @@ typedef struct virtio_dev {
     void (*poll)(struct virtio_dev *d);
     void (*destroy)(struct virtio_dev *d);
     bool legacy; /* transporte legado (virtio 0.9): tabelas contiguas */
+    /* trava propria (discos): o MMIO do dispositivo nao toma a bql, entao a leitura do disco nao
+     * para as outras CPUs; a interrupcao e levantada depois de soltar a trava (com a bql) */
+    bool own_lock;
+    pthread_mutex_t mu;
+    _Atomic int irq_dirty;
 } virtio_dev;
+void virtio_set_own_lock(virtio_dev *d);
 
 void virtio_reset(virtio_dev *d);
 bool virtq_pop(virtio_dev *d, int q, virtq_elem *e);
@@ -80,6 +86,19 @@ size_t virtq_write(virtio_dev *d, const virtq_elem *e, size_t off, const void *b
 virtio_dev *virtio_blk_new(mvm_vm *vm, mvm_blk *blk);
 virtio_dev *virtio_input_new(mvm_vm *vm, int kind); /* 0 = teclado, 1 = mouse (tablet relativo) */
 void virtio_input_event(virtio_dev *d, uint16_t type, uint16_t code, int32_t value);
+void virtio_input_key(virtio_dev *d, uint16_t code, bool pressed); /* codigo evdev */
+/* movimento relativo (dy positivo = para baixo), roda (negativo = para cima), botoes como no PS/2 */
+void virtio_input_mouse(virtio_dev *d, int dx, int dy, int dz, uint32_t buttons);
+/* virtio-gpu 2D: tela preferida pref_w x pref_h, desenhada em vm->fb */
+virtio_dev *virtio_gpu_new(mvm_vm *vm, uint32_t pref_w, uint32_t pref_h);
+/* nova resolucao preferida: o convidado recebe o evento de tela (config change) e reconsulta */
+void virtio_gpu_set_preferred(virtio_dev *d, uint32_t w, uint32_t h);
+/* virtio-scsi (ARM virt): CDs com troca de midia e discos conectaveis com a VM ligada */
+virtio_dev *virtio_scsi_new(mvm_vm *vm);
+int virtio_scsi_attach(virtio_dev *d, mvm_blk *blk, bool cd); /* alvo usado, ou -1 */
+int virtio_scsi_free_target(virtio_dev *d);
+/* CD: troca a midia (blk NULL = ejeta); disco: blk conecta no alvo, NULL desconecta */
+bool virtio_scsi_change(virtio_dev *d, int target, mvm_blk *blk, bool cd);
 void virtio_dev_free(virtio_dev *d);
 
 /* transporte MMIO */
@@ -96,6 +115,11 @@ void fw_cfg_add_u32(fw_cfg *f, uint16_t key, uint32_t v);
 void fw_cfg_add_u64(fw_cfg *f, uint16_t key, uint64_t v);
 void fw_cfg_add_file(fw_cfg *f, const char *name, const void *data, uint32_t len);
 extern const mvm_io_ops fw_cfg_ops; /* portas 0x510-0x51B */
+extern const mvm_io_ops fw_cfg_mmio_ops; /* ARM "virt": 0x18 bytes */
+/* arquivo que o convidado pode gravar por DMA; cb recebe o conteudo inteiro depois de cada escrita */
+typedef void (*fw_cfg_write_cb)(void *opaque, const uint8_t *data, uint32_t len);
+void fw_cfg_add_file_rw(fw_cfg *f, const char *name, const void *data, uint32_t len, fw_cfg_write_cb cb,
+                        void *opaque);
 
 /* ---------------------------------------------------------- ARM */
 typedef struct pl011 pl011;
@@ -104,8 +128,10 @@ void pl011_poll(pl011 *u);
 extern const mvm_io_ops pl011_ops;
 
 typedef struct gicv2 gicv2;
-gicv2 *gicv2_new(mvm_vm *vm, void (*cpu_irq)(void *cpu, int line, int level), void *cpu);
-void gicv2_set_irq(void *opaque, int irq, int level); /* irq = INTID */
+/* cpus[k] e o argumento de cpu_irq para a CPU k */
+gicv2 *gicv2_new(mvm_vm *vm, void (*cpu_irq)(void *cpu, int line, int level), void *const *cpus, int ncpus);
+void gicv2_set_irq(void *opaque, int irq, int level); /* irq = INTID (SPI) */
+void gicv2_set_ppi(gicv2 *g, int cpu, int irq, int level); /* PPI 16-31 de uma CPU */
 void gicv2_reset(gicv2 *g);
 extern const mvm_io_ops gicv2_dist_ops;
 extern const mvm_io_ops gicv2_cpu_ops;
